@@ -35,4 +35,3 @@ jobs:
         run: npm run publish
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          VERCEL_BACKEND_URL: ${{ secrets.VERCEL_BACKEND_URL }}
