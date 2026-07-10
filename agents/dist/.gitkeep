@@ -1,0 +1,2 @@
+# Native name-agent binaries are published here by agents/windows/build.ps1 and agents/macos/build.sh.
+# The app degrades gracefully (AI inference + rename UI) when no binary is present.

@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Your Call AI</title>
+</head>
+<body>
+  <div id="loader"><div class="loader-box"><img class="logo-img" id="loader-logo" alt="Your Call AI"><div class="spinner"></div></div></div>
+
+  <div class="app">
+    <aside class="sidebar">
+      <div class="brand">
+        <img class="logo-img brand-logo" id="brand-logo" alt="Your Call AI">
+        <span class="brand-name">Your Call AI</span>
+        <span class="version" id="app-version"></span>
+      </div>
+      <div class="status-pill" id="status-pill"><span class="dot"></span><span id="status-text">Idle</span></div>
+
+      <button id="btn-record" class="btn record-btn hidden">● Start Recording</button>
+      <button id="btn-huddle" class="btn huddle-btn">🎙 Huddle</button>
+
+      <div class="search-row">
+        <input id="search" class="search" type="text" placeholder="Search meetings…">
+        <select id="range-filter" class="range-filter" title="Filter by date">
+          <option value="all">All time</option>
+          <option value="week">This week</option>
+          <option value="month">This month</option>
+        </select>
+      </div>
+
+      <div id="meeting-list" class="meeting-list"></div>
+
+      <div class="sidebar-footer">
+        <button id="btn-settings" class="btn ghost pill footer-btn">⚙ Settings</button>
+        <details class="trash" id="trash-section">
+          <summary class="footer-btn">🗑 Trash <span id="trash-count" class="badge"></span></summary>
+          <div id="trash-list"></div>
+        </details>
+      </div>
+    </aside>
+
+    <main class="pane">
+      <div id="empty-state" class="empty">
+        <div class="empty-inner">
+          <img class="logo-img big" id="empty-logo" alt="Your Call AI">
+          <p>No meeting selected.<br>Join a meeting or start a Huddle to begin.</p>
+        </div>
+      </div>
+
+      <div id="editor" class="editor hidden">
+        <input id="note-title" class="note-title" type="text">
+        <div class="meta-line" id="meta-line"></div>
+        <div class="view-toggle segmented">
+          <button data-view="summary" class="seg-toggle active">Summary</button>
+          <button data-view="transcript" class="seg-toggle">Transcript</button>
+        </div>
+
+        <div id="view-summary" class="view">
+          <textarea id="note-content" spellcheck="false"></textarea>
+          <div class="action-row" id="action-row"></div>
+          <div class="send-block glass">
+            <div class="send-toggle segmented">
+              <button data-dest="slack" class="seg-toggle active">Slack</button>
+              <button data-dest="getoverview" class="seg-toggle">GetOverview</button>
+            </div>
+            <div id="send-slack" class="send-panel"></div>
+            <div id="send-getoverview" class="send-panel hidden"></div>
+          </div>
+        </div>
+
+        <div id="view-transcript" class="view hidden"></div>
+      </div>
+
+      <div id="settings-view" class="settings hidden">
+        <h2>Settings</h2>
+        <div id="settings-fields"></div>
+        <div class="settings-actions">
+          <button id="settings-save" class="btn primary pill">Save</button>
+          <button id="settings-done" class="btn ghost pill">Done</button>
+          <span id="settings-status" class="muted"></span>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <!-- Floating AI chat -->
+  <button id="chat-fab" class="chat-fab glass" title="Ask AI about this meeting">💬</button>
+  <div id="chat-modal" class="chat-modal glass hidden">
+    <div class="chat-modal-head">
+      <span class="chat-modal-title">Ask AI</span>
+      <button id="chat-close" class="chat-close" title="Close">✕</button>
+    </div>
+    <div id="chat-thread" class="chat-thread"></div>
+    <div class="chat-input-row">
+      <input id="chat-input" type="text" placeholder="Ask about this meeting…">
+      <button id="chat-send" class="btn primary pill">Send</button>
+    </div>
+  </div>
+</body>
+</html>

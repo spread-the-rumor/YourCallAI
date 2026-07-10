@@ -1,0 +1,9 @@
+node_modules/
+.env
+.webpack/
+out/
+agents/dist/*
+!agents/dist/.gitkeep
+agents/windows/bin/
+agents/windows/obj/
+.DS_Store

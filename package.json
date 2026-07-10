@@ -1,0 +1,34 @@
+{
+  "name": "your-call-ai",
+  "productName": "Your Call AI",
+  "version": "2.0.0",
+  "description": "Local-first meeting notetaker: records screen + meeting audio, transcribes with Deepgram, resolves speaker names, AI summaries, Slack & GetOverview integrations.",
+  "main": ".webpack/main",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/spread-the-rumor/YourCallAI.git"
+  },
+  "scripts": {
+    "start": "electron-forge start",
+    "package": "electron-forge package",
+    "make": "electron-forge make",
+    "publish": "electron-forge publish"
+  },
+  "author": "Rumor Avenue",
+  "license": "UNLICENSED",
+  "dependencies": {
+    "electron-squirrel-startup": "^1.0.1",
+    "express": "^4.21.2",
+    "get-windows": "^9.2.0",
+    "update-electron-app": "^3.1.1"
+  },
+  "devDependencies": {
+    "@electron-forge/cli": "^7.8.0",
+    "@electron-forge/maker-squirrel": "^7.8.0",
+    "@electron-forge/maker-zip": "^7.8.0",
+    "@electron-forge/plugin-webpack": "^7.8.0",
+    "css-loader": "^7.1.2",
+    "electron": "^37.2.0",
+    "style-loader": "^4.0.0"
+  }
+}

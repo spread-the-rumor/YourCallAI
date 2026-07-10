@@ -1,0 +1,38 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  release:
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+          - os: macos-14
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Build Windows name agent
+        if: runner.os == 'Windows'
+        run: pwsh agents/windows/build.ps1
+
+      - name: Build macOS name agent
+        if: runner.os == 'macOS'
+        run: sh agents/macos/build.sh
+
+      - run: npm ci
+
+      # Both jobs publish to the same draft GitHub Release; publish the draft to go live.
+      - name: Publish
+        run: npm run publish
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERCEL_BACKEND_URL: ${{ secrets.VERCEL_BACKEND_URL }}
