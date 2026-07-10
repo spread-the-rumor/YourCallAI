@@ -4,24 +4,19 @@
 const path = require('path');
 const { app } = require('electron');
 const { JsonFile } = require('../jsonFile');
+const { proxyPost } = require('../proxy');
 
 // Persistent cache of channel/user lists. Tier-2 methods (conversations.list, users.list)
 // rate-limit hard; on 429 we serve the last good lists instead of erroring the whole panel.
 let cacheFile;
 const cache = () => (cacheFile ||= new JsonFile(path.join(app.getPath('userData'), 'slack-cache.json'), {}));
 
+// Calls go through the Vercel proxy, which injects the bot token server-side.
 async function slackApi(method, params = {}) {
-  const token = process.env.Bot_User_OAuth_Token; // call-time read
-  if (!token) return { ok: false, error: 'Slack not configured — add Bot_User_OAuth_Token in Settings.' };
   try {
     // ponytail: retry only on 429; other failures return immediately. 3 tries max.
     for (let attempt = 0; ; attempt++) {
-      const res = await fetch(`https://slack.com/api/${method}`, {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json; charset=utf-8' },
-        body: JSON.stringify(params),
-        signal: AbortSignal.timeout(15000), // ponytail: hung request → reject → caught below, not an infinite spinner
-      });
+      const res = await proxyPost('/api/slack', { method, params }, { signal: AbortSignal.timeout(15000) });
       if (res.status === 429 && attempt < 3) {
         // ponytail: cap back-off at 5s so 3 retries fail fast (~15s) instead of sleeping Slack's 30-60s Retry-After thrice
         const wait = Math.min(parseInt(res.headers.get('retry-after'), 10) || 1, 5) * 1000;

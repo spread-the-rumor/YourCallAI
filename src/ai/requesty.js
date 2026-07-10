@@ -1,17 +1,11 @@
-// Shared requesty.ai client (OpenAI-compatible). Key and base URL read at call time.
+// Shared AI client — proxied through the Vercel backend (no key on the client).
+// The server picks the model; we just send messages. Kept name MODEL for callers/back-compat.
+const { proxyPost } = require('../proxy');
 const MODEL = 'google/gemma-4-31b-it';
 
 // Returns the full completion text. With onDelta, streams and calls onDelta(chunkText).
 async function chatCompletion(messages, { onDelta, temperature = 0.3 } = {}) {
-  const base = process.env.REQUESTY_BASE_URL || 'https://router.requesty.ai/v1';
-  const key = process.env.REQUESTY_API_KEY;
-  if (!key) throw new Error('REQUESTY_API_KEY not configured');
-
-  const res = await fetch(`${base}/chat/completions`, {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ model: MODEL, messages, temperature, stream: !!onDelta }),
-  });
+  const res = await proxyPost('/api/ai', { messages, temperature, stream: !!onDelta });
   if (!res.ok) {
     const body = await res.text().catch(() => '');
     throw new Error(`AI request failed (${res.status}): ${body.slice(0, 200)}`);

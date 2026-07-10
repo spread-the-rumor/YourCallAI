@@ -1,37 +1,13 @@
-// Deepgram batch transcription (§6). Plain fetch, no SDK.
+// Deepgram transcription via the Vercel proxy (§6). No key on the client.
+// Flow: upload audio.webm straight to Vercel Blob → submit job → poll for the result.
 // audio.webm is stereo opus: ch0 = mic (the user), ch1 = system audio (everyone else).
-// Cost note: multichannel bills per channel ≈ $0.43 per meeting-hour.
 const fs = require('fs');
 const fsp = fs.promises;
 const path = require('path');
-
-const DG_URL = 'https://api.deepgram.com/v1/listen?model=nova-3&multichannel=true&diarize=true&utterances=true&smart_format=true&punctuate=true';
+const { upload } = require('@vercel/blob/client');
+const { PROXY_URL, proxyPost } = require('./proxy');
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-async function deepgramRequest(audioBuf) {
-  const key = process.env.DEEPGRAM_API_KEY; // read at call time — Settings apply live
-  if (!key) throw new Error('DEEPGRAM_API_KEY not configured');
-  let lastErr;
-  for (let attempt = 0; attempt < 3; attempt++) {
-    try {
-      const res = await fetch(DG_URL, {
-        method: 'POST',
-        headers: { Authorization: `Token ${key}`, 'Content-Type': 'audio/webm' },
-        body: audioBuf,
-      });
-      if (res.ok) return await res.json();
-      const body = await res.text().catch(() => '');
-      if (res.status < 500) throw Object.assign(new Error(`Deepgram ${res.status}: ${body.slice(0, 300)}`), { fatal: true });
-      lastErr = new Error(`Deepgram ${res.status}`);
-    } catch (err) {
-      if (err.fatal) throw err;
-      lastErr = err;
-    }
-    await sleep(2000 * 2 ** attempt);
-  }
-  throw lastErr || new Error('Deepgram request failed');
-}
 
 // Map Deepgram utterances → the §4.1 segment shape, both channels interleaved by start time.
 function utterancesToSegments(utterances, startedAtMs, userName) {
@@ -51,11 +27,42 @@ function utterancesToSegments(utterances, startedAtMs, userName) {
   }));
 }
 
+// Upload the buffer directly to Vercel Blob (bytes never pass through a function body).
+// Deepgram fetches this URL, so it must be public. Wrap the Buffer in a Blob for the SDK.
+async function uploadAudio(audioBuf) {
+  const body = new Blob([audioBuf], { type: 'audio/webm' });
+  const blob = await upload(`audio/${Date.now()}.webm`, body, {
+    access: 'public',
+    contentType: 'audio/webm',
+    handleUploadUrl: `${PROXY_URL}/api/blob-upload`,
+  });
+  return blob.url;
+}
+
+// Submit the async Deepgram job and poll until the callback lands. Poll is cheap; no
+// Vercel exec-time limit is hit because transcription runs on Deepgram's side.
+async function transcribeViaProxy(audioBuf) {
+  const url = await uploadAudio(audioBuf);
+
+  const submit = await (await proxyPost('/api/transcribe', { url })).json();
+  if (submit.error || !submit.id) throw new Error(submit.error || 'Transcription submit failed');
+
+  // Poll: 3s interval, up to ~10 min for long meetings.
+  for (let i = 0; i < 200; i++) {
+    await sleep(3000);
+    const res = await fetch(`${PROXY_URL}/api/transcribe/result?id=${encodeURIComponent(submit.id)}`);
+    const data = await res.json().catch(() => ({}));
+    if (data.status === 'done') return data.result;
+    if (data.status === 'error') throw new Error(data.error || 'Transcription failed');
+  }
+  throw new Error('Transcription timed out');
+}
+
 async function transcribeRecording(recordingDir, startedAt) {
   const audioPath = path.join(recordingDir, 'audio.webm');
   const audioBuf = await fsp.readFile(audioPath);
   if (!audioBuf.length) throw new Error('audio.webm is empty');
-  const result = await deepgramRequest(audioBuf);
+  const result = await transcribeViaProxy(audioBuf);
   const utterances = result?.results?.utterances || [];
   const userName = process.env.USER_DISPLAY_NAME || 'You';
   return utterancesToSegments(utterances, Date.parse(startedAt), userName);

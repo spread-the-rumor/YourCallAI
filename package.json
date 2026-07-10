@@ -12,11 +12,13 @@
     "start": "electron-forge start",
     "package": "electron-forge package",
     "make": "electron-forge make",
-    "publish": "electron-forge publish"
+    "publish": "electron-forge publish",
+    "ship": "node scripts/ship.mjs"
   },
   "author": "Rumor Avenue",
   "license": "UNLICENSED",
   "dependencies": {
+    "@vercel/blob": "^2.6.1",
     "electron-squirrel-startup": "^1.0.1",
     "express": "^4.21.2",
     "get-windows": "^9.2.0",

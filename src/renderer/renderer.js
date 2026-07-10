@@ -519,12 +519,8 @@ function renderActionItemRows(box, items, projectSel) {
 }
 
 // ---------- settings ----------
+// API keys now live on the backend — only local, non-secret prefs remain here.
 const SETTINGS_FIELDS = [
-  ['DEEPGRAM_API_KEY', 'Deepgram API key (required for transcription)'],
-  ['REQUESTY_API_KEY', 'Requesty AI key (summary / chat / action items)'],
-  ['Bot_User_OAuth_Token', 'Slack bot token (xoxb-…)'],
-  ['GetOverview_BASE_URL', 'GetOverview base URL'],
-  ['GetOverview_Access_Token', 'GetOverview access token'],
   ['USER_DISPLAY_NAME', 'Your display name (mic channel label)'],
   ['AUTO_DELETE_DAYS', 'Auto-delete recordings after N days (0 = keep forever)'],
 ];

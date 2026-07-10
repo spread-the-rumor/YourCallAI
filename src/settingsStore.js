@@ -1,23 +1,19 @@
-// Settings (§4.5): settings.json in userData; optional Vercel team defaults cached
-// to config-cache.json. Effective config = .env (dev) < Vercel defaults < user overrides.
-// Keys are pushed into process.env so every module reads them AT CALL TIME.
+// Settings (§4.5): settings.json in userData. All SECRET keys now live on the Vercel
+// backend — the client stores only non-secret local prefs. Feature availability comes
+// from GET /api/config (booleans only), cached to config-cache.json for offline start.
 const path = require('path');
 const fs = require('fs');
 const { app } = require('electron');
 const { JsonFile } = require('./jsonFile');
+const { PROXY_URL } = require('./proxy');
 
+// Only non-secret, machine-local preferences live here now.
 const KEYS = [
-  'DEEPGRAM_API_KEY',
-  'REQUESTY_API_KEY',
-  'Bot_User_OAuth_Token',
-  'GetOverview_BASE_URL',
-  'GetOverview_Access_Token',
   'USER_DISPLAY_NAME',
   'AUTO_DELETE_DAYS',
 ];
 
-// eslint-disable-next-line no-undef
-const VERCEL_URL = typeof BUILD_VERCEL_BACKEND_URL !== 'undefined' ? BUILD_VERCEL_BACKEND_URL : '';
+const VERCEL_URL = PROXY_URL;
 
 // ponytail: 8-line .env parser instead of dotenv — swap in dotenv if quoting/expansion ever matters
 let envDefaults = null;
@@ -58,45 +54,47 @@ async function saveSettings(patch) {
   return getSettings();
 }
 
+// Fetch which integrations the backend has configured; cache for offline start.
 async function fetchTeamDefaults() {
   if (!VERCEL_URL) return;
   try {
     const res = await fetch(`${VERCEL_URL}/api/config`, { signal: AbortSignal.timeout(8000) });
     if (!res.ok) return;
-    const cfg = await res.json();
+    const cfg = await res.json(); // { enabled: {...} }
     await files().cacheFile.update(() => cfg);
+    await applyToEnv();
   } catch (e) {
-    console.warn('[config] team defaults fetch failed (using cache):', e.message);
+    console.warn('[config] backend config fetch failed (using cache):', e.message);
   }
 }
 
 async function getEffectiveConfig() {
-  const defaults = await files().cacheFile.read();
   const user = await getSettings();
-  const merged = { ...loadEnvFile(), ...defaults };
+  const merged = { ...loadEnvFile() };
   for (const k of KEYS) if (user[k]) merged[k] = user[k];
   if (!merged.USER_DISPLAY_NAME) merged.USER_DISPLAY_NAME = 'You';
   return merged;
 }
 
-// Renderer-safe view: which features are configured, without leaking key values.
+// Renderer-safe view: which features the backend supports + local prefs. No secrets anywhere.
 async function getConfiguredFlags() {
   const c = await getEffectiveConfig();
+  const enabled = (await files().cacheFile.read()).enabled || {};
   return {
-    deepgram: !!c.DEEPGRAM_API_KEY,
-    requesty: !!c.REQUESTY_API_KEY,
-    slack: !!c.Bot_User_OAuth_Token,
-    getoverview: !!(c.GetOverview_BASE_URL && c.GetOverview_Access_Token),
+    deepgram: !!enabled.deepgram,
+    requesty: !!enabled.requesty,
+    slack: !!enabled.slack,
+    getoverview: !!enabled.getoverview,
     userDisplayName: c.USER_DISPLAY_NAME,
     autoDeleteDays: Number(c.AUTO_DELETE_DAYS) || 0,
   };
 }
 
+// Only the two local prefs go to process.env (USER_DISPLAY_NAME read in transcribe.js).
 async function applyToEnv() {
   const c = await getEffectiveConfig();
-  // .env entries outside KEYS (e.g. REQUESTY_BASE_URL) go straight to env
   for (const [k, v] of Object.entries(loadEnvFile())) {
-    if (!KEYS.includes(k)) process.env[k] = v;
+    if (!KEYS.includes(k)) process.env[k] = v; // dev-only extras like VERCEL_BACKEND_URL
   }
   for (const k of KEYS) {
     if (c[k]) process.env[k] = c[k];

@@ -1,27 +1,18 @@
 // GetOverview (internal PM tool). All helpers return { ok, ... } | { ok:false, error }, never throw.
+// Calls go through the Vercel proxy, which injects the base URL + token server-side.
+const { proxyPost } = require('../proxy');
 
 const MAX_TRANSCRIPT_BYTES = 700 * 1024;
 
 async function goFetch(pathname, options = {}) {
-  const base = process.env.GetOverview_BASE_URL; // call-time reads
-  const token = process.env.GetOverview_Access_Token;
-  if (!base || !token) {
-    return { ok: false, error: 'GetOverview not configured — add GetOverview_BASE_URL and GetOverview_Access_Token in Settings.' };
-  }
   try {
-    const res = await fetch(`${base.replace(/\/$/, '')}${pathname}`, {
-      ...options,
-      headers: {
-        Authorization: `Bearer ${token}`,
-        'Content-Type': 'application/json',
-        ...(options.headers || {}),
-      },
+    const res = await proxyPost('/api/getoverview', {
+      pathname,
+      method: options.method || 'GET',
+      body: options.body,
     });
-    const body = await res.json().catch(() => ({}));
-    if (!res.ok && res.status !== 202) {
-      return { ok: false, error: body.error || body.message || `GetOverview ${res.status}` };
-    }
-    return { ok: true, status: res.status, body };
+    const out = await res.json().catch(() => ({ ok: false, error: `GetOverview ${res.status}` }));
+    return out; // proxy already returns { ok, status, body } | { ok:false, error }
   } catch (err) {
     return { ok: false, error: `GetOverview request failed: ${err.message}` };
   }
