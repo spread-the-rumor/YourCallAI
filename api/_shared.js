@@ -29,4 +29,19 @@ async function readJson(req) {
 
 const env = (k) => process.env[k];
 
-module.exports = { json, readJson, env, requireAppToken };
+// Upstash Redis REST client for the OTC store, shared by both Slack OAuth routes.
+// Env var names vary by how the store was provisioned: the marketplace integration here
+// prefixes them SLACK_ (SLACK_KV_REST_API_URL/TOKEN); plain Vercel KV uses KV_REST_API_*;
+// a bare Upstash store uses UPSTASH_REDIS_REST_*. Accept whichever is present.
+// NOTE: use the WRITE token, not SLACK_KV_REST_API_READ_ONLY_TOKEN (set/del need writes).
+let _redis;
+function redisClient() {
+  if (_redis) return _redis;
+  const { Redis } = require('@upstash/redis');
+  const url = env('SLACK_KV_REST_API_URL') || env('KV_REST_API_URL') || env('UPSTASH_REDIS_REST_URL');
+  const token = env('SLACK_KV_REST_API_TOKEN') || env('KV_REST_API_TOKEN') || env('UPSTASH_REDIS_REST_TOKEN');
+  _redis = new Redis({ url, token });
+  return _redis;
+}
+
+module.exports = { json, readJson, env, requireAppToken, redisClient };
