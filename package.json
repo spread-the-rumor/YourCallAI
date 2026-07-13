@@ -1,7 +1,7 @@
 {
   "name": "your-call-ai",
   "productName": "Your Call AI",
-  "version": "2.0.6",
+  "version": "2.0.7",
   "description": "Local-first meeting notetaker: records screen + meeting audio, transcribes with Deepgram, resolves speaker names, AI summaries, Slack & GetOverview integrations.",
   "main": ".webpack/main",
   "repository": {
