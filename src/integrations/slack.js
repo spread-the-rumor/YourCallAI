@@ -2,7 +2,8 @@
 // Slack returns HTTP 200 with { ok:false, error } on logical failures — always check parsed ok.
 // Per-user OAuth: each user connects their own workspace; we hold their xoxp- user token
 // locally and pass it to the proxy per call. User scopes: chat:write, channels:read,
-// groups:read, users:read, im:write, mpim:read.
+// groups:read, users:read, im:write, mpim:read, im:read (im:read lists existing DMs so we
+// can surface external Slack Connect people the user has DMed).
 const path = require('path');
 const crypto = require('crypto');
 const { app, shell, BrowserWindow } = require('electron');
@@ -11,7 +12,7 @@ const { proxyPost, PROXY_URL, slackClientId } = require('../proxy');
 
 const PROTOCOL = 'yourcallai';
 const REDIRECT_URI = `${PROXY_URL}/api/slack/oauth-callback`;
-const USER_SCOPES = 'chat:write,channels:read,groups:read,users:read,im:write,mpim:read';
+const USER_SCOPES = 'chat:write,channels:read,groups:read,users:read,im:write,mpim:read,im:read';
 
 // Persistent cache of channel/user lists. Tier-2 methods (conversations.list, users.list)
 // rate-limit hard; on 429 we serve the last good lists instead of erroring the whole panel.
@@ -62,7 +63,9 @@ async function listSlackChannels() {
       ...(cursor ? { cursor } : {}),
     });
     if (!page.ok) return fallbackList('channels', page);
-    channels.push(...page.channels.map((c) => ({ id: c.id, name: c.name, isPrivate: !!c.is_private })));
+    channels.push(...page.channels.map((c) => ({
+      id: c.id, name: c.name, isPrivate: !!c.is_private, isExternal: !!(c.is_ext_shared || c.is_shared),
+    })));
     cursor = page.response_metadata?.next_cursor;
   } while (cursor);
   channels.sort((a, b) => a.name.localeCompare(b.name));
@@ -88,6 +91,30 @@ async function listSlackUsers() {
       .map((u) => ({ id: u.id, name: u.profile?.real_name || u.name })));
     cursor = page.response_metadata?.next_cursor;
   } while (cursor);
+
+  // External Slack Connect people aren't in users.list. Surface the ones the user has DMed:
+  // enumerate im conversations (needs im:read) and resolve any partner not already listed.
+  const known = new Set(users.map((u) => u.id));
+  const dmNames = (await cache().read()).dmNames || {}; // { userId: name } — resolved once, then reused
+  const dms = await slackApi('users.conversations', { types: 'im', exclude_archived: true, limit: 1000 });
+  if (dms.ok) {
+    for (const im of dms.channels) {
+      const uid = im.user;
+      if (!uid || known.has(uid) || im.is_user_deleted) continue;
+      let name = dmNames[uid];
+      if (!name) {
+        // ponytail: one users.info per unknown external DM partner (a handful), then cached forever
+        const info = await slackApi('users.info', { user: uid });
+        if (!info.ok) continue;
+        name = info.user?.profile?.real_name || info.user?.name || uid;
+        dmNames[uid] = name;
+      }
+      users.push({ id: uid, name, isExternal: true });
+      known.add(uid);
+    }
+    await cache().update((d) => { d.dmNames = dmNames; });
+  } // if types:im fails (missing_scope before re-auth) we just skip externals — internal people still render
+
   users.sort((a, b) => a.name.localeCompare(b.name));
   await cache().update((d) => { d.users = users; });
   return { ok: true, users };

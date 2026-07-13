@@ -370,10 +370,13 @@ async function renderSlackPanel(m) {
   row.className = 'send-row';
   const sel = document.createElement('select');
   const gCh = document.createElement('optgroup'); gCh.label = 'Channels';
-  for (const c of state.slackTargets.channels) gCh.append(new Option(`#${c.name}`, `channel:${c.id}`));
+  for (const c of state.slackTargets.channels)
+    gCh.append(new Option(c.isExternal ? `#${c.name} (external)` : `#${c.name}`, `channel:${c.id}`));
   const gUs = document.createElement('optgroup'); gUs.label = 'People';
-  for (const u of state.slackTargets.users) gUs.append(new Option(u.name, `user:${u.id}`));
+  const gEx = document.createElement('optgroup'); gEx.label = 'External people';
+  for (const u of state.slackTargets.users) (u.isExternal ? gEx : gUs).append(new Option(u.name, `user:${u.id}`));
   sel.append(gCh, gUs);
+  if (gEx.childElementCount) sel.append(gEx);
   const btn = document.createElement('button');
   btn.className = 'slack-btn';
   btn.innerHTML = `${SLACK_LOGO_SVG}<span>Send in Slack</span>`;

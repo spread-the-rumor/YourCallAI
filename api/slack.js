@@ -6,7 +6,7 @@ const { json, readJson, env, requireAppToken } = require('./_shared');
 
 const ALLOWED = new Set([
   'users.conversations', 'conversations.open',
-  'users.list', 'chat.postMessage',
+  'users.list', 'users.info', 'chat.postMessage',
 ]);
 
 module.exports = async (req, res) => {
