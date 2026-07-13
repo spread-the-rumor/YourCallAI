@@ -6,7 +6,7 @@ module.exports = (req, res) => {
     enabled: {
       deepgram: !!env('DEEPGRAM_API_KEY'),
       requesty: !!env('REQUESTY_API_KEY'),
-      slack: !!env('Bot_User_OAuth_Token'),
+      slack: !!(env('SLACK_CLIENT_ID') && env('SLACK_CLIENT_SECRET')), // OAuth available → show Connect button
       getoverview: !!(env('GetOverview_BASE_URL') && env('GetOverview_Access_Token')),
     },
   });

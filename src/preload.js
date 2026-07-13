@@ -28,6 +28,10 @@ contextBridge.exposeInMainWorld('api', {
   sendToSlack: invoke('send-to-slack'),
   listSlackChannels: invoke('list-slack-channels'),
   listSlackUsers: invoke('list-slack-users'),
+  slackConnect: invoke('slack-connect'),
+  slackDisconnect: invoke('slack-disconnect'),
+  slackStatus: invoke('slack-status'),
+  onSlackChanged: on('slack-changed'),
   listGetOverviewProjects: invoke('list-getoverview-projects'),
   createGetOverviewTask: invoke('create-getoverview-task'),
   sendGetOverviewTranscript: invoke('send-getoverview-transcript'),
@@ -42,4 +46,10 @@ contextBridge.exposeInMainWorld('api', {
   getEffectiveConfig: invoke('get-effective-config'),
   getAppVersion: invoke('get-app-version'),
   restartApp: invoke('restart-app'),
+
+  signIn: invoke('auth-sign-in'),
+  signOut: invoke('auth-sign-out'),
+  getUser: invoke('auth-get-user'),
+  syncNow: invoke('sync-now'),
+  onAuthChanged: on('auth-changed'),
 });

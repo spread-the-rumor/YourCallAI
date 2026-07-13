@@ -4,6 +4,9 @@ module.exports = {
       unpack: '**/node_modules/{get-windows,get-windows/**,koffi,koffi/**}/**',
     },
     extraResource: ['./agents/dist'],
+    // Google SSO deep link — macOS registers the scheme from Info.plist via this.
+    // (Windows registration is handled at install time by app.setAsDefaultProtocolClient.)
+    protocols: [{ name: 'Your Call AI', schemes: ['yourcallai'] }],
   },
   // get-windows ships prebuilt N-API binaries — no per-Electron rebuild needed
   // (and rebuilding would require the VS C++ toolchain on Windows).

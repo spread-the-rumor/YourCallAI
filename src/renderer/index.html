@@ -73,6 +73,38 @@
 
       <div id="settings-view" class="settings hidden">
         <h2>Settings</h2>
+        <div id="account-block" class="account-block glass hidden">
+          <h3>Account</h3>
+          <p class="muted" id="account-desc">Sign in with Google to sync your meetings across machines. Recordings stay on this device.</p>
+          <div id="account-signed-out">
+            <button id="btn-sign-in" class="btn primary pill">Sign in with Google</button>
+          </div>
+          <div id="account-signed-in" class="hidden">
+            <div class="account-user">
+              <img id="account-avatar" class="account-avatar" alt="">
+              <span id="account-email" class="account-email"></span>
+            </div>
+            <div class="settings-actions">
+              <button id="btn-sync-now" class="btn ghost pill">Sync now</button>
+              <button id="btn-sign-out" class="btn ghost pill">Sign out</button>
+              <span id="account-status" class="muted"></span>
+            </div>
+          </div>
+        </div>
+        <div id="slack-block" class="account-block glass hidden">
+          <h3>Slack</h3>
+          <p class="muted">Connect your Slack workspace to send meeting summaries to your channels and DMs — posted as you.</p>
+          <div id="slack-signed-out">
+            <button id="btn-slack-connect" class="btn primary pill">Connect to Slack</button>
+            <span id="slack-status" class="muted"></span>
+          </div>
+          <div id="slack-signed-in" class="hidden">
+            <div class="settings-actions">
+              <span id="slack-team" class="account-email"></span>
+              <button id="btn-slack-disconnect" class="btn ghost pill">Disconnect</button>
+            </div>
+          </div>
+        </div>
         <div id="settings-fields"></div>
         <div class="settings-actions">
           <button id="settings-save" class="btn primary pill">Save</button>

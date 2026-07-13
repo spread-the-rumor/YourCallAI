@@ -18,6 +18,8 @@
   "author": "Rumor Avenue",
   "license": "UNLICENSED",
   "dependencies": {
+    "@supabase/supabase-js": "^2.110.2",
+    "@upstash/redis": "^1.38.0",
     "@vercel/blob": "^2.6.1",
     "electron-squirrel-startup": "^1.0.1",
     "express": "^4.21.2",

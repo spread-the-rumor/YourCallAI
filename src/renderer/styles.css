@@ -333,3 +333,11 @@ select {
 ::-webkit-scrollbar { width: 8px; }
 ::-webkit-scrollbar-thumb { background: var(--glass-border); border-radius: 4px; }
 ::-webkit-scrollbar-track { background: transparent; }
+
+/* Account / Google SSO block in Settings */
+.account-block { padding: 16px; border-radius: 12px; margin-bottom: 20px; }
+.account-block h3 { margin: 0 0 6px; }
+.account-block .muted { margin: 0 0 12px; }
+.account-user { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
+.account-avatar { width: 32px; height: 32px; border-radius: 50%; }
+.account-email { font-weight: 600; }

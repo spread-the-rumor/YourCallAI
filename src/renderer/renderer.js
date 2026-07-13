@@ -344,7 +344,11 @@ function statusEl(cls = '') {
 async function renderSlackPanel(m) {
   const panel = $('send-slack');
   if (!state.flags.slack) {
-    panel.innerHTML = '<span class="muted">Slack not configured — add Bot_User_OAuth_Token in Settings.</span>';
+    panel.innerHTML = '<span class="muted">Slack is not available.</span>';
+    return;
+  }
+  if (!state.slackConnected) {
+    panel.innerHTML = '<span class="muted">Connect your Slack workspace in Settings to send here.</span>';
     return;
   }
   panel.innerHTML = '<span class="muted">Loading Slack channels…</span>';
@@ -540,8 +544,39 @@ async function openSettings() {
   $('editor').classList.add('hidden');
   $('empty-state').classList.add('hidden');
   $('settings-view').classList.remove('hidden');
+  renderAccount();
+  renderSlack();
   closeChat();
   updateFab();
+}
+
+// Show the Slack connect/disconnect block. Block appears only if OAuth is configured on
+// the backend (state.flags.slack); connected state comes from the per-user slack-status IPC.
+async function renderSlack() {
+  const block = $('slack-block');
+  block.classList.toggle('hidden', !state.flags.slack);
+  if (!state.flags.slack) return;
+  const { connected, team } = await api.slackStatus();
+  state.slackConnected = connected;
+  $('slack-signed-out').classList.toggle('hidden', connected);
+  $('slack-signed-in').classList.toggle('hidden', !connected);
+  if (connected) $('slack-team').textContent = team ? `Connected: ${team}` : 'Connected';
+}
+
+// ---------- account / sync ----------
+async function renderAccount() {
+  const { enabled, user } = await api.getUser();
+  const block = $('account-block');
+  block.classList.toggle('hidden', !enabled); // hide entirely if SSO not configured in this build
+  if (!enabled) return;
+  const signedIn = !!user;
+  $('account-signed-out').classList.toggle('hidden', signedIn);
+  $('account-signed-in').classList.toggle('hidden', !signedIn);
+  if (signedIn) {
+    $('account-email').textContent = user.email || user.name || 'Signed in';
+    const av = $('account-avatar');
+    if (user.avatar) { av.src = user.avatar; av.classList.remove('hidden'); } else av.classList.add('hidden');
+  }
 }
 function closeSettings() {
   $('settings-view').classList.add('hidden');
@@ -582,6 +617,7 @@ async function init() {
   for (const id of ['loader-logo', 'brand-logo', 'empty-logo']) $(id).src = logoUrl;
   $('app-version').textContent = `v${await api.getAppVersion()}`;
   state.flags = await api.getEffectiveConfig();
+  if (state.flags.slack) state.slackConnected = (await api.slackStatus()).connected;
 
   api.onStatus((s) => { state.status = s; renderStatus(); });
   api.onRecordingComplete((meeting) => {
@@ -605,6 +641,24 @@ async function init() {
   });
   $('btn-settings').addEventListener('click', openSettings);
   $('settings-done').addEventListener('click', () => { closeSettings(); renderEditor(); });
+
+  $('btn-sign-in').addEventListener('click', () => api.signIn());
+  $('btn-sign-out').addEventListener('click', async () => { await api.signOut(); });
+  $('btn-sync-now').addEventListener('click', async () => {
+    $('account-status').textContent = 'Syncing…';
+    await api.syncNow();
+    await reload();
+    $('account-status').textContent = 'Synced';
+  });
+  api.onAuthChanged(() => { renderAccount(); reload(); }); // pulled meetings appear after login
+
+  $('btn-slack-connect').addEventListener('click', async () => {
+    $('slack-status').textContent = 'Opening Slack…';
+    const r = await api.slackConnect();
+    $('slack-status').textContent = r.ok ? 'Continue in your browser…' : `⚠ ${r.error || 'Could not start Slack connect'}`;
+  });
+  $('btn-slack-disconnect').addEventListener('click', async () => { await api.slackDisconnect(); });
+  api.onSlackChanged(() => { state.slackTargets = null; renderSlack(); renderEditor(); }); // new workspace → reload channels
   $('settings-save').addEventListener('click', async () => {
     const patch = {};
     document.querySelectorAll('#settings-fields input').forEach((i) => { patch[i.dataset.key] = i.value; });

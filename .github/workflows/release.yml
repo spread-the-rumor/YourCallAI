@@ -37,6 +37,11 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERCEL_BACKEND_URL: ${{ secrets.VERCEL_BACKEND_URL }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+          # Baked into the client build (public client id + shipped proxy gate token).
+          SLACK_CLIENT_ID: ${{ secrets.SLACK_CLIENT_ID }}
+          APP_PROXY_TOKEN: ${{ secrets.APP_PROXY_TOKEN }}
 
   deploy-api:
     runs-on: ubuntu-latest

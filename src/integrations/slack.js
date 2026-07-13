@@ -1,22 +1,37 @@
 // Slack Web API helpers. All return { ok, ... } | { ok:false, error } and never throw.
 // Slack returns HTTP 200 with { ok:false, error } on logical failures — always check parsed ok.
-// Bot scopes: chat:write, channels:read, groups:read, channels:join, users:read, im:write.
+// Per-user OAuth: each user connects their own workspace; we hold their xoxp- user token
+// locally and pass it to the proxy per call. User scopes: chat:write, channels:read,
+// groups:read, users:read, im:write, mpim:read.
 const path = require('path');
-const { app } = require('electron');
+const crypto = require('crypto');
+const { app, shell, BrowserWindow } = require('electron');
 const { JsonFile } = require('../jsonFile');
-const { proxyPost } = require('../proxy');
+const { proxyPost, PROXY_URL, slackClientId } = require('../proxy');
+
+const PROTOCOL = 'yourcallai';
+const REDIRECT_URI = `${PROXY_URL}/api/slack/oauth-callback`;
+const USER_SCOPES = 'chat:write,channels:read,groups:read,users:read,im:write,mpim:read';
 
 // Persistent cache of channel/user lists. Tier-2 methods (conversations.list, users.list)
 // rate-limit hard; on 429 we serve the last good lists instead of erroring the whole panel.
 let cacheFile;
 const cache = () => (cacheFile ||= new JsonFile(path.join(app.getPath('userData'), 'slack-cache.json'), {}));
 
-// Calls go through the Vercel proxy, which injects the bot token server-side.
+// The connected user's Slack session { token, team }, stored locally (like auth-session.json).
+let sessionFile;
+const session = () => (sessionFile ||= new JsonFile(path.join(app.getPath('userData'), 'slack-session.json'), {}));
+
+let pendingState = null; // in-memory CSRF state for the current connect() attempt
+
+// Calls go through the Vercel proxy, passing the user's own token per request.
 async function slackApi(method, params = {}) {
+  const { token } = await session().read();
+  if (!token) return { ok: false, error: 'Slack not connected' };
   try {
     // ponytail: retry only on 429; other failures return immediately. 3 tries max.
     for (let attempt = 0; ; attempt++) {
-      const res = await proxyPost('/api/slack', { method, params }, { signal: AbortSignal.timeout(15000) });
+      const res = await proxyPost('/api/slack', { method, params, token }, { signal: AbortSignal.timeout(15000) });
       if (res.status === 429 && attempt < 3) {
         // ponytail: cap back-off at 5s so 3 retries fail fast (~15s) instead of sleeping Slack's 30-60s Retry-After thrice
         const wait = Math.min(parseInt(res.headers.get('retry-after'), 10) || 1, 5) * 1000;
@@ -75,6 +90,8 @@ async function listSlackUsers() {
 }
 
 // target: { type: 'channel'|'user', id } — send the EDITED note text (no localhost video links).
+// Posts as the connected user (user token). A user can't auto-join channels, so if they're
+// not a member we surface a clear error instead of trying conversations.join.
 async function sendToSlack(target, text) {
   let channelId = target.id;
   if (target.type === 'user') {
@@ -82,13 +99,69 @@ async function sendToSlack(target, text) {
     if (!dm.ok) return dm;
     channelId = dm.channel.id;
   }
-  let post = await slackApi('chat.postMessage', { channel: channelId, text, unfurl_links: false });
+  const post = await slackApi('chat.postMessage', { channel: channelId, text, unfurl_links: false });
   if (!post.ok && post.error === 'not_in_channel') {
-    const join = await slackApi('conversations.join', { channel: channelId });
-    if (!join.ok) return join;
-    post = await slackApi('chat.postMessage', { channel: channelId, text, unfurl_links: false });
+    return { ok: false, error: "You're not a member of that channel — join it in Slack first." };
   }
   return post.ok ? { ok: true } : post;
 }
 
-module.exports = { listSlackChannels, listSlackUsers, sendToSlack };
+// ---- Per-user OAuth connect / disconnect ----
+
+function emitChanged() {
+  for (const w of BrowserWindow.getAllWindows()) {
+    if (!w.isDestroyed()) w.webContents.send('slack-changed');
+  }
+}
+
+// Open the Slack authorize page in the system browser. Slack -> Vercel callback -> yourcallai://slack.
+async function connect() {
+  const clientId = slackClientId();
+  if (!clientId) return { ok: false, error: 'Slack OAuth not configured.' };
+  pendingState = crypto.randomBytes(16).toString('hex');
+  const url = `https://slack.com/oauth/v2/authorize?${new URLSearchParams({
+    client_id: clientId,
+    user_scope: USER_SCOPES,
+    redirect_uri: REDIRECT_URI,
+    state: pendingState,
+  })}`;
+  await shell.openExternal(url);
+  return { ok: true };
+}
+
+// Handle yourcallai://slack?code=<otc>&state=... — redeem the OTC for the real token.
+async function handleDeepLink(url) {
+  let params;
+  try { params = new URL(url).searchParams; } catch { return; }
+  if (params.get('error')) { console.warn('[slack] connect failed:', params.get('error')); emitChanged(); return; }
+  if (!pendingState || params.get('state') !== pendingState) { console.warn('[slack] state mismatch'); return; }
+  pendingState = null;
+  const otc = params.get('code');
+  if (!otc) return;
+  try {
+    const res = await proxyPost('/api/slack/oauth-redeem', { code: otc });
+    const data = await res.json();
+    if (!data.ok || !data.token) { console.warn('[slack] redeem failed:', data.error); emitChanged(); return; }
+    await session().update(() => ({ token: data.token, team: data.team || '' }));
+    await cache().update(() => ({})); // drop the previous workspace's channel/user lists
+    emitChanged();
+  } catch (err) {
+    console.warn('[slack] redeem error:', err.message);
+    emitChanged();
+  }
+}
+
+async function isConnected() {
+  const s = await session().read();
+  return { connected: !!s.token, team: s.team || '' };
+}
+
+async function disconnect() {
+  await session().update(() => ({}));
+  await cache().update(() => ({}));
+  emitChanged();
+  return { ok: true };
+  // ponytail: local forget only; add a Slack auth.revoke call if server-side revoke is ever required.
+}
+
+module.exports = { listSlackChannels, listSlackUsers, sendToSlack, connect, handleDeepLink, isConnected, disconnect, PROTOCOL };

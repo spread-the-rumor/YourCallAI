@@ -21,6 +21,8 @@ const { extractActionItems } = require('./ai/extractActionItems');
 const { inferSpeakerNames } = require('./ai/inferSpeakerNames');
 const slack = require('./integrations/slack');
 const getoverview = require('./integrations/getoverview');
+const auth = require('./auth');
+const sync = require('./sync');
 const { transcriptToText, segSpeaker, segText, meetingDate } = require('./transcriptUtils');
 
 // Webpack magic constants (injected by @electron-forge/plugin-webpack)
@@ -458,6 +460,9 @@ ipcMain.on('popup-dismiss', () => hidePopup());
 ipcMain.handle('send-to-slack', (e, target, text) => slack.sendToSlack(target, text));
 ipcMain.handle('list-slack-channels', () => slack.listSlackChannels());
 ipcMain.handle('list-slack-users', () => slack.listSlackUsers());
+ipcMain.handle('slack-connect', () => slack.connect());
+ipcMain.handle('slack-disconnect', () => slack.disconnect());
+ipcMain.handle('slack-status', () => slack.isConnected());
 ipcMain.handle('list-getoverview-projects', () => getoverview.listProjects());
 ipcMain.handle('create-getoverview-task', (e, projectId, task) => getoverview.createTask(projectId, task));
 ipcMain.handle('send-getoverview-transcript', async (e, projectId, meetingId, kind) => {
@@ -528,15 +533,32 @@ ipcMain.handle('get-effective-config', () => settingsStore.getConfiguredFlags())
 ipcMain.handle('get-app-version', () => app.getVersion());
 ipcMain.handle('restart-app', () => { app.relaunch(); app.exit(0); });
 
+ipcMain.handle('auth-sign-in', () => auth.signIn());
+ipcMain.handle('auth-sign-out', () => auth.signOut());
+ipcMain.handle('auth-get-user', () => ({ enabled: auth.enabled(), user: auth.getUser() }));
+ipcMain.handle('sync-now', async () => { await sync.fullSync(); return { ok: true }; });
+
 // ---------- app lifecycle ----------
 
 const gotLock = app.requestSingleInstanceLock();
 if (!gotLock) {
   app.quit();
 } else {
-  app.on('second-instance', () => {
+  // Route a yourcallai:// deep link to Slack (host === 'slack') or Supabase auth (everything else).
+  const routeDeepLink = (url) => {
+    if (url.startsWith(`${auth.PROTOCOL}://slack`)) return slack.handleDeepLink(url);
+    return auth.handleDeepLink(url);
+  };
+
+  app.on('second-instance', (e, argv) => {
     if (mainWindow) { if (mainWindow.isMinimized()) mainWindow.restore(); mainWindow.focus(); }
+    // Windows/Linux deliver the yourcallai:// deep link as an argv on the relaunch.
+    const link = argv.find((a) => a.startsWith(`${auth.PROTOCOL}://`));
+    if (link) routeDeepLink(link);
   });
+
+  // macOS delivers the deep link via open-url.
+  app.on('open-url', (e, url) => { e.preventDefault(); routeDeepLink(url); });
 
   app.whenReady().then(async () => {
     await settingsStore.applyToEnv().catch((e) => console.error('[settings]', e.message));
@@ -587,6 +609,7 @@ if (!gotLock) {
 
     recoverAndRequeue().catch((e) => console.error('[recover]', e.message));
     retentionSweep().catch((e) => console.error('[retention]', e.message));
+    auth.init().catch((e) => console.error('[auth]', e.message)); // restore session + sync if signed in
   });
 
   app.on('before-quit', async (e) => {
