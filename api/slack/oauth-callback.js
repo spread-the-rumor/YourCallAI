@@ -28,7 +28,10 @@ module.exports = async (req, res) => {
 
   const clientId = env('SLACK_CLIENT_ID');
   const clientSecret = env('SLACK_CLIENT_SECRET');
-  const redirectUri = `${env('VERCEL_URL') ? 'https://' + env('VERCEL_URL') : 'https://your-call-ai.vercel.app'}/api/slack/oauth-callback`;
+  // Must EXACTLY match the authorize-step redirect_uri (client uses PROXY_URL) and the Slack
+  // app config. Do NOT use VERCEL_URL — it's the per-deployment host (…-<hash>.vercel.app),
+  // which differs from the canonical domain → Slack rejects the exchange with bad_redirect_uri.
+  const redirectUri = 'https://your-call-ai.vercel.app/api/slack/oauth-callback';
   if (!clientId || !clientSecret) return redirect(res, { error: 'server_not_configured', state: state || '' });
 
   try {
