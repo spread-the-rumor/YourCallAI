@@ -58,6 +58,19 @@ function emitAuthChanged() {
   }
 }
 
+function emitSyncStatus(state) {
+  for (const w of BrowserWindow.getAllWindows()) {
+    if (!w.isDestroyed()) w.webContents.send('sync-status', { state });
+  }
+}
+
+// Run the login/startup full-sync and broadcast its status to the UI (yellow→green/red).
+async function syncWithStatus(reason) {
+  emitSyncStatus('syncing');
+  try { await require('./sync').fullSync(); emitSyncStatus('synced'); }
+  catch (e) { emitSyncStatus('error'); console.warn(`[auth] ${reason} sync:`, e.message); }
+}
+
 // Restore a saved session on app start (no-op if none / disabled). Returns true if signed in.
 async function restore() {
   const sb = getClient();
@@ -106,7 +119,7 @@ async function handleDeepLink(url) {
   if (error) { console.error('[auth] code exchange failed:', error.message); return; }
   currentUser = data.user || null;
   emitAuthChanged();
-  try { await require('./sync').fullSync(); } catch (e) { console.warn('[auth] post-login sync:', e.message); }
+  await syncWithStatus('post-login');
 }
 
 function getUser() {
@@ -124,7 +137,7 @@ async function init() {
     app.setAsDefaultProtocolClient(PROTOCOL);
   }
   const authed = await restore();
-  if (authed) { emitAuthChanged(); try { await require('./sync').fullSync(); } catch (e) { console.warn('[auth] startup sync:', e.message); } }
+  if (authed) { emitAuthChanged(); await syncWithStatus('startup'); }
   return authed;
 }
 

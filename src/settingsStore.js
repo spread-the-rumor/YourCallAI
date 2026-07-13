@@ -11,6 +11,7 @@ const { PROXY_URL } = require('./proxy');
 const KEYS = [
   'USER_DISPLAY_NAME',
   'AUTO_DELETE_DAYS',
+  'THEME', // 'dark' | 'light' — UI theme preference
 ];
 
 const VERCEL_URL = PROXY_URL;

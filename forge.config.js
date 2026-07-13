@@ -1,5 +1,6 @@
 module.exports = {
   packagerConfig: {
+    icon: './assets/icon', // packager appends .ico (win) / .icns (mac)
     asar: {
       unpack: '**/node_modules/{get-windows,get-windows/**,koffi,koffi/**}/**',
     },
@@ -14,11 +15,18 @@ module.exports = {
   makers: [
     {
       name: '@electron-forge/maker-squirrel',
-      config: {},
+      config: { setupIcon: './assets/icon.ico' },
     },
     {
       name: '@electron-forge/maker-zip',
       platforms: ['darwin'],
+    },
+    {
+      // Branded macOS installer. darwin-only (appdmg needs macOS hdiutil); skipped on Windows.
+      name: '@electron-forge/maker-dmg',
+      platforms: ['darwin'],
+      config: { name: 'Your Call AI', icon: './assets/icon.icns', overwrite: true },
+      // ponytail: default DMG layout; add a background PNG later if wanted
     },
   ],
   publishers: [

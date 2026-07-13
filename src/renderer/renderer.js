@@ -544,13 +544,18 @@ async function openSettings() {
       <input data-key="${key}" type="${SECRET.test(key) ? 'password' : 'text'}" value="${esc(values[key] || '')}">`;
     box.appendChild(f);
   }
-  $('editor').classList.add('hidden');
-  $('empty-state').classList.add('hidden');
+  $('modal-backdrop').classList.remove('hidden');
   $('settings-view').classList.remove('hidden');
+  showTab('profile');
   renderAccount();
   renderSlack();
   closeChat();
   updateFab();
+}
+
+function showTab(name) {
+  document.querySelectorAll('.settings-tabs .seg-toggle').forEach((b) => b.classList.toggle('active', b.dataset.tab === name));
+  document.querySelectorAll('.settings-tab').forEach((t) => t.classList.toggle('hidden', t.id !== `tab-${name}`));
 }
 
 // Show the Slack connect/disconnect block. Block appears only if OAuth is configured on
@@ -571,18 +576,36 @@ async function renderAccount() {
   const { enabled, user } = await api.getUser();
   const block = $('account-block');
   block.classList.toggle('hidden', !enabled); // hide entirely if SSO not configured in this build
-  if (!enabled) return;
-  const signedIn = !!user;
-  $('account-signed-out').classList.toggle('hidden', signedIn);
-  $('account-signed-in').classList.toggle('hidden', !signedIn);
-  if (signedIn) {
-    $('account-email').textContent = user.email || user.name || 'Signed in';
-    const av = $('account-avatar');
-    if (user.avatar) { av.src = user.avatar; av.classList.remove('hidden'); } else av.classList.add('hidden');
+  const signedIn = enabled && !!user;
+  if (enabled) {
+    $('account-signed-out').classList.toggle('hidden', signedIn);
+    $('account-signed-in').classList.toggle('hidden', !signedIn);
+  }
+  // modal head + sidebar chip both mirror the same user
+  const label = signedIn ? (user.email || user.name || 'Signed in') : 'Account';
+  $('account-email').textContent = label;
+  const av = $('account-avatar');
+  if (signedIn && user.avatar) { av.src = user.avatar; av.classList.remove('hidden'); } else av.classList.add('hidden');
+  renderChip(enabled, user);
+}
+
+function renderChip(enabled, user) {
+  const chipAv = $('chip-avatar');
+  if (enabled && user) {
+    $('chip-name').textContent = user.name || user.email || 'Signed in';
+    $('chip-sub').textContent = user.name && user.email ? user.email : 'Signed in';
+    if (user.avatar) { chipAv.src = user.avatar; chipAv.classList.remove('hidden'); $('chip-fallback').classList.add('hidden'); }
+    else { chipAv.classList.add('hidden'); $('chip-fallback').classList.remove('hidden'); }
+  } else {
+    $('chip-name').textContent = enabled ? 'Not signed in' : 'Settings';
+    $('chip-sub').textContent = enabled ? 'Tap to sign in' : 'Preferences';
+    chipAv.classList.add('hidden'); $('chip-fallback').classList.remove('hidden');
   }
 }
+
 function closeSettings() {
   $('settings-view').classList.add('hidden');
+  $('modal-backdrop').classList.add('hidden');
   updateFab();
 }
 
@@ -615,14 +638,32 @@ function queueSave() {
   }, 1000);
 }
 
+// ---------- theme ----------
+function applyTheme(theme) {
+  const t = theme === 'light' ? 'light' : 'dark';
+  state.theme = t;
+  document.documentElement.setAttribute('data-theme', t);
+  const btn = $('theme-toggle');
+  if (btn) { btn.textContent = t === 'light' ? '☀' : '☾'; btn.title = t === 'light' ? 'Switch to dark' : 'Switch to light'; }
+}
+
 // ---------- wiring ----------
 async function init() {
   for (const id of ['loader-logo', 'brand-logo', 'empty-logo']) $(id).src = logoUrl;
+  // apply saved theme before anything renders (no flash of wrong theme)
+  applyTheme((await api.getSettings()).THEME || 'dark');
+  $('theme-toggle').addEventListener('click', () => {
+    const next = state.theme === 'light' ? 'dark' : 'light';
+    applyTheme(next);
+    api.saveSettings({ THEME: next });
+  });
   $('app-version').textContent = `v${await api.getAppVersion()}`;
   state.flags = await api.getEffectiveConfig();
   if (state.flags.slack) state.slackConnected = (await api.slackStatus()).connected;
 
   api.onStatus((s) => { state.status = s; renderStatus(); });
+  api.onSyncStatus(({ state: st }) => { $('sync-dot').className = `sync-dot ${st}`; if (st === 'synced') reload(); });
+  renderAccount(); // populate the sidebar user chip on startup
   api.onRecordingComplete((meeting) => {
     patchLocal(meeting);
     reload().then(() => selectMeeting(meeting.id));
@@ -642,8 +683,14 @@ async function init() {
     if (state.status.state === 'recording') await api.stopRecording();
     else await api.startDetectedRecording();
   });
-  $('btn-settings').addEventListener('click', openSettings);
-  $('settings-done').addEventListener('click', () => { closeSettings(); renderEditor(); });
+  $('user-chip').addEventListener('click', openSettings);
+  $('settings-close').addEventListener('click', closeSettings);
+  $('modal-backdrop').addEventListener('click', closeSettings);
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && !$('settings-view').classList.contains('hidden')) closeSettings();
+  });
+  document.querySelectorAll('.settings-tabs .seg-toggle').forEach((b) =>
+    b.addEventListener('click', () => showTab(b.dataset.tab)));
 
   $('btn-sign-in').addEventListener('click', () => api.signIn());
   $('btn-sign-out').addEventListener('click', async () => { await api.signOut(); });

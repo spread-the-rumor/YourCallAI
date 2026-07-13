@@ -31,11 +31,22 @@
       <div id="meeting-list" class="meeting-list"></div>
 
       <div class="sidebar-footer">
-        <button id="btn-settings" class="btn ghost pill footer-btn">⚙ Settings</button>
-        <details class="trash" id="trash-section">
-          <summary class="footer-btn">🗑 Trash <span id="trash-count" class="badge"></span></summary>
-          <div id="trash-list"></div>
-        </details>
+        <button id="user-chip" class="user-chip" title="Account & settings">
+          <img id="chip-avatar" class="chip-avatar hidden" alt="">
+          <span id="chip-fallback" class="chip-fallback">👤</span>
+          <span class="chip-text">
+            <span id="chip-name" class="chip-name">Not signed in</span>
+            <span id="chip-sub" class="chip-sub">Tap to sign in</span>
+          </span>
+        </button>
+        <div class="footer-row">
+          <details class="trash" id="trash-section">
+            <summary class="footer-btn">🗑 Trash <span id="trash-count" class="badge"></span></summary>
+            <div id="trash-list"></div>
+          </details>
+          <span id="sync-dot" class="sync-dot" title="Sync status"></span>
+          <button id="theme-toggle" class="icon-btn" title="Toggle light / dark">☾</button>
+        </div>
       </div>
     </aside>
 
@@ -58,7 +69,7 @@
         <div id="view-summary" class="view">
           <textarea id="note-content" spellcheck="false"></textarea>
           <div class="action-row" id="action-row"></div>
-          <div class="send-block glass">
+          <div class="send-block card">
             <div class="send-toggle segmented">
               <button data-dest="slack" class="seg-toggle active">Slack</button>
               <button data-dest="getoverview" class="seg-toggle">GetOverview</button>
@@ -71,27 +82,39 @@
         <div id="view-transcript" class="view hidden"></div>
       </div>
 
-      <div id="settings-view" class="settings hidden">
-        <h2>Settings</h2>
-        <div id="account-block" class="account-block glass hidden">
-          <h3>Account</h3>
-          <p class="muted" id="account-desc">Sign in with Google to sync your meetings across machines. Recordings stay on this device.</p>
-          <div id="account-signed-out">
-            <button id="btn-sign-in" class="btn primary pill">Sign in with Google</button>
-          </div>
-          <div id="account-signed-in" class="hidden">
-            <div class="account-user">
-              <img id="account-avatar" class="account-avatar" alt="">
-              <span id="account-email" class="account-email"></span>
-            </div>
-            <div class="settings-actions">
-              <button id="btn-sync-now" class="btn ghost pill">Sync now</button>
-              <button id="btn-sign-out" class="btn ghost pill">Sign out</button>
-              <span id="account-status" class="muted"></span>
-            </div>
-          </div>
+    </main>
+  </div>
+
+  <!-- Account / settings modal -->
+  <div id="modal-backdrop" class="modal-backdrop hidden"></div>
+  <div id="settings-view" class="settings glass hidden" role="dialog" aria-modal="true" aria-label="Account & settings">
+    <div class="settings-head">
+      <div class="account-user">
+        <img id="account-avatar" class="account-avatar hidden" alt="">
+        <span id="account-email" class="account-email">Account</span>
+      </div>
+      <button id="settings-close" class="chat-close" title="Close">✕</button>
+    </div>
+
+    <div class="settings-tabs segmented">
+      <button data-tab="profile" class="seg-toggle active">Profile</button>
+      <button data-tab="integrations" class="seg-toggle">Integrations</button>
+      <button data-tab="account" class="seg-toggle">Account</button>
+    </div>
+
+    <div class="settings-body">
+      <!-- Profile tab: preferred name + auto-delete (reuses existing settings save) -->
+      <div id="tab-profile" class="settings-tab">
+        <div id="settings-fields"></div>
+        <div class="settings-actions">
+          <button id="settings-save" class="btn primary pill">Save</button>
+          <span id="settings-status" class="muted"></span>
         </div>
-        <div id="slack-block" class="account-block glass hidden">
+      </div>
+
+      <!-- Integrations tab: Slack -->
+      <div id="tab-integrations" class="settings-tab hidden">
+        <div id="slack-block" class="account-block hidden">
           <h3>Slack</h3>
           <p class="muted">Connect your Slack workspace to send meeting summaries to your channels and DMs — posted as you.</p>
           <div id="slack-signed-out">
@@ -105,18 +128,29 @@
             </div>
           </div>
         </div>
-        <div id="settings-fields"></div>
-        <div class="settings-actions">
-          <button id="settings-save" class="btn primary pill">Save</button>
-          <button id="settings-done" class="btn ghost pill">Done</button>
-          <span id="settings-status" class="muted"></span>
+      </div>
+
+      <!-- Account tab: Google sign-in / sync / sign-out -->
+      <div id="tab-account" class="settings-tab hidden">
+        <div id="account-block" class="account-block hidden">
+          <p class="muted" id="account-desc">Sign in with Google to sync your meetings across machines. Recordings stay on this device.</p>
+          <div id="account-signed-out">
+            <button id="btn-sign-in" class="btn primary pill">Sign in with Google</button>
+          </div>
+          <div id="account-signed-in" class="hidden">
+            <div class="settings-actions">
+              <button id="btn-sync-now" class="btn ghost pill">Sync now</button>
+              <button id="btn-sign-out" class="btn ghost pill">Sign out</button>
+              <span id="account-status" class="muted"></span>
+            </div>
+          </div>
         </div>
       </div>
-    </main>
+    </div>
   </div>
 
   <!-- Floating AI chat -->
-  <button id="chat-fab" class="chat-fab glass" title="Ask AI about this meeting">💬</button>
+  <button id="chat-fab" class="chat-fab" title="Ask AI about this meeting">💬</button>
   <div id="chat-modal" class="chat-modal glass hidden">
     <div class="chat-modal-head">
       <span class="chat-modal-title">Ask AI</span>

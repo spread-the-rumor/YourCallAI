@@ -57,6 +57,13 @@ function emitProgress(recordingId, stage, detail = '') {
     mainWindow.webContents.send('transcribe-progress', { recordingId, stage, detail });
   }
 }
+// state ∈ 'syncing' | 'synced' | 'error'. 'synced' = this run didn't throw
+// (offline queue may still hold items). auth.js emits the same channel on login/startup sync.
+function emitSyncStatus(state) {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('sync-status', { state });
+  }
+}
 
 async function readMeta(dir) {
   try { return JSON.parse(await fsp.readFile(path.join(dir, 'meta.json'), 'utf8')); }
@@ -78,6 +85,8 @@ function createMainWindow() {
     minWidth: 900,
     minHeight: 600,
     backgroundColor: '#1C1C1C',
+    // Dev-only taskbar icon; packaged app gets its icon from forge packagerConfig.
+    ...(app.isPackaged ? {} : { icon: path.join(process.cwd(), 'assets', 'icon.png') }),
 
     webPreferences: {
       preload: MAIN_WINDOW_PRELOAD_WEBPACK_ENTRY,
@@ -536,7 +545,11 @@ ipcMain.handle('restart-app', () => { app.relaunch(); app.exit(0); });
 ipcMain.handle('auth-sign-in', () => auth.signIn());
 ipcMain.handle('auth-sign-out', () => auth.signOut());
 ipcMain.handle('auth-get-user', () => ({ enabled: auth.enabled(), user: auth.getUser() }));
-ipcMain.handle('sync-now', async () => { await sync.fullSync(); return { ok: true }; });
+ipcMain.handle('sync-now', async () => {
+  emitSyncStatus('syncing');
+  try { await sync.fullSync(); emitSyncStatus('synced'); return { ok: true }; }
+  catch (e) { emitSyncStatus('error'); return { ok: false, error: e.message }; }
+});
 
 // ---------- app lifecycle ----------
 

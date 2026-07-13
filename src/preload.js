@@ -52,4 +52,5 @@ contextBridge.exposeInMainWorld('api', {
   getUser: invoke('auth-get-user'),
   syncNow: invoke('sync-now'),
   onAuthChanged: on('auth-changed'),
+  onSyncStatus: on('sync-status'),
 });
