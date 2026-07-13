@@ -5,7 +5,7 @@
 const { json, readJson, env, requireAppToken } = require('./_shared');
 
 const ALLOWED = new Set([
-  'conversations.list', 'conversations.open',
+  'users.conversations', 'conversations.open',
   'users.list', 'chat.postMessage',
 ]);
 

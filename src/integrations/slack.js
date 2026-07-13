@@ -51,7 +51,11 @@ async function listSlackChannels() {
   const channels = [];
   let cursor;
   do {
-    const page = await slackApi('conversations.list', {
+    // users.conversations (channels this user belongs to), NOT conversations.list — the
+    // latter is hard rate-limited (429 ratelimited) for non-Marketplace apps. A user token
+    // can only post to channels the user is in anyway, so this is the correct set. Same
+    // channel object shape + next_cursor pagination.
+    const page = await slackApi('users.conversations', {
       types: 'public_channel,private_channel',
       exclude_archived: true,
       limit: 1000, // fewer paginated calls → fewer rate-limit hits
