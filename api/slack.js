@@ -20,10 +20,13 @@ module.exports = async (req, res) => {
   if (!ALLOWED.has(method)) return json(res, 200, { ok: false, error: `Slack method not allowed: ${method}` });
 
   try {
+    // Slack Web API reads params from form-urlencoded; a JSON body is IGNORED for read
+    // methods (users.conversations/users.list), silently dropping params like `types`.
+    // All our params are flat (channel/text/types/limit/booleans) so URLSearchParams is safe.
     const r = await fetch(`https://slack.com/api/${method}`, {
       method: 'POST',
-      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json; charset=utf-8' },
-      body: JSON.stringify(params),
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams(params),
     });
     // Pass through Slack's status (429 rate-limit incl. Retry-After) so the client's retry logic still works.
     const retry = r.headers.get('retry-after');
