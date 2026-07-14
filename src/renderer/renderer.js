@@ -657,7 +657,9 @@ async function init() {
     applyTheme(next);
     api.saveSettings({ THEME: next });
   });
-  $('app-version').textContent = `v${await api.getAppVersion()}`;
+  const _ver = await api.getAppVersion();
+  $('app-version').textContent = `v${_ver}`;
+  $('app-version').title = `Your Call AI v${_ver}`; // hover shows full build — auto-update sanity check
   state.flags = await api.getEffectiveConfig();
   if (state.flags.slack) state.slackConnected = (await api.slackStatus()).connected;
 
