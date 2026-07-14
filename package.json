@@ -16,7 +16,7 @@
     "ship": "node scripts/ship.mjs"
   },
   "author": "Rumor Avenue",
-  "license": "UNLICENSED",
+  "license": "MIT",
   "dependencies": {
     "@supabase/supabase-js": "^2.110.2",
     "@upstash/redis": "^1.38.0",
