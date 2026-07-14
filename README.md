@@ -45,10 +45,6 @@ Your Call AI is an [Electron](https://www.electronjs.org/) desktop app paired wi
       └──────────┘
 ```
 
-- **The app holds no API keys.** All third-party secrets live on the Vercel serverless backend (base `https://your-call-ai.vercel.app`). The client calls proxy routes and the backend injects the secret server-side.
-- **Supabase** provides Google SSO and per-user meeting sync.
-- **Recordings never leave your machine.** Only meeting metadata and transcripts sync, per user.
-
 ## Integrations
 
 ### Slack (per-user OAuth)
@@ -58,9 +54,9 @@ Each user connects their own workspace and posts **as themselves** — no shared
 - Send summaries to **channels or people** (DMs) from the meeting Slack panel.
 - Supports **external / Slack Connect** channels and DM contacts.
 
-### GetOverview
+### Project Management
 
-Push meeting summaries straight to GetOverview.
+Push meeting summaries straight to PM App.
 
 ## Install
 
@@ -69,46 +65,6 @@ Download the latest installer for your platform from the [**Releases**](https://
 - **Windows** — `.exe` (Squirrel) installer
 - **macOS** — `.dmg`
 
-## Development
-
-```bash
-npm install
-npm start          # electron-forge dev
-```
-
-> **Note:** Main-process changes require a **full restart** — kill every `electron.exe` / Electron process and relaunch. If the bundle looks stale, delete `.webpack/` for a clean rebuild.
-
-### Configuration
-
-Development secrets live in a gitignored `.env` at the project root (Supabase URL/anon key, Slack client ID, proxy token, and dev-only transcription/AI keys). Values resolve at access time in the order **build-time bake → `process.env` → `.env`**.
-
-See [`CLAUDE.md`](CLAUDE.md) for the full config/secrets map, backend route reference, and Slack app setup.
-
-## Release
-
-Releases are cut with a single command:
-
-```bash
-npm run ship -- "<message>" <patch|minor|major>
-```
-
-This commits, bumps the version, tags `vX.Y.Z`, and pushes — which triggers [`.github/workflows/release.yml`](.github/workflows/release.yml) to build the Windows + macOS installers into a **draft** GitHub Release and deploy the API to Vercel. Publish the draft manually once the build is green:
-
-```bash
-gh release edit vX.Y.Z --draft=false
-```
-
-## Project layout
-
-| Path | What lives there |
-|---|---|
-| `src/main.js` | Electron main process — IPC handlers, deep-link routing, app lifecycle |
-| `src/preload.js` | `contextBridge` `window.api` |
-| `src/proxy.js` | `PROXY_URL` + `proxyPost()`; resolves build/env/`.env` values |
-| `src/settingsStore.js` | Local prefs + feature flags |
-| `src/integrations/` | Slack + GetOverview clients |
-| `src/renderer/` | UI (`index.html`, `renderer.js`, `styles.css`) |
-| `api/` | Vercel serverless backend (proxy routes, OAuth, config) |
 
 ## License
 
