@@ -22,7 +22,7 @@ Records your screen and meeting audio, transcribes it, resolves who said what, w
 - 🎙️ **Records** screen + meeting audio locally.
 - ✍️ **Transcribes** with [Deepgram](https://deepgram.com/), then resolves speaker names.
 - 🧠 **Summarizes** each meeting with an LLM.
-- 📤 **Shares** the summary to **Slack** (as yourself, via per-user OAuth) or **GetOverview**.
+- 📤 **Shares** the summary to **Slack** (as yourself, via per-user OAuth) or **PM Tool**.
 - 🔒 **Keeps recordings on your machine** — only meeting metadata and transcripts sync per user.
 - 🔑 **Holds no API keys in the app.** Every third-party secret lives on a serverless backend; the desktop app only talks to proxy routes.
 
