@@ -604,10 +604,16 @@ if (!gotLock) {
         showPopup(info);
         emitStatus('meeting-detected', info.title);
       },
-      onClosed: () => {
+      onClosed: async () => {
         pendingMeeting = null;
         hidePopup();
         if (rec?.meta.source === 'detected') {
+          // A Meet's title vanishes on tab switch / screen share / PiP while the call is live —
+          // never auto-stop while the browser still holds the mic.
+          if (rec.meta.platform === 'google-meet' && await detector.browserMicActive()) {
+            console.warn('[detector] onClosed ignored: browser mic still active (Meet ongoing)');
+            return;
+          }
           stopRecording().catch((e) => console.error('[detector] auto-stop failed:', e.message));
         } else if (!rec) {
           emitStatus('idle');
