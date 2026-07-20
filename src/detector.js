@@ -1,21 +1,58 @@
-// Meeting detection (§8): poll window titles every 5s, debounce 2 hits / 3 misses.
+// Meeting detection (§8): poll window titles + mic-in-use every 5s, debounce 2 hits / 3 misses.
 // Primary: get-windows (ESM, dynamic import). Fallback: PowerShell (win) / AppleScript (mac).
+//
+// Liveness is COMPOSITE: once a meeting is announced, it stays alive while ANY of
+//   (W) a matching window/title is present,
+//   (M) the meeting app still holds the OS microphone,
+//   (A) meeting audio is still flowing (isAudioActive, supplied by main while recording),
+// is true. It only "closes" when ALL are absent for MISSES_TO_CLOSE polls. This survives tab
+// switches / screen share / PiP / mute / dial-in, and stops only when the meeting really ended.
 const { execFile } = require('child_process');
 
 const POLL_MS = 5000;
 const HITS_TO_DETECT = 2;
 const MISSES_TO_CLOSE = 3;
 
+// Browser families that can host a meeting (Chromium-based). Titles from these are tab titles.
+const BROWSER_RE = /chrome|msedge|edge|chromium|brave|opera|vivaldi/;
+
+// Returns { platform, transport, title } or null. transport ∈ 'app' | 'browser'.
 function matchMeeting(windows) {
   for (const w of windows) {
     const title = w.title || '';
     const app = (w.app || '').toLowerCase();
-    // "Meet – <code>" is the tab title; "meet.google.com is sharing..." appears during screen share.
-    if ((/^Meet [–-] /.test(title) || /meet\.google\.com/i.test(title)) && /chrome|edge|msedge/.test(app)) {
-      return { platform: 'google-meet', title };
+    const isBrowser = BROWSER_RE.test(app);
+    // Google Meet — always browser. "Meet – <code>" is the tab title; the "meet.google.com is
+    // sharing…" banner title shows during screen share.
+    if ((/^Meet [–-] /.test(title) || /meet\.google\.com/i.test(title)) && isBrowser) {
+      return { platform: 'google-meet', transport: 'browser', title };
     }
-    if (/zoom/.test(app) && /Zoom Meeting/.test(title)) return { platform: 'zoom', title };
-    if (/Microsoft Teams/.test(title) && /(Meeting|Call)/.test(title)) return { platform: 'teams', title };
+    // Zoom desktop app.
+    if (/zoom/.test(app) && /Zoom Meeting/i.test(title)) {
+      return { platform: 'zoom', transport: 'app', title };
+    }
+    // Zoom in a browser tab — the in-call title is "Zoom Meeting" / the web client is app.zoom.us.
+    if (isBrowser && (/\bzoom meeting\b/i.test(title) || /app\.zoom\.us/i.test(title))) {
+      return { platform: 'zoom', transport: 'browser', title };
+    }
+    // Teams desktop app — newer titles lack a Meeting/Call marker (mic fallback covers those).
+    if (/Microsoft Teams/i.test(title) && /(Meeting|Call)/i.test(title) && !isBrowser) {
+      return { platform: 'teams', transport: 'app', title };
+    }
+    // Teams in a browser tab is NOT matched on title — "… | Microsoft Teams" is ambiguous (chat,
+    // activity, etc.). Browser-Teams is detected via the mic (holders) instead.
+  }
+  return null;
+}
+
+// Does a browser window show any meeting-ish tab title? Used to gate browser-mic-only detection.
+function browserMeetingHint(windows) {
+  for (const w of windows) {
+    const title = w.title || '';
+    if (!BROWSER_RE.test((w.app || '').toLowerCase())) continue;
+    if (/^Meet [–-] /.test(title) || /meet\.google\.com/i.test(title)) return 'google-meet';
+    if (/\bzoom\b/i.test(title) || /app\.zoom\.us/i.test(title)) return 'zoom';
+    if (/Microsoft Teams/i.test(title)) return 'teams';
   }
   return null;
 }
@@ -23,6 +60,7 @@ function matchMeeting(windows) {
 let getWindowsMod = null;
 let getWindowsFailed = false;
 
+// Resolves to an array of { title, app }, or null if enumeration failed (distinct from "no windows").
 async function listWindows() {
   if (!getWindowsFailed) {
     try {
@@ -44,8 +82,8 @@ function platformListWindows() {
   return new Promise((resolve) => {
     if (process.platform === 'win32') {
       const ps = "Get-Process | Where-Object {$_.MainWindowTitle -ne ''} | ForEach-Object { $_.ProcessName + '|' + $_.MainWindowTitle }";
-      execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', ps], { timeout: 8000 }, (err, stdout) => {
-        if (err) return resolve([]);
+      execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', ps], { timeout: 4000 }, (err, stdout) => {
+        if (err) return resolve(null);
         resolve(stdout.split(/\r?\n/).filter(Boolean).map((line) => {
           const i = line.indexOf('|');
           return { app: line.slice(0, i), title: line.slice(i + 1) };
@@ -64,8 +102,8 @@ function platformListWindows() {
             end try
           end repeat
         end tell
-        return out`], { timeout: 8000 }, (err, stdout) => {
-        if (err) return resolve([]);
+        return out`], { timeout: 4000 }, (err, stdout) => {
+        if (err) return resolve(null);
         resolve(stdout.split('\n').filter(Boolean).map((line) => {
           const i = line.indexOf('|');
           return { app: line.slice(0, i), title: line.slice(i + 1) };
@@ -76,55 +114,103 @@ function platformListWindows() {
   });
 }
 
-// Windows mic-in-use registry: LastUsedTimeStop=0x0 under the ConsentStore means the app whose
-// key path matches appRe is holding the microphone right now. Survives tab switches / title changes.
-function micActive(appRe) {
-  if (process.platform !== 'win32') return Promise.resolve(false);
+// Windows mic-in-use registry: LastUsedTimeStop=0x0 under the ConsentStore means that app is
+// holding the microphone right now. The recursive scan covers packaged (e.g. MSTeams_…) and
+// NonPackaged (e.g. …\chrome.exe) subtrees. Returns a Set of platform-family tokens currently
+// holding the mic ('browser' | 'zoom' | 'teams'), or null if the registry could not be read
+// (null = unknown, never treated as "released"). Our own Electron mic-hold matches none of these.
+function micHolders() {
+  if (process.platform !== 'win32') return Promise.resolve(null);
   return new Promise((resolve) => {
     execFile('reg', ['query',
       'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\CapabilityAccessManager\\ConsentStore\\microphone',
-      '/s'], { timeout: 8000 }, (err, stdout) => {
-      if (err) return resolve(false);
-      let inAppKey = false;
+      '/s'], { timeout: 4000 }, (err, stdout) => {
+      if (err || !stdout) return resolve(null);
+      const holders = new Set();
+      let keyToken = null; // family token for the key section currently being scanned
       for (const raw of stdout.split(/\r?\n/)) {
         const line = raw.trim();
-        if (line.startsWith('HKEY_')) inAppKey = appRe.test(line);
-        else if (inAppKey && /^LastUsedTimeStop\s+REG_QWORD\s+0x0$/.test(line)) return resolve(true);
+        if (line.startsWith('HKEY_')) {
+          const low = line.toLowerCase();
+          if (BROWSER_RE.test(low)) keyToken = 'browser';
+          else if (/zoom|cpthost/.test(low)) keyToken = 'zoom';
+          else if (/teams|msteams/.test(low)) keyToken = 'teams';
+          else keyToken = null;
+        } else if (keyToken && /^LastUsedTimeStop\s+REG_QWORD\s+0x0$/.test(line)) {
+          holders.add(keyToken);
+        }
       }
-      resolve(false);
+      resolve(holders);
     });
   });
 }
 
-// New Teams window titles carry no "Meeting"/"Call" marker (e.g. "Guidion | SBPM | Microsoft Teams").
-const teamsMicActive = () => micActive(/teams/i);
-// Chrome/Edge hold the mic for the whole Meet call — through tab switches, screen share, and PiP.
-const browserMicActive = () => micActive(/chrome|msedge/i);
+// Back-compat thin wrappers (used elsewhere / tests).
+const teamsMicActive = async () => { const h = await micHolders(); return !!h && h.has('teams'); };
+const browserMicActive = async () => { const h = await micHolders(); return !!h && h.has('browser'); };
 
-function start({ onDetected, onClosed }) {
+// The mic-family token that keeps a given meeting alive.
+function micTokenFor(meeting) {
+  if (!meeting) return null;
+  if (meeting.transport === 'browser') return 'browser';
+  return meeting.platform === 'zoom' ? 'zoom' : 'teams'; // app transport
+}
+
+function start({ onDetected, onClosed, isAudioActive }) {
   let hits = 0, misses = 0, announced = false, stopped = false;
-  let current = null; // last announced meeting, kept so mic-sustained ticks reuse its identity
+  let current = null; // last announced { platform, transport }, reused by mic/audio sustain
 
   const tick = async () => {
     if (stopped) return;
     try {
-      const windows = await listWindows();
-      let meeting = matchMeeting(windows);
-      if (!meeting && await teamsMicActive()) {
-        const w = windows.find((x) => /teams/i.test(x.app) || / Microsoft Teams$/.test(x.title));
-        meeting = { platform: 'teams', title: w?.title || 'Microsoft Teams' };
+      const [windows, holders] = await Promise.all([listWindows(), micHolders()]);
+
+      // Enumeration failure = unknown; hold state rather than faking a miss.
+      if (windows === null && holders === null) {
+        if (!stopped) setTimeout(tick, POLL_MS);
+        return;
       }
-      // A live Meet's title disappears on tab switch / screen share / PiP. Initial detection stays
-      // title-gated, but once announced, the browser still holding the mic counts as a hit.
-      if (!meeting && announced && current?.platform === 'google-meet' && await browserMicActive()) {
-        meeting = current;
+      const wins = windows || [];
+
+      let meeting = matchMeeting(wins); // (W) confident title match
+
+      if (!announced) {
+        // Gate browser-transport title matches on the mic so a stray tab (a "zoom" article, an
+        // idle Teams/Meet tab) can't trigger a false popup. `holders === null` = unknown (mac /
+        // registry read failed) → don't block, fall back to title alone.
+        if (meeting && meeting.transport === 'browser' && holders && !holders.has('browser')) {
+          meeting = null;
+        }
+        // Announce path: title match, OR a dedicated app holds the mic (no title needed), OR a
+        // browser holds the mic AND some browser tab looks meeting-ish.
+        if (!meeting && holders) {
+          if (holders.has('zoom')) meeting = { platform: 'zoom', transport: 'app', title: 'Zoom Meeting' };
+          else if (holders.has('teams')) meeting = { platform: 'teams', transport: 'app', title: 'Microsoft Teams' };
+          else if (holders.has('browser')) {
+            const hint = browserMeetingHint(wins);
+            if (hint) meeting = { platform: hint, transport: 'browser', title: '' };
+          }
+        }
+      } else {
+        // Keep-alive path — composite (W) || (M) || (A). matchMeeting must agree on platform.
+        const windowAlive = !!meeting && meeting.platform === current.platform;
+        const micAlive = !!holders && holders.has(micTokenFor(current));
+        const audioAlive = !!isAudioActive && isAudioActive();
+        meeting = (windowAlive || micAlive || audioAlive) ? current : null;
       }
+
       if (meeting) {
         hits++; misses = 0;
-        if (hits >= HITS_TO_DETECT && !announced) { announced = true; current = meeting; onDetected(meeting); }
+        if (hits >= HITS_TO_DETECT && !announced) {
+          announced = true;
+          current = { platform: meeting.platform, transport: meeting.transport };
+          onDetected(meeting);
+        }
       } else {
         misses++; hits = 0;
-        if (misses >= MISSES_TO_CLOSE && announced) { announced = false; current = null; onClosed(); }
+        if (misses >= MISSES_TO_CLOSE && announced) {
+          announced = false; current = null; onClosed();
+        }
       }
     } catch (err) {
       console.warn('[detector] poll failed:', err.message);
@@ -136,4 +222,4 @@ function start({ onDetected, onClosed }) {
   return { stop: () => { stopped = true; } };
 }
 
-module.exports = { start, matchMeeting, teamsMicActive, browserMicActive };
+module.exports = { start, matchMeeting, micHolders, teamsMicActive, browserMicActive };

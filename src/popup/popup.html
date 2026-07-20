@@ -23,10 +23,14 @@
     .sub { font-size: 11px; color: rgba(246, 246, 246, 0.6); margin-top: 2px; max-width: 170px;
            white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     button { -webkit-app-region: no-drag; cursor: pointer; border: none; border-radius: 999px; font-size: 12px; }
-    #start { background: #FDE4C3; color: #2b2113; font-weight: 700; padding: 8px 16px; }
-    #start:hover { filter: brightness(1.08); }
-    #dismiss { background: transparent; color: rgba(246, 246, 246, 0.55); font-size: 15px; padding: 4px 8px; border-radius: 50%; }
-    #dismiss:hover { color: #F6F6F6; background: rgba(255, 255, 255, 0.08); }
+    .primary { background: #FDE4C3; color: #2b2113; font-weight: 700; padding: 8px 16px; }
+    .primary:hover { filter: brightness(1.08); }
+    .ghost { background: rgba(255, 255, 255, 0.08); color: rgba(246, 246, 246, 0.85);
+             font-weight: 600; padding: 8px 14px; }
+    .ghost:hover { background: rgba(255, 255, 255, 0.16); }
+    .icon { background: transparent; color: rgba(246, 246, 246, 0.55); font-size: 15px; padding: 4px 8px; border-radius: 50%; }
+    .icon:hover { color: #F6F6F6; background: rgba(255, 255, 255, 0.08); }
+    .hidden { display: none !important; }
   </style>
 </head>
 <body>
@@ -34,11 +38,17 @@
     <div class="row">
       <img class="logo" id="popup-logo" alt="">
       <div class="text">
-        <div class="title">Meeting detected</div>
+        <div class="title" id="title">Meeting detected</div>
         <div class="sub" id="detail">—</div>
       </div>
-      <button id="start">● Start Recording</button>
-      <button id="dismiss" title="Dismiss">✕</button>
+      <!-- detected mode -->
+      <button id="start" class="primary">● Start Recording</button>
+      <button id="dismiss" class="icon" title="Dismiss">✕</button>
+      <!-- silence mode -->
+      <button id="stop" class="primary hidden">■ Stop</button>
+      <button id="keep" class="ghost hidden">Keep going</button>
+      <!-- ending mode -->
+      <button id="keep-ending" class="primary hidden">Keep recording</button>
     </div>
   </div>
 </body>

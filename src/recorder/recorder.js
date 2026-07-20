@@ -3,7 +3,13 @@
 // Two MediaRecorders: A = video + mono mix (playback), B = stereo opus
 // (ch0 mic / ch1 system) for Deepgram multichannel. 15s timeslice chunks → IPC → disk.
 
-let state = null; // { recA, recB, streams, ctx, pending }
+let state = null; // { recA, recB, streams, ctx, pending, levelTimer }
+
+// Silence detection: an AnalyserNode taps mic+system so "anyone speaking" (local OR remote)
+// counts as sound. Below this RMS for SILENCE_MS → tell main (popup: "stop recording?").
+const LEVEL_MS = 1000;        // how often we sample the level
+const SILENCE_RMS = 0.0025;   // ~ -52 dBFS; below this = effectively silent
+const SILENCE_MS = 30000;     // no sound for this long → capture-silence (once, re-arms on sound)
 
 async function startCapture() {
   try {
@@ -55,9 +61,33 @@ async function startCapture() {
     // If the user ends screen share from the OS UI, treat it as a stop.
     display.getVideoTracks()[0].onended = () => stopCapture();
 
+    // Passive level tap (mic + system) for silence detection + a liveness heartbeat to main.
+    const analyser = ctx.createAnalyser();
+    analyser.fftSize = 2048;
+    micSrc.connect(analyser);
+    if (sysSrc) sysSrc.connect(analyser);
+    const buf = new Float32Array(analyser.fftSize);
+    let lastSoundTs = Date.now();
+    let silenceFired = false;
+    const levelTimer = setInterval(() => {
+      analyser.getFloatTimeDomainData(buf);
+      let sum = 0;
+      for (let i = 0; i < buf.length; i++) sum += buf[i] * buf[i];
+      const rms = Math.sqrt(sum / buf.length);
+      const active = rms >= SILENCE_RMS;
+      window.capture.audio(active); // heartbeat → main keeps lastFarEndSoundTs
+      if (active) {
+        lastSoundTs = Date.now();
+        silenceFired = false;
+      } else if (!silenceFired && Date.now() - lastSoundTs >= SILENCE_MS) {
+        silenceFired = true; // fire once; re-arms when sound returns
+        window.capture.silence();
+      }
+    }, LEVEL_MS);
+
     recA.start(15000);
     recB.start(15000);
-    state = { recA, recB, streams: [display, mic, monoDest.stream, stereoDest.stream], ctx, pending };
+    state = { recA, recB, streams: [display, mic, monoDest.stream, stereoDest.stream], ctx, pending, levelTimer };
   } catch (err) {
     window.capture.error(`capture failed to start: ${err.message}`);
   }
@@ -65,8 +95,9 @@ async function startCapture() {
 
 async function stopCapture() {
   if (!state) { window.capture.stopped(); return; }
-  const { recA, recB, streams, ctx, pending } = state;
+  const { recA, recB, streams, ctx, pending, levelTimer } = state;
   state = null;
+  clearInterval(levelTimer); // stop sampling before the context closes
   const stopped = (rec) => new Promise((resolve) => {
     if (rec.state === 'inactive') return resolve();
     rec.onstop = resolve;

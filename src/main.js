@@ -1,7 +1,7 @@
 // Electron main: orchestrates settings/config, backend, detector, recorder window,
 // recording state, the post-recording pipeline, persistence, and all IPC (§3.1).
 // CRITICAL: never process.exit / throw at module load — missing keys degrade per-feature.
-const { app, BrowserWindow, ipcMain, session, desktopCapturer, dialog, shell, screen, systemPreferences } = require('electron');
+const { app, BrowserWindow, ipcMain, session, desktopCapturer, dialog, shell, screen, systemPreferences, Notification } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const fsp = fs.promises;
@@ -32,6 +32,8 @@ const { transcriptToText, segSpeaker, segText, meetingDate } = require('./transc
 
 let mainWindow = null;
 let popupWindow = null;
+let popupReady = false;      // popup webContents finished loading (guards the content race)
+let pendingPopupInfo = null; // info to send once the popup is ready
 let recorderWindow = null;
 let recordingsDir = null;
 let detectorHandle = null;
@@ -41,6 +43,15 @@ let quitting = false;
 // Active recording state
 let rec = null; // { id, dir, meta, videoStream, audioStream, speakersStream, agent, stopResolve }
 const pipelineRunning = new Set();
+
+// Composite liveness: last time the recorder reported meeting audio, and the cancelable
+// "meeting ended" countdown. isAudioActive() is one of the detector's keep-alive signals.
+let lastFarEndSoundTs = 0;
+let pendingStop = null; // { timer, watch } while the ending countdown runs
+const AUDIO_ACTIVE_MS = 20000;
+const STOP_COUNTDOWN_MS = 15000;
+const isAudioActive = () => !!rec && (Date.now() - lastFarEndSoundTs < AUDIO_ACTIVE_MS);
+const PLATFORM_LABELS = { 'google-meet': 'Google Meet', zoom: 'Zoom', teams: 'Microsoft Teams' };
 
 // ---------- helpers ----------
 
@@ -104,8 +115,9 @@ function createMainWindow() {
 }
 
 function createPopupWindow() {
+  popupReady = false;
   popupWindow = new BrowserWindow({
-    width: 360,
+    width: 380,
     height: 96,
     show: false,
     frame: false,
@@ -121,19 +133,74 @@ function createPopupWindow() {
     },
   });
   popupWindow.setAlwaysOnTop(true, 'screen-saver');
+  // Appear on whatever virtual desktop / fullscreen space the user is currently in.
+  popupWindow.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
   popupWindow.loadURL(POPUP_WINDOW_WEBPACK_ENTRY);
-  popupWindow.on('closed', () => { popupWindow = null; });
+  // Content race: don't send until the renderer is listening, or it shows the "—" placeholder.
+  popupWindow.webContents.on('did-finish-load', () => {
+    popupReady = true;
+    if (pendingPopupInfo && popupWindow && !popupWindow.isDestroyed()) {
+      popupWindow.webContents.send('popup-show', pendingPopupInfo);
+      pendingPopupInfo = null;
+    }
+  });
+  popupWindow.on('closed', () => { popupWindow = null; popupReady = false; });
 }
 
+// info = { kind: 'detected' | 'silence' | 'ending', platform, title, seconds }
 function showPopup(info) {
   if (!popupWindow || popupWindow.isDestroyed()) createPopupWindow();
-  const { workArea } = screen.getPrimaryDisplay();
-  popupWindow.setPosition(workArea.x + workArea.width - 376, workArea.y + 16);
-  popupWindow.webContents.send('meeting-info', info);
+  // Position on the display nearest the cursor, not always the primary monitor.
+  const { workArea } = screen.getDisplayNearestPoint(screen.getCursorScreenPoint());
+  popupWindow.setPosition(workArea.x + workArea.width - 396, workArea.y + 16);
+  if (popupReady) popupWindow.webContents.send('popup-show', info);
+  else pendingPopupInfo = info;
   popupWindow.showInactive();
+  popupWindow.setAlwaysOnTop(true, 'screen-saver');
+  popupWindow.moveTop();
+  notify(info); // native toast — reliable even when the popup lands on another desktop
 }
 function hidePopup() {
+  pendingPopupInfo = null;
   if (popupWindow && !popupWindow.isDestroyed()) popupWindow.hide();
+}
+
+// Native OS notification as a cross-desktop / fullscreen safety net for the popup.
+function notify(info) {
+  try {
+    if (!Notification.isSupported()) return;
+    const platform = PLATFORM_LABELS[info.platform] || info.platform || 'Meeting';
+    let title, body;
+    if (info.kind === 'silence') { title = 'Still recording?'; body = 'No one has spoken for 30s — open Your Call AI to stop.'; }
+    else if (info.kind === 'ending') { title = 'Meeting ended'; body = 'Stopping the recording shortly…'; }
+    else { title = 'Meeting detected'; body = `${platform} — open Your Call AI to start recording.`; }
+    const n = new Notification({ title, body });
+    n.on('click', () => { if (mainWindow && !mainWindow.isDestroyed()) { mainWindow.show(); mainWindow.focus(); } });
+    n.show();
+  } catch { /* toast unsupported — in-app popup + status still cover it */ }
+}
+
+// Cancelable "meeting ended" auto-stop (user chose a countdown over a silent stop).
+function beginPendingStop() {
+  if (pendingStop || !rec) return;
+  showPopup({ kind: 'ending', platform: rec.meta.platform, title: rec.meta.title, seconds: STOP_COUNTDOWN_MS / 1000 });
+  const timer = setTimeout(() => {
+    clearInterval(pendingStop.watch);
+    pendingStop = null;
+    hidePopup();
+    stopRecording().catch((e) => console.error('[detector] auto-stop failed:', e.message));
+  }, STOP_COUNTDOWN_MS);
+  // If meeting audio returns mid-countdown, the meeting didn't really end — cancel.
+  const watch = setInterval(() => { if (isAudioActive()) cancelPendingStop('audio resumed'); }, 1000);
+  pendingStop = { timer, watch };
+}
+function cancelPendingStop(reason) {
+  if (!pendingStop) return;
+  clearTimeout(pendingStop.timer);
+  clearInterval(pendingStop.watch);
+  pendingStop = null;
+  hidePopup();
+  console.warn('[detector] pending stop canceled:', reason);
 }
 
 function createRecorderWindow() {
@@ -188,6 +255,8 @@ async function startRecording(source, platform = '', title = '') {
   if (rec) return { ok: false, error: 'Already recording.' };
   const perms = await ensureMacPermissions();
   if (!perms.ok) { emitStatus('error', perms.error); return perms; }
+  cancelPendingStop('new recording');
+  lastFarEndSoundTs = Date.now(); // assume the meeting is live at the moment we start
 
   const id = rid();
   const dir = path.join(recordingsDir, id);
@@ -247,6 +316,7 @@ async function finalizeRecording(failedMessage = null) {
 
 async function stopRecording() {
   if (!rec) return { ok: false, error: 'Not recording.' };
+  cancelPendingStop('recording stopped'); // clear any in-flight ending countdown
   const stopped = new Promise((resolve) => { rec.stopResolve = resolve; });
   if (recorderWindow && !recorderWindow.isDestroyed()) {
     recorderWindow.webContents.send('stop-capture');
@@ -269,6 +339,13 @@ ipcMain.on('capture-error', async (e, message) => {
   console.error('[capture]', message);
   await finalizeRecording(message);
   emitStatus('error', message);
+});
+// Recorder liveness heartbeat: meeting audio is flowing → keeps the detector's (A) signal alive.
+ipcMain.on('capture-audio', (e, active) => { if (active) lastFarEndSoundTs = Date.now(); });
+// 30s of no speech → ask the user whether to stop (ignored = keep recording).
+ipcMain.on('capture-silence', () => {
+  if (!rec || pendingStop) return; // don't overlay the "ending" countdown
+  showPopup({ kind: 'silence', platform: rec.meta.platform, title: rec.meta.title });
 });
 
 // ---------- post-recording pipeline (§11) ----------
@@ -462,6 +539,15 @@ ipcMain.handle('dismiss-detected-meeting', () => { hidePopup(); return { ok: tru
 ipcMain.on('popup-start-recording', () => {
   startRecording('detected', pendingMeeting?.platform, pendingMeeting?.title);
 });
+ipcMain.on('popup-stop-recording', () => {
+  cancelPendingStop('user stopped');
+  hidePopup();
+  stopRecording().catch((e) => console.error('[popup] stop failed:', e.message));
+});
+ipcMain.on('popup-keep-recording', () => {
+  if (pendingStop) cancelPendingStop('user kept recording'); // ending countdown
+  else hidePopup();                                          // silence popup "keep going"
+});
 ipcMain.on('popup-dismiss', () => hidePopup());
 
 // ---------- IPC: integrations ----------
@@ -598,24 +684,24 @@ if (!gotLock) {
     createPopupWindow();
 
     detectorHandle = detector.start({
+      isAudioActive, // composite keep-alive signal (A): meeting audio still flowing
       onDetected: (info) => {
-        if (rec) return; // already recording — don't re-announce
+        if (rec) {
+          // Already recording. If a "meeting ended" countdown is running, the meeting came back.
+          if (pendingStop) cancelPendingStop('meeting resumed');
+          return;
+        }
         pendingMeeting = info;
-        showPopup(info);
+        showPopup({ kind: 'detected', platform: info.platform, title: info.title });
         emitStatus('meeting-detected', info.title);
       },
-      onClosed: async () => {
+      onClosed: () => {
         pendingMeeting = null;
-        hidePopup();
+        // The detector fires this only when window AND mic AND audio have all been gone ~15s.
         if (rec?.meta.source === 'detected') {
-          // A Meet's title vanishes on tab switch / screen share / PiP while the call is live —
-          // never auto-stop while the browser still holds the mic.
-          if (rec.meta.platform === 'google-meet' && await detector.browserMicActive()) {
-            console.warn('[detector] onClosed ignored: browser mic still active (Meet ongoing)');
-            return;
-          }
-          stopRecording().catch((e) => console.error('[detector] auto-stop failed:', e.message));
+          beginPendingStop(); // cancelable countdown, not a silent stop
         } else if (!rec) {
+          hidePopup();
           emitStatus('idle');
         }
       },
