@@ -295,6 +295,29 @@ function closeStream(stream) {
   });
 }
 
+// A minimal, always-persistable meeting record with a playable video and no transcript yet.
+// runPipeline later updates this same record; the id/recordingId/title/date match what the
+// pipeline produces (buildTitle from the recording date) so the later write doesn't drift.
+function buildPlaceholderMeeting(id, meta, failedMessage) {
+  const date = meta?.startedAt || nowIso();
+  const summary = failedMessage
+    ? `Recording saved. Transcription failed — ${failedMessage}. Use Retry transcription.`
+    : 'Recording saved. Transcript and summary are being generated…';
+  return {
+    id,
+    recordingId: id,
+    title: buildTitle(date),
+    date,
+    content: summary,
+    summary,
+    transcript: null,
+    videoUrl: `http://localhost:${server.PORT}/recordings/${id}/video.webm`,
+    transcriptUrl: null,
+    speakerMap: {},
+    chat: [],
+  };
+}
+
 async function finalizeRecording(failedMessage = null) {
   if (!rec) return null;
   const current = rec;
@@ -311,6 +334,20 @@ async function finalizeRecording(failedMessage = null) {
     ...(failedMessage ? { error: failedMessage } : {}),
   });
   if (recorderWindow && !recorderWindow.isDestroyed()) recorderWindow.destroy();
+
+  // Persist a meeting card the instant capture stops, BEFORE the pipeline runs. This guarantees
+  // the recording (and playable video) is always visible in the UI even if transcription fails or
+  // the app is closed mid-pipeline. runPipeline upserts by recordingId, so it updates this record.
+  try {
+    const placeholder = buildPlaceholderMeeting(current.id, current.meta, failedMessage);
+    const saved = await store.upsertMeeting(placeholder);
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('recording-complete', saved);
+    }
+  } catch (err) {
+    console.error('[finalize] could not persist meeting card:', err.message);
+  }
+
   return current.id;
 }
 
@@ -364,6 +401,15 @@ async function runPipeline(recordingId) {
   try {
     const meta = await readMeta(dir);
     if (!meta) return;
+
+    // Ensure a visible card exists before transcription — covers requeued/orphaned recordings
+    // (folder on disk but no meetings.json entry) so they surface immediately, not only if the
+    // pipeline reaches its final upsert. Live recordings already got this in finalizeRecording.
+    if (!(await store.getMeeting(recordingId))) {
+      const ph = buildPlaceholderMeeting(recordingId, meta, meta.status === 'failed' ? (meta.error || null) : null);
+      const saved = await store.upsertMeeting(ph);
+      if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('recording-complete', saved);
+    }
 
     await patchMeta(dir, { status: 'transcribing' });
     emitStatus('transcribing', 'Transcribing with Deepgram…');
@@ -425,6 +471,14 @@ async function runPipeline(recordingId) {
   } catch (err) {
     console.error('[pipeline] fatal:', err);
     await patchMeta(dir, { status: 'failed', error: err.message }).catch(() => {});
+    // Never let an IO/store throw silently discard the recording: ensure a card still exists.
+    try {
+      if (!(await store.getMeeting(recordingId))) {
+        const meta = await readMeta(dir).catch(() => null);
+        const saved = await store.upsertMeeting(buildPlaceholderMeeting(recordingId, meta, err.message));
+        if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('recording-complete', saved);
+      }
+    } catch (e) { console.error('[pipeline] fallback persist failed:', e.message); }
   } finally {
     pipelineRunning.delete(recordingId);
     emitStatus(rec ? 'recording' : 'idle');
@@ -458,8 +512,14 @@ async function recoverAndRequeue() {
     });
     if (response === 0) requeue.push(...interrupted);
   }
-  if (requeue.length && process.env.DEEPGRAM_API_KEY) {
-    for (const id of requeue) runPipeline(id);
+  if (requeue.length) {
+    // Auto-transcribe only when the backend actually has Deepgram configured. The key lives on
+    // the Vercel proxy (never on the client), so the old `process.env.DEEPGRAM_API_KEY` gate was
+    // ALWAYS false in packaged builds — recovery never ran and interrupted/failed recordings were
+    // orphaned forever. Use the cached /api/config flag instead (default to attempting if unknown).
+    let deepgramEnabled = true;
+    try { deepgramEnabled = (await settingsStore.getConfiguredFlags()).deepgram !== false; } catch { /* assume on */ }
+    if (deepgramEnabled) for (const id of requeue) runPipeline(id);
   }
 }
 
@@ -718,11 +778,20 @@ if (!gotLock) {
   });
 
   app.on('before-quit', async (e) => {
-    if (rec && !quitting) {
+    if (quitting) return;
+    // Guard on BOTH an active recording AND an in-flight pipeline. Previously only `rec` was
+    // checked, so closing the app during post-recording processing killed the pipeline. That is
+    // now recoverable (the card is persisted at stop and recoverAndRequeue re-runs on launch), but
+    // we still give a brief grace so the fast final stages (names/summary/persist) can complete.
+    if (rec || pipelineRunning.size) {
       e.preventDefault();
       quitting = true;
-      try { await stopRecording(); } catch (err) { console.error('[quit]', err.message); }
-      app.quit(); // transcription resumes on next launch via the requeue
+      try { if (rec) await stopRecording(); } catch (err) { console.error('[quit]', err.message); }
+      const deadline = Date.now() + 12000;
+      while (pipelineRunning.size && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 250));
+      }
+      app.quit(); // anything still transcribing resumes on next launch via the requeue
     }
   });
 

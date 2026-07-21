@@ -1,5 +1,6 @@
 // Deepgram transcription via the Vercel proxy (§6). No key on the client.
-// Flow: upload audio.webm straight to Vercel Blob → submit job → poll for the result.
+// Flow: upload audio.webm straight to Vercel Blob → POST /api/transcribe (synchronous; the proxy
+// runs Deepgram and stores the transcript to Blob) → fetch the transcript URL directly from Blob.
 // audio.webm is stereo opus: ch0 = mic (the user), ch1 = system audio (everyone else).
 const fs = require('fs');
 const fsp = fs.promises;
@@ -39,23 +40,35 @@ async function uploadAudio(audioBuf) {
   return blob.url;
 }
 
-// Submit the async Deepgram job and poll until the callback lands. Poll is cheap; no
-// Vercel exec-time limit is hit because transcription runs on Deepgram's side.
+// Transcribe synchronously through the proxy (§6): /api/transcribe blocks while Deepgram runs,
+// stores the transcript to Blob, and returns its URL. We fetch that URL DIRECTLY from Blob storage
+// (never back through a function) so neither the ~4.5 MB request nor response limit is hit — this
+// is what lets long meetings transcribe. The proxy call can take minutes; that's expected.
 async function transcribeViaProxy(audioBuf) {
   const url = await uploadAudio(audioBuf);
+  // Client-generated id so a lost /api/transcribe response is still recoverable via /result polling.
+  const id = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 
-  const submit = await (await proxyPost('/api/transcribe', { url })).json();
-  if (submit.error || !submit.id) throw new Error(submit.error || 'Transcription submit failed');
+  const submit = await (await proxyPost('/api/transcribe', { url, id })).json();
+  if (submit.error) throw new Error(submit.error);
 
-  // Poll: 3s interval, up to ~10 min for long meetings.
-  for (let i = 0; i < 200; i++) {
-    await sleep(3000);
-    const res = await fetch(`${PROXY_URL}/api/transcribe/result?id=${encodeURIComponent(submit.id)}`);
-    const data = await res.json().catch(() => ({}));
-    if (data.status === 'done') return data.result;
-    if (data.status === 'error') throw new Error(data.error || 'Transcription failed');
+  // Prefer the URL from the submit response; fall back to polling /result if it was lost.
+  let resultUrl = submit.resultUrl;
+  if (!resultUrl) {
+    for (let i = 0; i < 60 && !resultUrl; i++) {
+      await sleep(3000);
+      const data = await fetch(`${PROXY_URL}/api/transcribe/result?id=${encodeURIComponent(id)}`)
+        .then((r) => r.json()).catch(() => ({}));
+      if (data.status === 'done') resultUrl = data.resultUrl;
+      else if (data.status === 'error') throw new Error(data.error || 'Transcription failed');
+    }
+    if (!resultUrl) throw new Error('Transcription timed out');
   }
-  throw new Error('Transcription timed out');
+
+  const result = await fetch(resultUrl).then((r) => r.json());
+  // Best-effort: drop the stored transcript now that we have it.
+  fetch(`${PROXY_URL}/api/transcribe/result?id=${encodeURIComponent(id)}&ack=1`).catch(() => {});
+  return result;
 }
 
 async function transcribeRecording(recordingDir, startedAt) {

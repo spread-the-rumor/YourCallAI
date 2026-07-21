@@ -4,6 +4,7 @@
   "buildCommand": null,
   "installCommand": "npm install",
   "functions": {
-    "api/**/*.js": { "maxDuration": 10 }
+    "api/**/*.js": { "maxDuration": 10 },
+    "api/transcribe.js": { "maxDuration": 300 }
   }
 }
