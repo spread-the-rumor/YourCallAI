@@ -73,9 +73,11 @@
             <div class="send-toggle segmented">
               <button data-dest="slack" class="seg-toggle active">Slack</button>
               <button data-dest="getoverview" class="seg-toggle">GetOverview</button>
+              <button data-dest="asana" class="seg-toggle">Asana</button>
             </div>
             <div id="send-slack" class="send-panel"></div>
             <div id="send-getoverview" class="send-panel hidden"></div>
+            <div id="send-asana" class="send-panel hidden"></div>
           </div>
         </div>
 
@@ -112,7 +114,7 @@
         </div>
       </div>
 
-      <!-- Integrations tab: Slack -->
+      <!-- Integrations tab: Slack + Asana -->
       <div id="tab-integrations" class="settings-tab hidden">
         <div id="slack-block" class="account-block hidden">
           <h3>Slack</h3>
@@ -125,6 +127,20 @@
             <div class="settings-actions">
               <span id="slack-team" class="account-email"></span>
               <button id="btn-slack-disconnect" class="btn ghost pill">Disconnect</button>
+            </div>
+          </div>
+        </div>
+        <div id="asana-block" class="account-block hidden">
+          <h3>Asana</h3>
+          <p class="muted">Connect your Asana account to turn meeting action items into tasks — created as you, in your own projects.</p>
+          <div id="asana-signed-out">
+            <button id="btn-asana-connect" class="btn primary pill">Connect to Asana</button>
+            <span id="asana-status" class="muted"></span>
+          </div>
+          <div id="asana-signed-in" class="hidden">
+            <div class="settings-actions">
+              <span id="asana-user" class="account-email"></span>
+              <button id="btn-asana-disconnect" class="btn ghost pill">Disconnect</button>
             </div>
           </div>
         </div>

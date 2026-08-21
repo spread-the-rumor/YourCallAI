@@ -86,6 +86,7 @@ async function getConfiguredFlags() {
     requesty: !!enabled.requesty,
     slack: !!enabled.slack,
     getoverview: !!enabled.getoverview,
+    asana: !!enabled.asana,
     userDisplayName: c.USER_DISPLAY_NAME,
     autoDeleteDays: Number(c.AUTO_DELETE_DAYS) || 0,
   };

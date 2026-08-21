@@ -41,6 +41,7 @@ jobs:
           SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
           # Baked into the client build (public client id + shipped proxy gate token).
           SLACK_CLIENT_ID: ${{ secrets.SLACK_CLIENT_ID }}
+          ASANA_CLIENT_ID: ${{ secrets.ASANA_CLIENT_ID }}
           APP_PROXY_TOKEN: ${{ secrets.APP_PROXY_TOKEN }}
 
   deploy-api:

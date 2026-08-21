@@ -13,6 +13,7 @@ module.exports = {
       // App-token gates the proxy; Slack client id is public (rides in the authorize URL).
       BUILD_APP_PROXY_TOKEN: JSON.stringify(process.env.APP_PROXY_TOKEN || ''),
       BUILD_SLACK_CLIENT_ID: JSON.stringify(process.env.SLACK_CLIENT_ID || ''),
+      BUILD_ASANA_CLIENT_ID: JSON.stringify(process.env.ASANA_CLIENT_ID || ''),
     }),
   ],
   resolve: { extensions: ['.js', '.json'] },

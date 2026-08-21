@@ -21,6 +21,7 @@ const { extractActionItems } = require('./ai/extractActionItems');
 const { inferSpeakerNames } = require('./ai/inferSpeakerNames');
 const slack = require('./integrations/slack');
 const getoverview = require('./integrations/getoverview');
+const asana = require('./integrations/asana');
 const auth = require('./auth');
 const sync = require('./sync');
 const { transcriptToText, segSpeaker, segText, meetingDate } = require('./transcriptUtils');
@@ -629,6 +630,14 @@ ipcMain.handle('send-getoverview-transcript', async (e, projectId, meetingId, ki
   if (!text.trim()) return { ok: false, error: `No ${kind} to send.` };
   return getoverview.sendTranscript(projectId, { title: meeting.title, text });
 });
+// Asana is task-creation only — no summary/transcript export (unlike GetOverview).
+ipcMain.handle('asana-connect', () => asana.connect());
+ipcMain.handle('asana-disconnect', () => asana.disconnect());
+ipcMain.handle('asana-status', () => asana.isConnected());
+ipcMain.handle('list-asana-workspaces', () => asana.listWorkspaces());
+ipcMain.handle('list-asana-projects', (e, workspaceGid) => asana.listProjects(workspaceGid));
+ipcMain.handle('list-asana-users', (e, workspaceGid) => asana.listUsers(workspaceGid));
+ipcMain.handle('create-asana-task', (e, projectGid, task) => asana.createTask(projectGid, task));
 ipcMain.handle('extract-action-items', async (e, meetingId) => {
   const meeting = await store.getMeeting(meetingId);
   if (!meeting?.transcript) return { items: [], error: 'No transcript.' };
@@ -703,9 +712,10 @@ const gotLock = app.requestSingleInstanceLock();
 if (!gotLock) {
   app.quit();
 } else {
-  // Route a yourcallai:// deep link to Slack (host === 'slack') or Supabase auth (everything else).
+  // Route a yourcallai:// deep link by host: 'slack', 'asana', or Supabase auth (everything else).
   const routeDeepLink = (url) => {
     if (url.startsWith(`${auth.PROTOCOL}://slack`)) return slack.handleDeepLink(url);
+    if (url.startsWith(`${auth.PROTOCOL}://asana`)) return asana.handleDeepLink(url);
     return auth.handleDeepLink(url);
   };
 

@@ -3,7 +3,7 @@
 // Values resolve build-time (DefinePlugin) → process.env → .env file, read at ACCESS time —
 // NOT at module load. proxy.js is required before app.whenReady()/applyToEnv() runs, so a
 // module-load const would freeze to '' before .env is loaded (mirrors auth.js's cfg()).
-/* global BUILD_VERCEL_BACKEND_URL, BUILD_APP_PROXY_TOKEN, BUILD_SLACK_CLIENT_ID */
+/* global BUILD_VERCEL_BACKEND_URL, BUILD_APP_PROXY_TOKEN, BUILD_SLACK_CLIENT_ID, BUILD_ASANA_CLIENT_ID */
 
 // Lazy require: settingsStore requires proxy back (circular), so importing loadEnvFile at
 // top-level would get a half-initialized module. Requiring it inside cfg() defers past load.
@@ -25,6 +25,9 @@ const appProxyToken = () => cfg(typeof BUILD_APP_PROXY_TOKEN !== 'undefined' ? B
 // Slack OAuth client id — public by design (rides in the authorize URL). Read fresh.
 // eslint-disable-next-line no-undef
 const slackClientId = () => cfg(typeof BUILD_SLACK_CLIENT_ID !== 'undefined' ? BUILD_SLACK_CLIENT_ID : '', 'SLACK_CLIENT_ID');
+// Asana OAuth client id — public by design (rides in the authorize URL). Read fresh.
+// eslint-disable-next-line no-undef
+const asanaClientId = () => cfg(typeof BUILD_ASANA_CLIENT_ID !== 'undefined' ? BUILD_ASANA_CLIENT_ID : '', 'ASANA_CLIENT_ID');
 
 // POST JSON to a proxy route. Returns the fetch Response (caller reads json/stream).
 function proxyPost(pathname, body, extra = {}) {
@@ -37,4 +40,4 @@ function proxyPost(pathname, body, extra = {}) {
   });
 }
 
-module.exports = { PROXY_URL, appProxyToken, slackClientId, proxyPost };
+module.exports = { PROXY_URL, appProxyToken, slackClientId, asanaClientId, proxyPost };

@@ -24,15 +24,17 @@ resolves speaker names, AI summaries (Requesty/LLM), and sends summaries to Slac
 - `api/_shared.js` — `json`, `readJson`, `env`, `requireAppToken`, `redisClient`.
 - `api/slack.js` — proxy to Slack Web API; per-request user token; method allowlist; app-token gated.
 - `api/slack/oauth-callback.js`, `api/slack/oauth-redeem.js` — Slack OAuth (see below).
-- `api/config.js` — `{enabled:{deepgram,requesty,slack,getoverview}}` booleans only.
+- `api/asana.js` — proxy to Asana REST API; per-request user token; **path** allowlist; app-token gated.
+- `api/asana/oauth-callback.js`, `-redeem.js`, `-refresh.js` — Asana OAuth (see below).
+- `api/config.js` — `{enabled:{deepgram,requesty,slack,getoverview,asana}}` booleans only.
 - `api/ai.js`, `api/transcribe*.js`, `api/blob-upload.js`, `api/getoverview.js`.
 
 ## Config / secrets — where things live
 
 | Value | Location | Notes |
 |---|---|---|
-| Slack `client_secret`, Deepgram/Requesty/GetOverview keys, Upstash + Vercel tokens | Vercel env only | Never on client, never in git/installer |
-| `SLACK_CLIENT_ID`, `SUPABASE_URL`, `SUPABASE_ANON_KEY` | Vercel + GitHub secret + baked into installer + local `.env` | Public by design |
+| Slack + Asana `client_secret`, Deepgram/Requesty/GetOverview keys, Upstash + Vercel tokens | Vercel env only | Never on client, never in git/installer |
+| `SLACK_CLIENT_ID`, `ASANA_CLIENT_ID`, `SUPABASE_URL`, `SUPABASE_ANON_KEY` | Vercel + GitHub secret + baked into installer + local `.env` | Public by design |
 | `APP_PROXY_TOKEN` | same as above | Shared proxy gate (low-value); baked in — extractable. Rotate if abused. Consider replacing with per-user Supabase-JWT auth. |
 | Slack user token (`xoxp-`), Google/Supabase session | User's machine only (`userData/*.json`) | Plaintext on disk, per-user, never centralized |
 | Slack OTC | Upstash Redis via Vercel, 120s TTL, single-use | Ephemeral |
@@ -91,12 +93,58 @@ tokens can't auto-join, so `not_in_channel` → clear error (no `conversations.j
 - **Proxy method allowlist** (`api/slack.js`): `users.conversations, conversations.open, users.list,
   users.info, chat.postMessage`.
 
+## Per-user "Connect to Asana" OAuth (second PM tool)
+
+Same OAuth shape as Slack — authorize in the system browser → Vercel callback exchanges the code
+server-side → 120s single-use OTC rides `yourcallai://asana` → app redeems it over HTTPS. Reuses
+the same Upstash store (`asana:otc:*`) and the same `yourcallai://` scheme, so **no packaging or
+protocol-registration change** was needed; only a new branch in `routeDeepLink` (`src/main.js`).
+
+**Scope of the feature:** Asana is **task-creation only** — no summary/transcript export (that's
+GetOverview's job). The meeting send block's Asana panel is: workspace select → project select
+(grouped by team) → `⚡ Create tasks from action items`. Action-item rows get an **assignee
+`<select>`** of real workspace users (Asana needs a user gid, not a name), pre-selected by
+fuzzy-matching the AI-extracted name (exact → first name → email local-part → Unassigned).
+
+**Two things Asana forces that Slack didn't:**
+1. **Token expiry.** Access tokens last ~1h and come with a `refresh_token`. `asana-session.json`
+   stores `{token, refreshToken, expiresAt, user}`; `validToken()` refreshes via
+   `/api/asana/oauth-refresh` when within 60s of expiry, and `asanaApi()` also refreshes+retries
+   once on a `401`. Concurrent refreshes are coalesced through one module-level in-flight promise.
+   A failed refresh says *"session expired — reconnect"*, **not** *"not connected"* (the user is
+   connected; the session went stale). Refreshing needs `client_secret`, hence the backend route.
+2. **`response_type=code`** is mandatory in the authorize URL (Slack's omits it).
+
+**Asana app config** (`app.asana.com/0/my-apps`): redirect URL must be exactly
+`https://your-call-ai.vercel.app/api/asana/oauth-callback`. Scope `default`.
+**Proxy path allowlist** (`api/asana.js`, method+regex pairs — query strings are stripped before
+matching so `opt_fields`/`limit`/`offset` are free): `GET /workspaces`,
+`GET /workspaces/{gid}/projects`, `GET /workspaces/{gid}/users`, `POST /tasks`.
+
+**Client API:** `connect()`, `handleDeepLink()`, `isConnected()`, `disconnect()`,
+`listWorkspaces()`, `listProjects(wsGid)`, `listUsers(wsGid)`, `createTask(projectGid, {...})`.
+IPC: `asana-connect/-disconnect/-status`, `list-asana-workspaces/-projects/-users`,
+`create-asana-task`, `onAsanaChanged`. UI: `#asana-block` in `index.html`, `renderAsana()` +
+`renderAsanaPanel()` in `renderer.js`.
+
+**Gotchas hit while building it:**
+- `due_on` is only sent when the value matches `^\d{4}-\d{2}-\d{2}$` — the AI-extracted date is
+  free text and Asana 400s on anything else (e.g. "next Friday").
+- Asana wraps request **and** response payloads in `{data: …}`, and is a JSON API — this is the one
+  place NOT to copy Slack's `application/x-www-form-urlencoded` body.
+- `renderSendBlock()` was a binary if/else; a third destination silently fell through to
+  GetOverview. It's now a `SEND_PANELS` map keyed by `data-dest` / `#send-<key>`.
+- `renderActionItemRows()` is shared: `opts.users` switches the assignee cell to a `<select>`,
+  `opts.onCreate` swaps the create call. Omitting both keeps GetOverview's original behaviour.
+
 ## Vercel env vars required
 
-`SLACK_CLIENT_ID`, `SLACK_CLIENT_SECRET`, `APP_PROXY_TOKEN`, Upstash Redis
+`SLACK_CLIENT_ID`, `SLACK_CLIENT_SECRET`, `ASANA_CLIENT_ID`, `ASANA_CLIENT_SECRET`,
+`APP_PROXY_TOKEN`, Upstash Redis
 (`SLACK_KV_REST_API_URL` / `SLACK_KV_REST_API_TOKEN` — code also accepts `KV_REST_API_*` /
-`UPSTASH_REDIS_REST_*`), plus the transcription/AI keys. GitHub Actions secrets (for the installer
-build): `SLACK_CLIENT_ID`, `APP_PROXY_TOKEN`, `SUPABASE_URL`, `SUPABASE_ANON_KEY`, `VERCEL_*`.
+`UPSTASH_REDIS_REST_*`; the same store holds the `asana:otc:*` keys), plus the transcription/AI
+keys. GitHub Actions secrets (for the installer build): `SLACK_CLIENT_ID`, `ASANA_CLIENT_ID`,
+`APP_PROXY_TOKEN`, `SUPABASE_URL`, `SUPABASE_ANON_KEY`, `VERCEL_*`.
 
 ## Build / release / deploy
 

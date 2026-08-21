@@ -1,8 +1,9 @@
 // POST /api/getoverview — forward { pathname, method, body } to GetOverview, inject base+token.
-const { json, readJson, env } = require('./_shared');
+const { json, readJson, env, requireAppToken } = require('./_shared');
 
 module.exports = async (req, res) => {
   if (req.method !== 'POST') return json(res, 405, { ok: false, error: 'POST only' });
+  if (!requireAppToken(req, res)) return; // else the route is an open relay to our GetOverview instance
   const base = env('GetOverview_BASE_URL');
   const token = env('GetOverview_Access_Token');
   if (!base || !token) return json(res, 200, { ok: false, error: 'GetOverview not configured on server.' });

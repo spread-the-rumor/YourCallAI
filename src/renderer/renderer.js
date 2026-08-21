@@ -20,6 +20,11 @@ const state = {
   status: { state: 'idle', detail: '' },
   slackTargets: null,     // { channels, users } cache
   overviewProjects: null, // cache
+  asanaConnected: false,
+  asanaWorkspaces: null,  // cache
+  asanaWorkspaceGid: null, // current workspace selection
+  asanaProjects: null,    // cache for the selected workspace
+  asanaUsers: null,       // cache for the selected workspace (assignee dropdown)
   actionItems: [],
 };
 
@@ -326,13 +331,21 @@ async function sendChat() {
 }
 
 // ---------- send-to block ----------
+// dest key -> panel renderer. Keys must match both the #send-<key> element ids and the
+// data-dest values on the toggle buttons, so adding a destination is a one-line change here.
+const SEND_PANELS = {
+  slack: renderSlackPanel,
+  getoverview: renderOverviewPanel,
+  asana: renderAsanaPanel,
+};
+
 function renderSendBlock(m) {
   document.querySelectorAll('.send-toggle .seg-toggle').forEach((b) =>
     b.classList.toggle('active', b.dataset.dest === state.dest));
-  $('send-slack').classList.toggle('hidden', state.dest !== 'slack');
-  $('send-getoverview').classList.toggle('hidden', state.dest !== 'getoverview');
-  if (state.dest === 'slack') renderSlackPanel(m);
-  else renderOverviewPanel(m);
+  for (const key of Object.keys(SEND_PANELS)) {
+    $(`send-${key}`).classList.toggle('hidden', state.dest !== key);
+  }
+  (SEND_PANELS[state.dest] || renderSlackPanel)(m);
 }
 
 function statusEl(cls = '') {
@@ -406,7 +419,7 @@ const SLACK_LOGO_SVG = `<svg viewBox="0 0 122.8 122.8" width="16" height="16" ar
 async function renderOverviewPanel(m) {
   const panel = $('send-getoverview');
   if (!state.flags.getoverview) {
-    panel.innerHTML = '<span class="muted">GetOverview not configured — add its URL and token in Settings.</span>';
+    panel.innerHTML = '<span class="muted">GetOverview is not available.</span>';
     return;
   }
   panel.innerHTML = '<span class="muted">Loading projects…</span>';
@@ -471,21 +484,171 @@ async function renderOverviewPanel(m) {
   });
 }
 
-function renderActionItemRows(box, items, projectSel) {
+// Asana is task-creation only — no summary/transcript export. Workspace → project → tasks.
+async function renderAsanaPanel(m) {
+  const panel = $('send-asana');
+  if (!state.flags.asana) {
+    panel.innerHTML = '<span class="muted">Asana is not available.</span>';
+    return;
+  }
+  if (!state.asanaConnected) {
+    panel.innerHTML = '<span class="muted">Connect your Asana account in Settings to create tasks here.</span>';
+    return;
+  }
+  panel.innerHTML = '<span class="muted">Loading Asana workspaces…</span>';
+
+  if (!state.asanaWorkspaces) {
+    const r = await api.listAsanaWorkspaces();
+    if (!r.ok) { panel.innerHTML = `<span class="send-status err">${esc(r.error)}</span>`; return; }
+    state.asanaWorkspaces = r.workspaces || [];
+  }
+  if (!state.asanaWorkspaces.length) {
+    panel.innerHTML = '<span class="muted">No Asana workspaces found for this account.</span>';
+    return;
+  }
+  // Default to the first workspace; keep the user's choice across re-renders.
+  if (!state.asanaWorkspaces.some((w) => w.gid === state.asanaWorkspaceGid)) {
+    state.asanaWorkspaceGid = state.asanaWorkspaces[0].gid;
+  }
+
+  if (!state.asanaProjects) {
+    const r = await api.listAsanaProjects(state.asanaWorkspaceGid);
+    if (!r.ok) { panel.innerHTML = `<span class="send-status err">${esc(r.error)}</span>`; return; }
+    state.asanaProjects = r.projects || [];
+  }
+  // Assignee list is best-effort: a failure just means the dropdowns show Unassigned only.
+  if (!state.asanaUsers) {
+    const r = await api.listAsanaUsers(state.asanaWorkspaceGid);
+    state.asanaUsers = r.ok ? (r.users || []) : [];
+  }
+  panel.innerHTML = '';
+
+  // Row 1 — workspace. Changing it invalidates the project + user caches.
+  const wsRow = document.createElement('div');
+  wsRow.className = 'send-row';
+  const wsSel = document.createElement('select');
+  for (const w of state.asanaWorkspaces) wsSel.append(new Option(w.name, w.gid));
+  wsSel.value = state.asanaWorkspaceGid;
+  wsSel.addEventListener('change', () => {
+    state.asanaWorkspaceGid = wsSel.value;
+    state.asanaProjects = null;
+    state.asanaUsers = null;
+    renderAsanaPanel(m);
+  });
+  const wsLabel = document.createElement('span');
+  wsLabel.className = 'muted';
+  wsLabel.textContent = 'Workspace';
+  wsRow.append(wsLabel, wsSel);
+  panel.appendChild(wsRow);
+
+  // Row 2 — project, grouped by team.
+  const projRow = document.createElement('div');
+  projRow.className = 'send-row';
+  const sel = document.createElement('select');
+  if (!state.asanaProjects.length) {
+    sel.append(new Option('No projects in this workspace', ''));
+    sel.disabled = true;
+  } else {
+    const byTeam = {};
+    for (const p of state.asanaProjects) (byTeam[p.team] ||= []).push(p);
+    for (const [team, projects] of Object.entries(byTeam)) {
+      const g = document.createElement('optgroup'); g.label = team;
+      for (const p of projects) g.append(new Option(p.name, p.id));
+      sel.appendChild(g);
+    }
+  }
+  const refresh = document.createElement('button');
+  refresh.className = 'btn small'; refresh.textContent = '↻'; refresh.title = 'Refresh projects';
+  refresh.addEventListener('click', () => {
+    state.asanaProjects = null;
+    state.asanaUsers = null;
+    renderAsanaPanel(m);
+  });
+  const openLink = document.createElement('button');
+  openLink.className = 'btn small ghost'; openLink.textContent = 'Open in Asana ↗';
+  openLink.addEventListener('click', () => {
+    const p = state.asanaProjects.find((x) => String(x.id) === sel.value);
+    if (p?.url) window.open(p.url, '_blank');
+  });
+  const projLabel = document.createElement('span');
+  projLabel.className = 'muted';
+  projLabel.textContent = 'Project';
+  projRow.append(projLabel, sel, refresh, openLink);
+  panel.appendChild(projRow);
+
+  // Row 3 — extract action items (the only send action for Asana).
+  const actionRow = document.createElement('div');
+  actionRow.className = 'send-row';
+  const st = statusEl();
+  const extractBtn = document.createElement('button');
+  extractBtn.className = 'btn small primary';
+  extractBtn.textContent = '⚡ Create tasks from action items';
+  extractBtn.disabled = sel.disabled;
+  actionRow.append(extractBtn, st);
+  panel.appendChild(actionRow);
+
+  const aiBox = document.createElement('div');
+  aiBox.className = 'ai-rows';
+  panel.appendChild(aiBox);
+  extractBtn.addEventListener('click', async () => {
+    extractBtn.disabled = true; extractBtn.textContent = 'Extracting…';
+    const r = await api.extractActionItems(m.id);
+    extractBtn.disabled = false; extractBtn.textContent = '⚡ Create tasks from action items';
+    if (r.error && !r.items.length) { st.className = 'send-status err'; st.textContent = `⚠ ${r.error}`; return; }
+    renderActionItemRows(aiBox, r.items, sel, {
+      users: state.asanaUsers,
+      onCreate: (f) => api.createAsanaTask(sel.value, {
+        title: f.title,
+        assigneeGid: f.assignee, // the <select> value is a user gid
+        dueDate: f.dueDate,
+      }),
+    });
+  });
+}
+
+// Editable action-item grid, shared by the GetOverview and Asana panels.
+// opts.users  — when supplied, the assignee cell is a <select> of real users (Asana, which
+//               needs a user gid) instead of a free-text input (GetOverview).
+// opts.onCreate(fields) — performs the create for one row and returns { ok, error }.
+//               Defaults to GetOverview's createTask so existing callers are unchanged.
+function renderActionItemRows(box, items, projectSel, opts = {}) {
+  const { users, onCreate } = opts;
   box.innerHTML = '';
   const rowsBox = document.createElement('div');
   box.appendChild(rowsBox);
   const rows = [];
 
+  // Best-effort match of an AI-extracted name to a real user: exact full name, then first
+  // name, then email local-part. No match → Unassigned (never guess an arbitrary person).
+  const matchUser = (name) => {
+    const n = (name || '').trim().toLowerCase();
+    if (!n || !users) return '';
+    const exact = users.find((u) => u.name.toLowerCase() === n);
+    if (exact) return exact.gid;
+    const first = users.find((u) => u.name.toLowerCase().split(' ')[0] === n.split(' ')[0]);
+    if (first) return first.gid;
+    const byEmail = users.find((u) => u.email && u.email.toLowerCase().split('@')[0] === n);
+    return byEmail ? byEmail.gid : '';
+  };
+
   const mkRow = (item = { title: '', assignee: '', dueDate: '' }) => {
     const row = document.createElement('div');
     row.className = 'ai-row';
+    const assigneeCell = users
+      ? '<select class="ai-assignee"></select>'
+      : `<input class="ai-assignee" value="${esc(item.assignee)}" placeholder="Assignee">`;
     row.innerHTML = `
       <input class="ai-title" value="${esc(item.title)}" placeholder="Task title">
-      <input class="ai-assignee" value="${esc(item.assignee)}" placeholder="Assignee">
+      ${assigneeCell}
       <input class="ai-due" value="${esc(item.dueDate)}" placeholder="YYYY-MM-DD">
       <span class="ai-state"></span>
       <button class="btn small ghost ai-remove" title="Remove">×</button>`;
+    if (users) {
+      const sel = row.querySelector('.ai-assignee');
+      sel.append(new Option('Unassigned', ''));
+      for (const u of users) sel.append(new Option(u.name, u.gid));
+      sel.value = matchUser(item.assignee);
+    }
     row.querySelector('.ai-remove').addEventListener('click', () => {
       rows.splice(rows.indexOf(row), 1);
       row.remove();
@@ -512,11 +675,14 @@ function renderActionItemRows(box, items, projectSel) {
       const title = row.querySelector('.ai-title').value.trim();
       if (!title) { stEl.textContent = '✕'; stEl.title = 'Title required'; continue; }
       stEl.textContent = '…';
-      const r = await api.createGetOverviewTask(projectSel.value, {
+      const fields = {
         title,
         assignee: row.querySelector('.ai-assignee').value.trim(),
         dueDate: row.querySelector('.ai-due').value.trim(),
-      });
+      };
+      const r = onCreate
+        ? await onCreate(fields)
+        : await api.createGetOverviewTask(projectSel.value, fields);
       stEl.textContent = r.ok ? '✓' : '✕';
       stEl.title = r.ok ? 'Created' : r.error;
     }
@@ -549,6 +715,7 @@ async function openSettings() {
   showTab('profile');
   renderAccount();
   renderSlack();
+  renderAsana();
   closeChat();
   updateFab();
 }
@@ -569,6 +736,19 @@ async function renderSlack() {
   $('slack-signed-out').classList.toggle('hidden', connected);
   $('slack-signed-in').classList.toggle('hidden', !connected);
   if (connected) $('slack-team').textContent = team ? `Connected: ${team}` : 'Connected';
+}
+
+// Same two-level gate as renderSlack: the block appears only if Asana OAuth is configured
+// on the backend; signed-in/out comes from the per-user asana-status IPC.
+async function renderAsana() {
+  const block = $('asana-block');
+  block.classList.toggle('hidden', !state.flags.asana);
+  if (!state.flags.asana) return;
+  const { connected, user } = await api.asanaStatus();
+  state.asanaConnected = connected;
+  $('asana-signed-out').classList.toggle('hidden', connected);
+  $('asana-signed-in').classList.toggle('hidden', !connected);
+  if (connected) $('asana-user').textContent = user ? `Connected: ${user}` : 'Connected';
 }
 
 // ---------- account / sync ----------
@@ -662,6 +842,7 @@ async function init() {
   $('app-version').title = `Your Call AI v${_ver}`; // hover shows full build — auto-update sanity check
   state.flags = await api.getEffectiveConfig();
   if (state.flags.slack) state.slackConnected = (await api.slackStatus()).connected;
+  if (state.flags.asana) state.asanaConnected = (await api.asanaStatus()).connected;
 
   api.onStatus((s) => { state.status = s; renderStatus(); });
   api.onSyncStatus(({ state: st }) => { $('sync-dot').className = `sync-dot ${st}`; if (st === 'synced') reload(); });
@@ -711,6 +892,21 @@ async function init() {
   });
   $('btn-slack-disconnect').addEventListener('click', async () => { await api.slackDisconnect(); });
   api.onSlackChanged(() => { state.slackTargets = null; renderSlack(); renderEditor(); }); // new workspace → reload channels
+
+  $('btn-asana-connect').addEventListener('click', async () => {
+    $('asana-status').textContent = 'Opening Asana…';
+    const r = await api.asanaConnect();
+    $('asana-status').textContent = r.ok ? 'Continue in your browser…' : `⚠ ${r.error || 'Could not start Asana connect'}`;
+  });
+  $('btn-asana-disconnect').addEventListener('click', async () => { await api.asanaDisconnect(); });
+  api.onAsanaChanged(() => { // new account → drop the previous one's workspaces/projects/people
+    state.asanaWorkspaces = null;
+    state.asanaWorkspaceGid = null;
+    state.asanaProjects = null;
+    state.asanaUsers = null;
+    renderAsana();
+    renderEditor();
+  });
   $('settings-save').addEventListener('click', async () => {
     const patch = {};
     document.querySelectorAll('#settings-fields input').forEach((i) => { patch[i.dataset.key] = i.value; });
@@ -718,6 +914,9 @@ async function init() {
     state.flags = await api.getEffectiveConfig();
     state.slackTargets = null;
     state.overviewProjects = null;
+    state.asanaWorkspaces = null;
+    state.asanaProjects = null;
+    state.asanaUsers = null;
     $('settings-status').textContent = '✓ Saved — applied immediately';
     setTimeout(() => { $('settings-status').textContent = ''; }, 2500);
     renderStatus();

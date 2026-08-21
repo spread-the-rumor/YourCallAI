@@ -8,6 +8,7 @@ module.exports = (req, res) => {
       requesty: !!env('REQUESTY_API_KEY'),
       slack: !!(env('SLACK_CLIENT_ID') && env('SLACK_CLIENT_SECRET')), // OAuth available → show Connect button
       getoverview: !!(env('GetOverview_BASE_URL') && env('GetOverview_Access_Token')),
+      asana: !!(env('ASANA_CLIENT_ID') && env('ASANA_CLIENT_SECRET')), // OAuth available → show Connect button
     },
   });
 };

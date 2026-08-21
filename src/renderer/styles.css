@@ -387,6 +387,11 @@ select:focus { border-color: var(--accent); }
   color: var(--text); padding: var(--s1) var(--s3); font-size: var(--fs-sm); outline: none;
 }
 .ai-row input:focus { border-color: var(--accent); }
+/* Asana's assignee cell is a <select> (needs a real user gid); match the input siblings
+   instead of inheriting the wider global select sizing. */
+.ai-row select.ai-assignee {
+  padding: var(--s1) var(--s3); font-size: var(--fs-sm); max-width: none; min-width: 0;
+}
 .ai-row .ai-title { flex: 2; }
 .ai-row .ai-assignee { flex: 1; }
 .ai-row .ai-due { width: 110px; }
