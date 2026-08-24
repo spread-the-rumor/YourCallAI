@@ -215,9 +215,16 @@ Slack per-user OAuth was landed across v2.0.3–v2.0.8. Bugs hit and fixed, in o
       before emitting a byte. Same prompt: `stream:false` → **504 at 25.2s**; `stream:true` →
       **200, first byte 2.3s, total 131s**. The limit is on **time-to-first-byte**, not total
       duration. `maxDuration` is **not** a fix — it doesn't apply to Edge functions (`vercel.json`
-      sets it only for `api/transcribe.js`, a Node function). Fix: always request `stream:true`
-      upstream and reassemble the SSE frames server-side for non-streaming callers, so the
-      response shape is unchanged. 3 of 4 AI callers passed no `onDelta` and were all exposed —
+      sets it only for `api/transcribe.js`, a Node function).
+      **The subtlety that cost a release (v2.2.1 → v2.2.2):** the timer is on the **response's**
+      TTFB, and *reading* from the upstream stream does **not** reset it — only **sending** a byte
+      downstream does. v2.2.1 switched upstream to `stream:true` and reassembled frames in the
+      handler, which still emitted nothing until the end and still 504'd at 25.2s (even for a
+      300-word essay). Fix: return a `ReadableStream` that emits a space immediately, then
+      keep-alive whitespace every 5s while assembling, then the JSON. `JSON.parse`/`Response.json()`
+      ignore leading whitespace, so the client contract is unchanged. Verified: the exact prompt
+      that returned 504@25.2s now returns 200, first byte 2.1s, total **134s**.
+      3 of 4 AI callers passed no `onDelta` and were all exposed —
       note `summarizeTranscript` was called **both** ways, so live recording survived while
       *re-summarizing* the same meeting 504'd.
     - **No transcript cap.** `transcriptToText` sent every segment. Bisected: 60,868 B → 200 in
