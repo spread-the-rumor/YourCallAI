@@ -37,50 +37,76 @@ export default async function handler(req) {
     });
   }
 
-  // Non-stream: consume the SSE frames and hand back one assembled completion, byte-identical in
-  // shape to what upstream would have returned unstreamed — src/ai/requesty.js reads
-  // choices[0].message.content either way, so no client change is needed.
-  let content = '';
-  let finishReason = null;
-  let model = MODEL;
-  let usage;
-  let id;
-  let created;
+  // Non-stream: assemble the SSE frames into one completion, byte-identical in shape to what
+  // upstream would have returned unstreamed — src/ai/requesty.js reads choices[0].message.content
+  // either way, so no client change is needed.
+  //
+  // The response is returned as a stream that emits keep-alive whitespace while we assemble.
+  // Measured: the Edge runtime kills any invocation that sends no response byte for ~25s, and that
+  // timer is on the RESPONSE's time-to-first-byte — merely reading from upstream does NOT reset it.
+  // Same prompt, same work: streamed 200 (72s), buffered 504 (25.2s). Emitting a byte immediately
+  // keeps the invocation alive for as long as generation takes. JSON.parse ignores leading
+  // whitespace, so the client parses the payload exactly as before.
+  const enc = new TextEncoder();
+  const out = new ReadableStream({
+    async start(controller) {
+      controller.enqueue(enc.encode(' ')); // first byte now — starts the response, stops the clock
+      const keepAlive = setInterval(() => {
+        try { controller.enqueue(enc.encode(' ')); } catch { /* already closed */ }
+      }, 5000);
 
-  const reader = upstream.body.getReader();
-  const dec = new TextDecoder();
-  let buf = '';
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buf += dec.decode(value, { stream: true });
-    let i;
-    while ((i = buf.indexOf('\n')) >= 0) {
-      const line = buf.slice(0, i).trim();
-      buf = buf.slice(i + 1);
-      if (!line.startsWith('data:')) continue;
-      const payload = line.slice(5).trim();
-      if (payload === '[DONE]') continue;
-      let frame;
-      try { frame = JSON.parse(payload); } catch { continue; } // partial frame — the next read completes it
-      const choice = frame.choices?.[0];
-      if (choice?.delta?.content) content += choice.delta.content;
-      if (choice?.finish_reason) finishReason = choice.finish_reason;
-      // Trailing frames carry the totals; keep the last non-empty value of each.
-      if (frame.usage) usage = frame.usage;
-      if (frame.model) model = frame.model;
-      if (frame.id) id = frame.id;
-      if (frame.created) created = frame.created;
-    }
-  }
-
-  const body = {
-    choices: [{ index: 0, finish_reason: finishReason, message: { role: 'assistant', content } }],
-    model,
-    object: 'chat.completion',
-    ...(id ? { id } : {}),
-    ...(created ? { created } : {}),
-    ...(usage ? { usage } : {}),
-  };
-  return new Response(JSON.stringify(body), { headers: { 'Content-Type': 'application/json' } });
+      let content = '';
+      let finishReason = null;
+      let model = MODEL;
+      let usage;
+      let id;
+      let created;
+      try {
+        const reader = upstream.body.getReader();
+        const dec = new TextDecoder();
+        let buf = '';
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buf += dec.decode(value, { stream: true });
+          let i;
+          while ((i = buf.indexOf('\n')) >= 0) {
+            const line = buf.slice(0, i).trim();
+            buf = buf.slice(i + 1);
+            if (!line.startsWith('data:')) continue;
+            const payload = line.slice(5).trim();
+            if (payload === '[DONE]') continue;
+            let frame;
+            try { frame = JSON.parse(payload); } catch { continue; } // partial frame — next read completes it
+            const choice = frame.choices?.[0];
+            if (choice?.delta?.content) content += choice.delta.content;
+            if (choice?.finish_reason) finishReason = choice.finish_reason;
+            // Trailing frames carry the totals; keep the last non-empty value of each.
+            if (frame.usage) usage = frame.usage;
+            if (frame.model) model = frame.model;
+            if (frame.id) id = frame.id;
+            if (frame.created) created = frame.created;
+          }
+        }
+      } catch (err) {
+        // Headers are already sent, so we can't switch to an error status — return the failure in
+        // the body's shape instead. requesty.js surfaces an empty completion as "empty response".
+        clearInterval(keepAlive);
+        controller.enqueue(enc.encode(JSON.stringify({ error: `AI stream failed: ${err.message}` })));
+        controller.close();
+        return;
+      }
+      clearInterval(keepAlive);
+      controller.enqueue(enc.encode(JSON.stringify({
+        choices: [{ index: 0, finish_reason: finishReason, message: { role: 'assistant', content } }],
+        model,
+        object: 'chat.completion',
+        ...(id ? { id } : {}),
+        ...(created ? { created } : {}),
+        ...(usage ? { usage } : {}),
+      })));
+      controller.close();
+    },
+  });
+  return new Response(out, { headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-cache' } });
 }
