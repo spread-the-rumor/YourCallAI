@@ -1,9 +1,9 @@
 // Per-meeting AI chat: answers ONLY from the full transcript + prior turns. Never throws.
 const { chatCompletion } = require('./requesty');
-const { transcriptToText } = require('../transcriptUtils');
+const { transcriptToPrompt } = require('../transcriptUtils');
 
 async function askMeeting(transcript, priorTurns, question) {
-  const text = transcriptToText(transcript);
+  const text = transcriptToPrompt(transcript);
   if (!text.trim()) return 'Chat unavailable — this meeting has no transcript.';
   try {
     const messages = [

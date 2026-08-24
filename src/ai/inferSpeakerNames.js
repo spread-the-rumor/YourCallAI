@@ -1,12 +1,14 @@
 // Layer 2 (§7): AI name inference for speakers still generic after alignment.
 // Returns a mapping { "Speaker 2": "Priya Shah" } — only high-confidence entries. Never throws.
 const { chatCompletion, parseLooseJson } = require('./requesty');
-const { transcriptToText, participants } = require('../transcriptUtils');
+const { transcriptToPrompt, participants } = require('../transcriptUtils');
 
 async function inferSpeakerNames(transcript, roster) {
+  // Labels come from the FULL transcript — a speaker who only talks early would otherwise be
+  // dropped by the cap below and never get resolved.
   const generic = participants(transcript).filter((p) => /^Speaker \d+$/.test(p));
   if (!generic.length) return {};
-  const text = transcriptToText(transcript);
+  const text = transcriptToPrompt(transcript);
   try {
     const raw = await chatCompletion([
       {

@@ -10,10 +10,18 @@ module.exports = async (req, res) => {
   const { code } = await readJson(req);
   if (!code) return json(res, 200, { ok: false, error: 'Missing code.' });
 
-  const redis = redisClient();
   const key = `asana:otc:${code}`;
-  const entry = await redis.get(key); // @upstash/redis auto-deserializes the stored object
-  await redis.del(key); // single use — delete whether or not it existed
+  let entry;
+  try {
+    const redis = redisClient();
+    entry = await redis.get(key); // @upstash/redis auto-deserializes the stored object
+    await redis.del(key); // single use — delete whether or not it existed
+  } catch (err) {
+    // Store unreachable (archived/paused Upstash DB, network) — report it instead of throwing,
+    // which would surface as an opaque FUNCTION_INVOCATION_FAILED 500 with no cause.
+    // Distinct from the "not found" case below: that one is normal, this one is an outage.
+    return json(res, 200, { ok: false, error: `Token store unavailable: ${err.message}` });
+  }
   if (!entry || !entry.token) return json(res, 200, { ok: false, error: 'Code expired or invalid.' });
 
   return json(res, 200, {

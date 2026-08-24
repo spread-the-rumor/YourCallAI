@@ -1,10 +1,10 @@
 // Strict-JSON action-item extraction → { items: [{title, assignee, dueDate}], error }.
 // Never throws; parse is defensive (fences stripped, first [...] isolated).
 const { chatCompletion, parseLooseJson } = require('./requesty');
-const { transcriptToText } = require('../transcriptUtils');
+const { transcriptToPrompt } = require('../transcriptUtils');
 
 async function extractActionItems(transcript) {
-  const text = transcriptToText(transcript);
+  const text = transcriptToPrompt(transcript);
   if (!text.trim()) return { items: [], error: 'No transcript to extract from.' };
   const today = new Date().toISOString().slice(0, 10);
   try {

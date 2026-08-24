@@ -567,7 +567,10 @@ ipcMain.handle('ask-meeting', async (e, id, question) => {
 ipcMain.handle('regenerate-summary', async (e, id) => {
   const meeting = await store.getMeeting(id);
   if (!meeting?.transcript) return { ok: false, error: 'No transcript to summarize.' };
-  const summary = await summarizeTranscript(meeting.transcript);
+  // Pass an onDelta (even though there's no progress channel on this invoke path) so this takes
+  // the streaming branch, like the live-recording call above. Buffered requests for a long
+  // summary hit the Edge function's time-to-first-byte limit and come back as a 504.
+  const summary = await summarizeTranscript(meeting.transcript, () => {});
   if (summaryFailed(summary)) return { ok: false, error: summary };
   const updated = await store.updateMeeting(id, { content: summary, summary });
   return { ok: true, meeting: updated };
@@ -731,7 +734,17 @@ if (!gotLock) {
 
   app.whenReady().then(async () => {
     await settingsStore.applyToEnv().catch((e) => console.error('[settings]', e.message));
-    settingsStore.fetchTeamDefaults().then(() => settingsStore.applyToEnv()).catch(() => {});
+    // Fire-and-forget: an 8s network call must not gate window creation (offline start still
+    // works off the disk cache). But the renderer reads its flags once at boot, so when the
+    // fetch lands AFTER the window opened, push the fresh flags — otherwise a newly-enabled
+    // integration reads as "not available" until the next restart.
+    settingsStore.fetchTeamDefaults().then(async () => {
+      await settingsStore.applyToEnv();
+      const flags = await settingsStore.getConfiguredFlags();
+      for (const w of BrowserWindow.getAllWindows()) {
+        if (!w.isDestroyed()) w.webContents.send('config-changed', flags);
+      }
+    }).catch(() => {});
 
     recordingsDir = path.join(app.getPath('userData'), 'recordings');
     await fsp.mkdir(recordingsDir, { recursive: true }).catch(() => {});

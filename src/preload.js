@@ -52,6 +52,7 @@ contextBridge.exposeInMainWorld('api', {
   getSettings: invoke('get-settings'),
   saveSettings: invoke('save-settings'),
   getEffectiveConfig: invoke('get-effective-config'),
+  onConfigChanged: on('config-changed'),
   getAppVersion: invoke('get-app-version'),
   restartApp: invoke('restart-app'),
 

@@ -1,7 +1,7 @@
 // Fixed-structure Markdown meeting summary. Never throws — failures return a
 // readable "Summary unavailable — <reason>" string the UI shows as-is.
 const { chatCompletion } = require('./requesty');
-const { transcriptToText } = require('../transcriptUtils');
+const { transcriptToPrompt } = require('../transcriptUtils');
 
 const SYSTEM = `You are an expert executive assistant and elite meeting synthesizer. Your task is to transform raw, messy meeting transcripts into hyper-dense, actionable, and scannable summaries.
 
@@ -42,7 +42,7 @@ Participants:
 * [Future roadmap item]`;
 
 async function summarizeTranscript(transcript, onDelta) {
-  const text = transcriptToText(transcript);
+  const text = transcriptToPrompt(transcript);
   if (!text.trim()) return 'Summary unavailable — the transcript is empty.';
   try {
     const out = await chatCompletion(

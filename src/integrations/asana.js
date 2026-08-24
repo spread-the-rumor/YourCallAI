@@ -4,7 +4,8 @@
 // access token to the proxy per call.
 // Divergence from Slack: Asana access tokens expire in ~1h, so every call goes through
 // validToken(), which refreshes via the backend (client_secret stays server-side) when the
-// stored token is within 60s of expiry. Scope is Asana's default (full user access).
+// stored token is within 60s of expiry. Granular OAuth scopes (see SCOPES below) — NOT Asana's
+// "Full permissions" mode, which forbids requesting individual scopes.
 const path = require('path');
 const crypto = require('crypto');
 const { app, shell, BrowserWindow } = require('electron');
@@ -13,6 +14,18 @@ const { proxyPost, PROXY_URL, asanaClientId } = require('../proxy');
 
 const PROTOCOL = 'yourcallai';
 const REDIRECT_URI = `${PROXY_URL}/api/asana/oauth-callback`;
+
+// Space-delimited granular scopes, one per API call we make: /workspaces, /workspaces/*/projects,
+// /workspaces/*/users, POST /tasks. This list MUST match the allowlist registered under
+// OAuth > Permission scopes in the Asana developer console (Full permissions OFF) — requesting
+// an unregistered scope fails the authorize page with forbidden_scopes. Adding one means updating
+// BOTH places, and every connected user must Disconnect → Connect (tokens are frozen to the
+// scopes granted at authorization, and re-auth is not additive).
+// Deliberately absent: `teams:read` — we request opt_fields=team.name on projects, but `name` is
+// one of the related-object fields Asana serves without an extra scope. `tasks:read` — createTask
+// reads gid off its own POST response, which is the created resource, not a read (scopes are not
+// hierarchical: write does not imply read).
+const SCOPES = 'workspaces:read projects:read users:read tasks:write';
 
 // Persistent cache of workspace/project/user lists, keyed by workspace where relevant.
 // On a failed live fetch we serve the last good list instead of blanking the panel.
@@ -182,13 +195,16 @@ async function connect() {
   const clientId = asanaClientId();
   if (!clientId) return { ok: false, error: 'Asana OAuth not configured.' };
   pendingState = crypto.randomBytes(16).toString('hex');
-  const url = `https://app.asana.com/-/oauth_authorize?${new URLSearchParams({
+  // scope is appended separately: URLSearchParams form-encodes spaces as '+', but Asana's docs
+  // call for %20 ("spaces become %20"), so encode it with encodeURIComponent instead of gambling
+  // on their parser accepting '+'.
+  const params = new URLSearchParams({
     client_id: clientId,
     redirect_uri: REDIRECT_URI,
     response_type: 'code', // required by Asana (Slack's authorize URL omits it)
     state: pendingState,
-    scope: 'default',
-  })}`;
+  });
+  const url = `https://app.asana.com/-/oauth_authorize?${params}&scope=${encodeURIComponent(SCOPES)}`;
   await shell.openExternal(url);
   return { ok: true };
 }

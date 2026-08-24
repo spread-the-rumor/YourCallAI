@@ -116,7 +116,26 @@ fuzzy-matching the AI-extracted name (exact → first name → email local-part 
 2. **`response_type=code`** is mandatory in the authorize URL (Slack's omits it).
 
 **Asana app config** (`app.asana.com/0/my-apps`): redirect URL must be exactly
-`https://your-call-ai.vercel.app/api/asana/oauth-callback`. Scope `default`.
+`https://your-call-ai.vercel.app/api/asana/oauth-callback`.
+
+**OAuth scopes — granular, NOT "Full permissions".** Asana apps are in one of two modes, and a
+freshly created app is in *neither*, which fails the authorize page with *"Your app does not have
+any scopes registered."* We use granular scopes: developer console → **OAuth** → **Permission
+scopes**, leave **Full permissions OFF**, check exactly `workspaces:read`, `projects:read`,
+`users:read`, `tasks:write`, save. `SCOPES` in `src/integrations/asana.js` must match that list —
+requesting an unregistered scope fails with `forbidden_scopes`; conversely, with Full permissions
+ON you may NOT request individual scopes (must send `scope=default` or omit it).
+- Space-delimited, and appended with `encodeURIComponent` rather than through `URLSearchParams` —
+  the latter form-encodes spaces as `+`, while Asana's docs call for `%20`.
+- Adding a scope means updating **both** the console and `SCOPES`, and every connected user must
+  **Disconnect → Connect**: tokens are frozen to the scopes granted at authorization, and
+  re-authorization is **not additive** (the full set must be sent). Same caveat as Slack.
+- **Not** needed, so don't add them "just in case": `teams:read` — we request
+  `opt_fields=team.name` on projects, and `name` is one of the related-object fields
+  (`gid`/`name`/`resource_type`/`resource_subtype`) Asana serves without an extra scope; a
+  *non*-default related field would 403 the **whole project list**, not just the label.
+  `tasks:read` — `createTask` reads `gid` off its own POST response, which is the created
+  resource, not a read (scopes are not hierarchical: `write` does not imply `read`).
 **Proxy path allowlist** (`api/asana.js`, method+regex pairs — query strings are stripped before
 matching so `opt_fields`/`limit`/`offset` are free): `GET /workspaces`,
 `GET /workspaces/{gid}/projects`, `GET /workspaces/{gid}/users`, `POST /tasks`.
@@ -176,6 +195,38 @@ Slack per-user OAuth was landed across v2.0.3–v2.0.8. Bugs hit and fixed, in o
 8. **External channels missing** — **proxy sent params as JSON body**, which Slack read methods
    ignore → `types` dropped → only public channels. Fixed: proxy sends
    `application/x-www-form-urlencoded` via `URLSearchParams` (all our params are flat).
+9. **`store_failed: fetch failed` on an OAuth callback** — the **Upstash DB was archived for
+   inactivity** while its env vars stayed configured. The two Upstash failure modes are
+   distinguishable by message, which is the fastest way to tell them apart:
+   `Failed to parse URL from /pipeline` = creds **missing** (bug #5); `fetch failed` = creds
+   **present, host unreachable** (archived/paused/deleted). Redis is shared, so an outage breaks
+   **Slack and Asana together** — a quick check is that non-Redis routes (`/api/config`) return
+   200 while every `*/oauth-redeem` returns 500. Restore: Vercel → Storage → create an Upstash
+   Redis DB, then Upstash console → Inactive databases → Restore; delete stale env pairs, since
+   `redisClient()` takes the **first** match of `SLACK_KV_*` → `KV_REST_API_*` →
+   `UPSTASH_REDIS_REST_*` and a stale pair would win. Redeploy afterward — env changes don't
+   reach existing deployments. Expect recurrence on the free tier (OAuth traffic is sparse); both
+   `oauth-redeem` routes now catch store errors and return
+   `Token store unavailable: <cause>` at HTTP 200 instead of an opaque 500.
+10. **`AI request failed (504): FUNCTION_INVOCATION_TIMEOUT`** — reported from the Asana task
+    flow, but **not** integration code: every integration funnels through `/api/ai`. Two separate
+    defects, both measured against prod:
+    - **`api/ai.js` is Edge runtime**, and with `stream:false` it awaited the whole completion
+      before emitting a byte. Same prompt: `stream:false` → **504 at 25.2s**; `stream:true` →
+      **200, first byte 2.3s, total 131s**. The limit is on **time-to-first-byte**, not total
+      duration. `maxDuration` is **not** a fix — it doesn't apply to Edge functions (`vercel.json`
+      sets it only for `api/transcribe.js`, a Node function). Fix: always request `stream:true`
+      upstream and reassemble the SSE frames server-side for non-streaming callers, so the
+      response shape is unchanged. 3 of 4 AI callers passed no `onDelta` and were all exposed —
+      note `summarizeTranscript` was called **both** ways, so live recording survived while
+      *re-summarizing* the same meeting 504'd.
+    - **No transcript cap.** `transcriptToText` sent every segment. Bisected: 60,868 B → 200 in
+      7.5s, **67,618 B → 429 in 1.0s**. The ~1s fast-fail with no model work (while small prompts
+      still returned 200) means a **per-request token limit**, not a drained account — the
+      provider's "exceeded your current quota… check your plan and billing" text is misleading and
+      will send you to the billing page for an oversized request. Fix: `transcriptToPrompt()` caps
+      at 48 KB keeping the **tail** (decisions/action items are at the end) with an
+      `[earlier portion…omitted]` marker; `transcriptToText` stays uncapped for non-AI callers.
 
 ## Known follow-ups / caveats
 

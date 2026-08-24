@@ -899,6 +899,19 @@ async function init() {
     $('asana-status').textContent = r.ok ? 'Continue in your browser…' : `⚠ ${r.error || 'Could not start Asana connect'}`;
   });
   $('btn-asana-disconnect').addEventListener('click', async () => { await api.asanaDisconnect(); });
+  // Backend flags can land after boot (the /api/config fetch isn't awaited in main). Adopt them
+  // so a newly-enabled integration appears without a restart, and refresh the panels that gate
+  // on them — including the connected-state reads, or a flag flipping on would show the connect
+  // prompt but never load its lists.
+  api.onConfigChanged(async (flags) => {
+    state.flags = flags;
+    if (flags.slack) state.slackConnected = (await api.slackStatus()).connected;
+    if (flags.asana) state.asanaConnected = (await api.asanaStatus()).connected;
+    renderSlack();
+    renderAsana();
+    renderEditor();
+  });
+
   api.onAsanaChanged(() => { // new account → drop the previous one's workspaces/projects/people
     state.asanaWorkspaces = null;
     state.asanaWorkspaceGid = null;
