@@ -460,6 +460,9 @@ async function runPipeline(recordingId) {
       transcriptUrl: transcript ? `http://localhost:${server.PORT}/recordings/${recordingId}/transcript.json` : null,
       speakerMap: existing?.speakerMap || {},
       chat: existing?.chat || [],
+      // This is a freshly built transcript (first run or Retry transcription), so any cached
+      // action items describe the old one. Set explicitly: upsert merges, so omitting would keep them.
+      actionItems: null,
     };
 
     // Persist BEFORE forwarding; if the disk write fails, still forward the in-memory meeting.
@@ -589,7 +592,8 @@ ipcMain.handle('rename-speaker', async (e, id, channel, diarizedSpeaker, newName
   const transcript = meeting.transcript.map((seg) =>
     seg.channel === channel && seg.diarizedSpeaker === diarizedSpeaker ? { ...seg, speaker: name } : seg);
   const speakerMap = { ...(meeting.speakerMap || {}), [`${channel}:${diarizedSpeaker}`]: name };
-  const updated = await store.updateMeeting(id, { transcript, speakerMap });
+  // Drop cached action items — speaker names feed the assignee field, so they're now stale.
+  const updated = await store.updateMeeting(id, { transcript, speakerMap, actionItems: null });
   return { ok: true, meeting: updated };
 });
 
@@ -641,10 +645,18 @@ ipcMain.handle('list-asana-workspaces', () => asana.listWorkspaces());
 ipcMain.handle('list-asana-projects', (e, workspaceGid) => asana.listProjects(workspaceGid));
 ipcMain.handle('list-asana-users', (e, workspaceGid) => asana.listUsers(workspaceGid));
 ipcMain.handle('create-asana-task', (e, projectGid, task) => asana.createTask(projectGid, task));
-ipcMain.handle('extract-action-items', async (e, meetingId) => {
+// Read-through cache: extraction is a full-transcript AI call (~12s), and the renderer rebuilds
+// the send panel — discarding the rows — on every destination switch. Persisting the result the
+// same way `summary` and `chat` are means only the first extract costs anything.
+// Invalidated wherever the transcript changes (rename-speaker, retry-transcription).
+ipcMain.handle('extract-action-items', async (e, meetingId, opts = {}) => {
   const meeting = await store.getMeeting(meetingId);
   if (!meeting?.transcript) return { items: [], error: 'No transcript.' };
-  return extractActionItems(meeting.transcript);
+  if (!opts.force && meeting.actionItems) return { items: meeting.actionItems, cached: true };
+  const res = await extractActionItems(meeting.transcript);
+  // Only cache success — caching an { items: [], error } would make a transient AI outage sticky.
+  if (!res.error) await store.updateMeeting(meetingId, { actionItems: res.items });
+  return res;
 });
 
 // ---------- IPC: export / save ----------

@@ -156,6 +156,34 @@ IPC: `asana-connect/-disconnect/-status`, `list-asana-workspaces/-projects/-user
 - `renderActionItemRows()` is shared: `opts.users` switches the assignee cell to a `<select>`,
   `opts.onCreate` swaps the create call. Omitting both keeps GetOverview's original behaviour.
 
+## Action-item extraction is cached on the meeting
+
+Extraction is a full-transcript AI call (~12s). `renderSendBlock()` rebuilds the panel with
+`innerHTML = ''` on every destination switch, so the rows were destroyed and re-extracted each
+time a user flipped Slack ↔ Asana ↔ GetOverview (and the two panels have separate `aiBox`es, so
+trying both destinations cost two calls minimum).
+
+`extract-action-items` is now a **read-through cache** persisting `actionItems` on the meeting
+record, like `summary` and `chat`. `wireActionItems()` (renderer) restores cached rows on wire with
+no IPC call; the button then reads **Re-extract** and passes `{force:true}`.
+
+- **Only successes are cached** — caching an `{items:[], error}` would make a transient AI outage
+  sticky. An *empty* success **is** cached (`[]` is truthy), so a meeting with genuinely no action
+  items doesn't re-run the AI on every visit.
+- **Invalidate wherever the transcript changes**: `rename-speaker` (speaker names feed the assignee
+  field) and the pipeline's record build (covers Retry transcription). The pipeline sets
+  `actionItems: null` **explicitly** — `upsertMeeting` shallow-merges, so omitting it would keep
+  the stale value.
+- The renderer must also mirror the result onto the in-memory meeting: `current()` reads
+  `state.meetings`, which only refreshes on `listMeetings()`, so without that the next rebuild
+  would miss the cache and re-run the AI.
+- No migration: `store.js` is schema-less and `stripLocal()` only *removes* `LOCAL_FIELDS`, so the
+  field syncs to Supabase automatically.
+- **Rejected**: extracting from the summary instead. Its `⚡ Action Items` section is strictly
+  lossier — restricted to "immediate, tactical tasks assigned to specific people" (strategic items
+  go to `🚀 Next Steps`), contradictory rules for owner-less items, free-text dates rather than the
+  ISO `due_on` Asana requires, and absent entirely when summarization failed.
+
 ## Vercel env vars required
 
 `SLACK_CLIENT_ID`, `SLACK_CLIENT_SECRET`, `ASANA_CLIENT_ID`, `ASANA_CLIENT_SECRET`,

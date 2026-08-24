@@ -25,7 +25,6 @@ const state = {
   asanaWorkspaceGid: null, // current workspace selection
   asanaProjects: null,    // cache for the selected workspace
   asanaUsers: null,       // cache for the selected workspace (assignee dropdown)
-  actionItems: [],
 };
 
 const current = () => state.meetings.find((m) => m.id === state.currentId) || null;
@@ -164,7 +163,6 @@ function renderList() {
 function selectMeeting(id) {
   state.currentId = id;
   state.view = 'summary';
-  state.actionItems = [];
   closeSettings();
   closeChat();
   renderList();
@@ -475,13 +473,7 @@ async function renderOverviewPanel(m) {
   const aiBox = document.createElement('div');
   aiBox.className = 'ai-rows';
   panel.appendChild(aiBox);
-  extractBtn.addEventListener('click', async () => {
-    extractBtn.disabled = true; extractBtn.textContent = 'Extracting…';
-    const r = await api.extractActionItems(m.id);
-    extractBtn.disabled = false; extractBtn.textContent = '⚡ Create tasks from action items';
-    if (r.error && !r.items.length) { st.className = 'send-status err'; st.textContent = `⚠ ${r.error}`; return; }
-    renderActionItemRows(aiBox, r.items, sel);
-  });
+  wireActionItems(extractBtn, aiBox, m, sel, st);
 }
 
 // Asana is task-creation only — no summary/transcript export. Workspace → project → tasks.
@@ -590,20 +582,40 @@ async function renderAsanaPanel(m) {
   const aiBox = document.createElement('div');
   aiBox.className = 'ai-rows';
   panel.appendChild(aiBox);
-  extractBtn.addEventListener('click', async () => {
-    extractBtn.disabled = true; extractBtn.textContent = 'Extracting…';
-    const r = await api.extractActionItems(m.id);
-    extractBtn.disabled = false; extractBtn.textContent = '⚡ Create tasks from action items';
-    if (r.error && !r.items.length) { st.className = 'send-status err'; st.textContent = `⚠ ${r.error}`; return; }
-    renderActionItemRows(aiBox, r.items, sel, {
-      users: state.asanaUsers,
-      onCreate: (f) => api.createAsanaTask(sel.value, {
-        title: f.title,
-        assigneeGid: f.assignee, // the <select> value is a user gid
-        dueDate: f.dueDate,
-      }),
-    });
+  wireActionItems(extractBtn, aiBox, m, sel, st, {
+    users: state.asanaUsers,
+    onCreate: (f) => api.createAsanaTask(sel.value, {
+      title: f.title,
+      assigneeGid: f.assignee, // the <select> value is a user gid
+      dueDate: f.dueDate,
+    }),
   });
+}
+
+// Wires an extract button + rows box to the cached extraction, shared by both send panels.
+// The panel is rebuilt from scratch on every destination switch, so previously extracted rows are
+// restored from the meeting's cache (no AI call); the button then re-extracts with force.
+// rowOpts is passed straight through to renderActionItemRows (Asana supplies users/onCreate).
+function wireActionItems(btn, box, meeting, projectSel, st, rowOpts = {}) {
+  const LABEL = '⚡ Create tasks from action items';
+  const run = async (force) => {
+    btn.disabled = true; btn.textContent = 'Extracting…';
+    const r = await api.extractActionItems(meeting.id, { force });
+    btn.disabled = false;
+    // Label tracks whether rows are on screen, not how the result arrived — otherwise the button
+    // after a first extract would disagree with the identical state after a panel rebuild.
+    btn.textContent = r.items?.length ? 'Re-extract' : LABEL;
+    if (r.error && !r.items.length) { st.className = 'send-status err'; st.textContent = `⚠ ${r.error}`; return; }
+    // Mirror onto the in-memory meeting: current() reads state.meetings, which only refreshes on
+    // listMeetings(), so without this the next panel rebuild would miss the cache and re-run the AI.
+    meeting.actionItems = r.items;
+    renderActionItemRows(box, r.items, projectSel, rowOpts);
+  };
+  if (meeting.actionItems?.length) { // cached — render immediately, no AI call
+    btn.textContent = 'Re-extract';
+    renderActionItemRows(box, meeting.actionItems, projectSel, rowOpts);
+  }
+  btn.addEventListener('click', () => run(btn.textContent === 'Re-extract'));
 }
 
 // Editable action-item grid, shared by the GetOverview and Asana panels.
