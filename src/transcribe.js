@@ -71,13 +71,15 @@ async function transcribeViaProxy(audioBuf) {
   return result;
 }
 
-async function transcribeRecording(recordingDir, startedAt) {
+// displayName: the channel-0 speaker (the local user). Callers pass the signed-in account name;
+// the env var stays as the fallback so this works before sign-in and in the recovery script.
+async function transcribeRecording(recordingDir, startedAt, displayName) {
   const audioPath = path.join(recordingDir, 'audio.webm');
   const audioBuf = await fsp.readFile(audioPath);
   if (!audioBuf.length) throw new Error('audio.webm is empty');
   const result = await transcribeViaProxy(audioBuf);
   const utterances = result?.results?.utterances || [];
-  const userName = process.env.USER_DISPLAY_NAME || 'You';
+  const userName = (displayName && displayName.trim()) || process.env.USER_DISPLAY_NAME || 'You';
   return utterancesToSegments(utterances, Date.parse(startedAt), userName);
 }
 

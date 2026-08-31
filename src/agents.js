@@ -14,11 +14,18 @@ function agentBinaryPath() {
   return candidates.find((p) => fs.existsSync(p)) || null;
 }
 
+// Lifecycle events go into speakers.jsonl alongside the observations, so the pipeline can tell
+// "the agent found nobody" from "the agent never ran" — previously indistinguishable, which made a
+// silent Layer 1 failure in a shipped installer invisible. parseSpeakerEvents ignores unknown
+// `type` values, so older readers are unaffected.
+const status = (state, extra) => JSON.stringify({ ts: Date.now(), type: 'agent-status', state, ...extra });
+
 // onLine receives each raw stdout JSON line. Returns { stop() }.
 function startNameAgent(platform, onLine) {
   const bin = agentBinaryPath();
   if (!bin) {
     console.log('[agent] no native name agent binary — speaker names fall back to AI inference / rename UI');
+    onLine(status('missing-binary', { platform }));
     return { stop: () => {} };
   }
 
@@ -37,14 +44,28 @@ function startNameAgent(platform, onLine) {
         if (line) onLine(line);
       }
     });
-    child.stderr.on('data', (d) => console.warn('[agent:stderr]', d.toString('utf8').trim()));
-    child.on('error', (err) => console.warn('[agent] spawn failed:', err.message));
+    child.stderr.on('data', (d) => {
+      const text = d.toString('utf8').trim();
+      console.warn('[agent:stderr]', text);
+      // The agent announces its heuristics version on startup; record it so a transcript can be
+      // traced back to the selector set that produced its names.
+      const m = /heuristics=(\S+)/.exec(text);
+      if (m) onLine(status('started', { platform, heuristics: m[1] }));
+    });
+    child.on('error', (err) => {
+      console.warn('[agent] spawn failed:', err.message);
+      onLine(status('spawn-failed', { platform, error: err.message }));
+    });
     child.on('exit', (code) => {
       if (stopped || code === 0) return;
       if (++restarts <= 3) {
         console.warn(`[agent] exited (${code}), restarting ${restarts}/3`);
+        onLine(status('exited', { platform, code, restarts }));
         setTimeout(launch, 1000);
-      } else console.warn('[agent] gave up after 3 restarts — layers 2–3 take over');
+      } else {
+        console.warn('[agent] gave up after 3 restarts — layers 2–3 take over');
+        onLine(status('gave-up', { platform, code }));
+      }
     });
   };
   launch();

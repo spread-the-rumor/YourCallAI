@@ -4,6 +4,12 @@
     <TargetFramework>net8.0-windows</TargetFramework>
     <UseWPF>true</UseWPF> <!-- pulls in UIAutomationClient/UIAutomationTypes -->
     <Nullable>enable</Nullable>
+    <!-- Required: the source uses List<>/HashSet<>/Dictionary<>/LINQ without spelling out
+         System.Collections.Generic or System.Linq. Without this the build fails with CS0246.
+         This was missing since the agent was first added, so it had NEVER compiled — the
+         "Build Windows name agent" step in release.yml failed on every release, which is why
+         Layer 1 speaker names never worked in any installer. -->
+    <ImplicitUsings>enable</ImplicitUsings>
     <PublishSingleFile>true</PublishSingleFile>
     <SelfContained>true</SelfContained>
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>

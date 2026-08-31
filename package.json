@@ -13,7 +13,9 @@
     "package": "electron-forge package",
     "make": "electron-forge make",
     "publish": "electron-forge publish",
-    "ship": "node scripts/ship.mjs"
+    "ship": "node scripts/ship.mjs",
+    "test": "node test/selfcheck.js",
+    "build:agent": "node scripts/build-agent.mjs"
   },
   "author": "Rumor Avenue",
   "license": "MIT",

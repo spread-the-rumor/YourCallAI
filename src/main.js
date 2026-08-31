@@ -15,6 +15,8 @@ const detector = require('./detector');
 const { startNameAgent } = require('./agents');
 const { transcribeRecording } = require('./transcribe');
 const { alignSpeakers } = require('./align');
+const { mergeRoster } = require('./roster');
+const { resolveSpeakers, readSpeakerMap, sampleFor } = require('./speakerResolve');
 const { summarizeTranscript, summaryFailed } = require('./ai/summarize');
 const { askMeeting } = require('./ai/chat');
 const { extractActionItems } = require('./ai/extractActionItems');
@@ -416,25 +418,56 @@ async function runPipeline(recordingId) {
     emitStatus('transcribing', 'Transcribing with Deepgram…');
     emitProgress(recordingId, 'transcribing');
 
+    // The channel-0 speaker is whoever is signed in on this machine; the env var is the fallback.
+    const userName = auth.getUser()?.name || process.env.USER_DISPLAY_NAME || 'You';
+
     let transcript = null;
     let transcribeError = null;
     try {
-      transcript = await transcribeRecording(dir, meta.startedAt);
+      transcript = await transcribeRecording(dir, meta.startedAt, userName);
     } catch (err) {
       transcribeError = err.message;
       console.error('[pipeline] transcription failed:', err.message);
       await patchMeta(dir, { status: 'failed', error: err.message });
     }
 
+    // Carries the resolution outcome out of the `if (transcript)` block to the meeting record.
+    let nameAttribution = null;
+    let resolvedSpeakerMap = null;
+
     let summary;
     if (transcript) {
-      // §7 Layer 1: native-agent alignment; Layer 2: AI inference for leftovers
+      // §7 Layer 1: native-agent alignment; Layer 2: roster-constrained AI inference;
+      // then resolveSpeakers merges those with the user's prior manual renames.
       emitProgress(recordingId, 'resolving-names');
-      const { roster } = alignSpeakers(transcript, path.join(dir, 'speakers.jsonl'));
-      const inferred = await inferSpeakerNames(transcript, roster);
-      for (const seg of transcript) {
-        if (inferred[seg.speaker]) seg.speaker = inferred[seg.speaker];
-      }
+      const prior = await store.getMeeting(recordingId);
+      const { roster, rosterSources, diagnostics, votes } =
+        alignSpeakers(transcript, path.join(dir, 'speakers.jsonl'));
+      const merged = mergeRoster([
+        ...(rosterSources?.length ? rosterSources : [{ names: roster, source: 'agent-roster', confidence: 0.9 }]),
+        // Prior manual renames are ground truth for who was in the room.
+        { names: Object.values(readSpeakerMap(prior?.speakerMap)).map((e) => e.name), source: 'manual', confidence: 1 },
+      ]);
+      const inferred = await inferSpeakerNames(transcript, merged, {
+        subject: meta.title || null,
+        userName,
+      });
+      const resolved = resolveSpeakers({
+        transcript,
+        roster: merged,
+        priorSpeakerMap: prior?.speakerMap,
+        userName,
+        inferred,
+        alignment: votes && Object.keys(votes).length ? votes : null,
+      });
+      transcript = resolved.transcript;
+      resolvedSpeakerMap = resolved.speakerMap;
+      nameAttribution = {
+        agent: diagnostics || null,
+        roster: merged.map((r) => r.name),
+        unresolved: resolved.unresolved,
+        sources: resolved.sources,
+      };
       await fsp.writeFile(path.join(dir, 'transcript.json'), JSON.stringify(transcript, null, 2));
 
       emitStatus('processing', 'Generating summary…');
@@ -458,7 +491,10 @@ async function runPipeline(recordingId) {
       transcript,
       videoUrl: `http://localhost:${server.PORT}/recordings/${recordingId}/video.webm`,
       transcriptUrl: transcript ? `http://localhost:${server.PORT}/recordings/${recordingId}/transcript.json` : null,
-      speakerMap: existing?.speakerMap || {},
+      speakerMap: resolvedSpeakerMap || existing?.speakerMap || {},
+      // Why each name was chosen, so the UI can mark low-confidence ones unverified and a support
+      // question ("why is this wrong?") is answerable without re-running anything.
+      nameAttribution,
       chat: existing?.chat || [],
       // This is a freshly built transcript (first run or Retry transcription), so any cached
       // action items describe the old one. Set explicitly: upsert merges, so omitting would keep them.
@@ -591,7 +627,19 @@ ipcMain.handle('rename-speaker', async (e, id, channel, diarizedSpeaker, newName
   if (!name) return { ok: false, error: 'Name is empty.' };
   const transcript = meeting.transcript.map((seg) =>
     seg.channel === channel && seg.diarizedSpeaker === diarizedSpeaker ? { ...seg, speaker: name } : seg);
-  const speakerMap = { ...(meeting.speakerMap || {}), [`${channel}:${diarizedSpeaker}`]: name };
+  // Store a speech sample with the rename. Deepgram's diarized ids are not stable across runs, so
+  // on Retry transcription this is what lets resolveSpeakers tell "same person, reapply the name"
+  // from "different person, don't silently mislabel them".
+  const speakerMap = {
+    ...(meeting.speakerMap || {}),
+    [`${channel}:${diarizedSpeaker}`]: {
+      name,
+      source: 'manual',
+      confidence: 1,
+      lockedByUser: true,
+      sampleText: sampleFor(meeting.transcript, channel, diarizedSpeaker),
+    },
+  };
   // Drop cached action items — speaker names feed the assignee field, so they're now stale.
   const updated = await store.updateMeeting(id, { transcript, speakerMap, actionItems: null });
   return { ok: true, meeting: updated };

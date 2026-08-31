@@ -405,6 +405,19 @@ select:focus { border-color: var(--accent); }
 }
 .seg .speaker:hover { text-decoration: underline; }
 .seg .speaker.you { color: var(--text-muted); cursor: default; }
+/* A name the app inferred but could not confirm — dotted underline + trailing "?" so it reads as
+   a suggestion rather than a fact. It still flows into summaries, so it must look correctable. */
+.seg .speaker.unverified {
+  color: var(--text-muted);
+  text-decoration: underline dotted var(--border);
+  text-underline-offset: 3px;
+}
+.seg .speaker.unverified:hover { color: var(--accent); text-decoration: underline solid var(--accent); }
+.transcript-note {
+  margin: 0 0 var(--s2); padding: var(--s2) var(--s3);
+  background: var(--surface); border: 1px solid var(--border); border-radius: var(--r-sm);
+  font-size: var(--fs-sm);
+}
 .seg .text { flex: 1; line-height: 1.6; font-size: var(--fs-md); }
 .seg .rename-input {
   background: var(--surface); color: var(--text); border: 1px solid var(--accent);

@@ -156,6 +156,158 @@ IPC: `asana-connect/-disconnect/-status`, `list-asana-workspaces/-projects/-user
 - `renderActionItemRows()` is shared: `opts.users` switches the assignee cell to a `<select>`,
   `opts.onCreate` swaps the create call. Omitting both keeps GetOverview's original behaviour.
 
+## Speaker names (§7) — candidate/evidence model
+
+Names are resolved by `resolveSpeakers()` (`src/speakerResolve.js`, pure) which merges every signal
+into one `speakerMap` of `{ name, source, confidence, lockedByUser, sampleText }`, keyed
+`"<channel>:<diarizedSpeaker>"`. Sources are applied in descending trust and **each step only
+touches labels still unresolved**, so a weaker source can never overwrite a stronger one:
+
+1. **channel 0 → the signed-in user** (0.95). ch0 is the local mic by construction. Name comes from
+   `auth.getUser()?.name`, falling back to `USER_DISPLAY_NAME`.
+2. **Prior manual renames** (1.0) — the Retry-transcription fix. `speakerMap` used to be
+   *write-only*, so every rename was silently destroyed by a re-transcribe.
+3. **Native-agent overlap vote** (`src/align.js`, ~0.9) — real names read off the meeting UI.
+4. **Roster-constrained AI inference** (`src/ai/inferSpeakerNames.js`, 0.5–0.8).
+5. Leftovers keep `Speaker N` and are reported in `nameAttribution.unresolved`.
+
+**Staleness check.** Deepgram's diarized ids are **not stable across runs**, so a lock for `1:3`
+from run A may point at a different person in run B. Each manual rename stores a `sampleText` (first
+~200 chars that speaker said); on re-apply, a word-overlap mismatch **demotes** the entry to
+`prior-manual-stale` at 0.7 (shown as unverified) instead of confidently mislabelling someone.
+
+**Confidence is surfaced.** `< 0.85` renders with a dotted underline and a trailing `?`
+(`.speaker.unverified`), tooltip naming the source. A wrong name propagates into the summary, the
+action-item `assignee` and the Slack/Asana send, so it must read as a suggestion, not a fact.
+
+**Read-side back-compat is mandatory:** `speakerMap` values were bare strings before this change.
+`readSpeakerMap()` accepts a string as `{source:'manual', confidence:1, lockedByUser:true}` — existing
+`meetings.json` files and already-synced Supabase rows still hold that shape. `sync.js` stores the
+meeting as opaque JSON, so no migration was needed.
+
+### Prompt windowing — the bug that made long meetings unnameable
+`transcriptToPrompt` keeps the **last** 48 KB, which is right for summaries (decisions are at the
+end) and **wrong for names** (introductions are in the first two minutes). On any meeting past
+~45 min the name prompt received exactly the portion containing no introductions.
+`transcriptToNamePrompt` (`src/transcriptUtils.js`) instead emits a **name-dense excerpt first**
+(intro-cue lines + the first/last two turns of every speaker), then fills head-first and tail-last.
+`transcriptToPrompt` is deliberately untouched — `summarize`/`chat`/`extractActionItems`/
+`getoverview` all depend on its tail-keeping behaviour.
+
+### The roster is a CLOSED set, not a hint
+The old prompt said "Known participants: …" and validated only the *key*, so any hallucinated value
+was accepted. Now `parseInferenceResponse` (pure, unit-tested) enforces: name must match the roster
+via `matchToRoster`, one person cannot hold two labels, and **the ch0 user can never be a ch1
+speaker**. With an *empty* roster it falls back to open-ended inference at ≤0.55 — today's
+behaviour, kept as the floor rather than resolving nothing.
+
+`src/roster.js` merges roster sources by confidence. **A `dictionary: true` source may only
+canonicalise a name another source already supplied — never introduce one.** That is what keeps the
+whole Slack workspace (`listSlackUsers()` returns thousands) out of a 3-person meeting's roster.
+
+### Ground truth: what live Teams actually emits (captured 2026-08-27, via `--dump`)
+
+The heuristics were originally written against *assumptions* about a11y output and every one was
+wrong. These are the real strings; `test/selfcheck.js` uses them verbatim as fixtures. **Do not
+"simplify" those fixtures** — they are the only evidence the parser is correct.
+
+```
+Menu                                            <- container is a MENU, not a List
+  MenuItem 'System'                             <- Win32 window menu, NOT a participant
+  MenuItem 'Myself video, Sagar, Has control of production tools, Muted, Has context menu'
+  MenuItem 'Carlos Brito, Has control of production tools, Context menu is available'
+  MenuItem 'SBPM Dev, Has control of production tools, muted, Context menu is available'
+Button 'People'                                 <- NO participant count anywhere
+Text   'Elapsed time 18:56' / '23:08'           <- false-match hazard for a count regex
+MenuItem 'Content shared by Hernan Zapata'      <- contains a name, is not a roster row
+```
+
+Four bugs this exposed, all fixed in C#, Swift **and** `src/roster.js` (keep the three in step):
+1. **The name is one comma-separated field; the rest is status.** `ROLE_WORDS` only stripped single
+   role words, so `", Has control of production tools, Context menu is available"` survived and blew
+   the ≤5-token limit — **every real name scored 0.00**. Note Teams prefixes its own tile
+   (`Myself video, Sagar, …`), so the name is *not* reliably the first field: take the first field
+   that isn't status-clause-shaped.
+2. **The container is `Menu`/`MenuItem`, not `List`/`ListItem`.** Accepting only list roles is why
+   the roster came back empty. `Menu` and `Group` are now accepted too.
+3. **Exact-match denylist for UI artifacts.** `System` and `Workspaces` score **0.85 — identical to
+   a real mononym** like `Sagar` or `Nav`, so scoring can never separate them. Whole-string match
+   only, so a person named `Nav` is unaffected. A denylist can't be complete, which is why…
+4. **An active speaker MUST be on the roster.** A Chrome window's `Workspaces` label was reported as
+   the active speaker in a live call. `FindActiveByPhrase` now rejects off-roster names outright
+   rather than down-weighting them — a speaker who isn't a participant is a contradiction.
+
+`expectedCount` returns **0 = unknown, never "nobody"**: Teams exposes no count at all. The regex
+requires the number *adjacent* to the keyword and excludes clock-shaped values, because a looser
+rule read `Elapsed time 18:56` and reported a 5-person call as 18 participants.
+
+### Google Meet exposed the real design flaw: scope, not name-shape
+
+A live 19-minute Meet call (`platform: google-meet`, auto-detected, pipeline `complete`) produced a
+roster of **Chrome's toolbar**: `["Back","Forward","Reload","Work","History Navigation","PDF
+Creator","Mentions","REPORTS", …]` — 22 entries, another tab's sidebar included. The two real
+participants were `Sagar Bansal` and `Vicky Rana`; Vicky never entered the roster at all.
+
+Every junk string scored **0.74–1.00**, i.e. indistinguishable from a real name (`PDF Creator` and
+`History Navigation` both score exactly 1.00, same as `Vicky Rana`). **No amount of name-shape
+scoring or denylisting can fix this** — the flaw was that the agent walks an entire Chrome window,
+where the participants panel is a small region in a tree full of browser chrome and other tabs.
+
+**The damage was in the guard, not the transcript.** The transcript stayed clean (`Sagar Bansal` on
+ch0, `Speaker 1` on ch1) — but the polluted roster became a *closed set that excluded the real
+participant*, so the correctly-inferred "Vicky Rana" was **rejected by our own anti-hallucination
+guard** and she stayed `Speaker 1` for the whole meeting. Junk in the roster caused a guaranteed
+miss, which is worse than having no roster.
+
+Fixes, in order of importance:
+1. **`LooksInCall()` gate** (`Program.cs` / `main.swift`): a window contributes names only if it has
+   a leave/hangup control **plus** another call control (mic/camera/share/participants). Slack's
+   formatting toolbar (`Bold`, `Italic`, `Code` — which the agent emitted as a 10-person roster with
+   no meeting open at all) and Chrome's toolbar have neither. This is the one place English strings
+   are unavoidable; a localized client yields no names and falls back to AI inference.
+2. **`rosterIsTrustworthy()`** (`src/roster.js`): an untrustworthy roster is treated as **absent**,
+   not as a closed set, so it can never exclude a real person. The measured discriminator is the
+   share of **exactly-two-word** names — real Meet 100%, real Teams 60%, the pollution 32%. A plain
+   multi-word test does *not* separate them (55% vs 60%).
+3. `Group` dropped as a roster container (too generic — Chrome's toolbar qualified); a depth gate
+   (`MinWebContentDepth = 6`) separates browser chrome from web content; browser windows additionally
+   require multi-word names; and the `tile-grid` fallback now needs the same item-role evidence a
+   panel does.
+
+**Verified: Teams desktop (correct roster) and the no-meeting case (zero output).** Zoom and
+browser-hosted Teams/Zoom remain unverified. Use `agents/dist/YourCallAgent.exe --dump` *while that
+meeting is open* before touching a heuristic — every heuristic written from assumption was wrong.
+
+### Native agent (`agents/windows/Program.cs`, `agents/macos/main.swift`)
+Rewritten to match **structure, never English UI strings**:
+- **Roster** = the best-scoring sibling group whose children mostly look like people (an accessible
+  List/DataGrid, or ≥2 ListItems). Meet/Zoom/Teams all render the participants panel that way, in
+  every language. Falls back to the tile grid at 0.75 (Meet's panel is usually *closed*).
+- **Active speaker** = **decoration delta**: we already know the clean roster names, so a node
+  reading `<known name> + extra` is that person with a status appended. Matching a name *we
+  extracted* is immune to localization and to Meet/Teams rewording their status text. The old
+  `"<Name> is speaking"` regex is demoted to a last-resort confirmation.
+- Dispatch now classifies by **owning process, not window title**, and no longer `return`s after the
+  first window — browser-hosted Teams/Zoom had **no branch at all**, and modern Teams titles (no
+  "Meeting"/"Call") never matched.
+- `personScore()` is a score, not a gate: mononyms and single-initial tokens are accepted
+  (common for Meet guests); decorations like `(Guest)`/`(She/Her)`/`, Host` are stripped first.
+  Mirrored in three places — C#, Swift, and `src/roster.js` (the JS side re-validates, so it is the
+  final safety net). **Keep them in step.**
+
+**`npm run build:agent`** builds the binary locally. It previously existed only in CI, so
+`agents/dist` was empty in every dev checkout and Layer 1 **never ran outside a shipped installer**.
+Lifecycle events (`{"type":"agent-status","state":"missing-binary"|"started"|…}`) now land in
+`speakers.jsonl`, so "found nobody" is distinguishable from "never ran". `<binary> --dump` prints the
+raw a11y tree of every candidate window — the instrument for diagnosing a platform whose names stop
+resolving. **Windows needs the .NET 8 SDK** (the runtime alone is not enough).
+
+Not built: voice fingerprinting (audio never reaches main as PCM; needs ffmpeg + an embedding model;
+solves clustering, not naming; persistent biometric identifiers) and Google Calendar attendees
+(sensitive scope, re-consent, Google review, and invited ≠ attended). Slack Huddle has no detection
+or agent branch — the manual `start-huddle` button is the only path, though every platform-independent
+layer above still improves those recordings.
+
 ## Action-item extraction is cached on the meeting
 
 Extraction is a full-transcript AI call (~12s). `renderSendBlock()` rebuilds the panel with

@@ -237,6 +237,15 @@ function renderActionRow(m) {
   }
 }
 
+// How each speaker name was arrived at, for the unverified tooltip (§7).
+const SOURCE_LABELS = {
+  'native-agent': 'the meeting window',
+  'ai-inference': 'the conversation',
+  'prior-manual-stale': 'an earlier rename that may no longer match this speaker',
+  'signed-in-user': 'your account',
+  manual: 'your rename',
+};
+
 // ---------- transcript view + rename (§7 Layer 3) ----------
 function renderTranscript(m) {
   const box = $('view-transcript');
@@ -245,14 +254,36 @@ function renderTranscript(m) {
     box.innerHTML = '<p class="muted">No transcript for this meeting.</p>';
     return;
   }
+  // A name the app is not sure about is worse than a missing one: it flows into the summary, the
+  // action-item assignee and the Slack/Asana send. Mark it instead, so a wrong name costs one click.
+  const speakerMap = m.speakerMap || {};
+  const attribution = (seg) => {
+    const raw = speakerMap[`${seg.channel}:${seg.diarizedSpeaker}`];
+    if (!raw) return null;
+    return typeof raw === 'string' ? { name: raw, confidence: 1, source: 'manual' } : raw;
+  };
+  const unresolved = m.nameAttribution?.unresolved || [];
+  if (unresolved.length) {
+    const note = document.createElement('p');
+    note.className = 'muted transcript-note';
+    note.textContent = unresolved.length === 1
+      ? 'One speaker could not be identified — click the name to correct it.'
+      : `${unresolved.length} speakers could not be identified — click a name to correct it.`;
+    box.appendChild(note);
+  }
+
   for (const seg of m.transcript) {
     const el = document.createElement('div');
     el.className = 'seg';
     const nameEl = document.createElement('div');
-    nameEl.className = 'speaker' + (seg.channel === 0 ? ' you' : '');
-    nameEl.textContent = segSpeaker(seg);
+    const info = attribution(seg);
+    const unverified = !!info && typeof info.confidence === 'number' && info.confidence < 0.85;
+    nameEl.className = 'speaker' + (seg.channel === 0 ? ' you' : '') + (unverified ? ' unverified' : '');
+    nameEl.textContent = segSpeaker(seg) + (unverified ? ' ?' : '');
     if (seg.channel !== 0) {
-      nameEl.title = 'Click to rename this speaker';
+      nameEl.title = unverified
+        ? `Unverified — inferred from ${SOURCE_LABELS[info.source] || info.source}. Click to correct.`
+        : 'Click to rename this speaker';
       nameEl.addEventListener('click', () => {
         const input = document.createElement('input');
         input.className = 'rename-input';

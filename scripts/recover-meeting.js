@@ -16,6 +16,8 @@ const os = require('os');
 const { utterancesToSegments } = require('../src/transcribe');
 const { alignSpeakers } = require('../src/align');
 const { inferSpeakerNames } = require('../src/ai/inferSpeakerNames');
+const { mergeRoster } = require('../src/roster');
+const { resolveSpeakers } = require('../src/speakerResolve');
 const { summarizeTranscript } = require('../src/ai/summarize');
 const { meetingDate } = require('../src/transcriptUtils');
 
@@ -81,14 +83,25 @@ async function main() {
   const result = await deepgramTranscribe(audioBuf);
   const utterances = result?.results?.utterances || [];
   const userName = process.env.USER_DISPLAY_NAME || 'You';
-  const transcript = utterancesToSegments(utterances, Date.parse(meta.startedAt), userName);
+  let transcript = utterancesToSegments(utterances, Date.parse(meta.startedAt), userName);
   console.log(`[recover] ${transcript.length} utterance segments`);
   if (!transcript.length) throw new Error('Deepgram returned no utterances');
 
-  // Speaker names: alignment (native agent, likely empty here) + AI inference.
-  const { roster } = alignSpeakers(transcript, path.join(dir, 'speakers.jsonl'));
-  const inferred = await inferSpeakerNames(transcript, roster);
-  for (const seg of transcript) if (inferred[seg.speaker]) seg.speaker = inferred[seg.speaker];
+  let speakerMap = {};
+  // Speaker names: alignment (native agent, likely empty here) + roster-constrained AI inference,
+  // merged by resolveSpeakers. Mirrors runPipeline in src/main.js — keep the two in step.
+  const { roster, rosterSources, votes } = alignSpeakers(transcript, path.join(dir, 'speakers.jsonl'));
+  const merged = mergeRoster(rosterSources?.length
+    ? rosterSources
+    : [{ names: roster, source: 'agent-roster', confidence: 0.9 }]);
+  const inferred = await inferSpeakerNames(transcript, merged, { subject: meta.title || null, userName });
+  const resolved = resolveSpeakers({
+    transcript, roster: merged, userName, inferred,
+    alignment: votes && Object.keys(votes).length ? votes : null,
+  });
+  transcript = resolved.transcript;
+  speakerMap = resolved.speakerMap;
+  if (resolved.unresolved.length) console.log(`[recover] unresolved speakers: ${resolved.unresolved.join(', ')}`);
   await fsp.writeFile(path.join(dir, 'transcript.json'), JSON.stringify(transcript, null, 2));
   console.log('[recover] wrote transcript.json');
 
@@ -107,7 +120,7 @@ async function main() {
     transcript,
     videoUrl: `http://localhost:${SERVER_PORT}/recordings/${recordingId}/video.webm`,
     transcriptUrl: `http://localhost:${SERVER_PORT}/recordings/${recordingId}/transcript.json`,
-    speakerMap: {},
+    speakerMap,
     chat: [],
   };
 
