@@ -209,13 +209,20 @@ enum Heuristics {
     //
     // This is the one place English strings are unavoidable; a localized client yields no names and
     // falls through to AI inference, which is the documented degradation, not a break.
+    // Keep in step with Program.cs. Widened for Zoom, whose leave button is often bare "End" and
+    // whose controls read "Start Video"/"Mute" rather than the Teams phrasings originally encoded.
+    // A window matching neither contributes nothing at all, so a miss is a silent whole-meeting
+    // failure. The leave+control conjunction is what keeps ordinary windows ("End" in Explorer,
+    // "Exit"/"Forward" in a mail client) from qualifying.
     static let leaveControl = try! NSRegularExpression(
-        pattern: "^(leave|leave call|leave meeting|hang up|end call|end meeting|disconnect)\\b",
+        pattern: "^(leave|hang ?up|end|disconnect|exit)\\b",
         options: [.caseInsensitive])
     static let callControl = try! NSRegularExpression(
-        pattern: "\\b(mute|unmute) (mic|microphone)\\b|\\bturn (camera|video) (on|off)\\b"
-            + "|\\bshare (content|screen)\\b|\\bmicrophone\\b|\\bcamera\\b|\\braise your hand\\b"
-            + "|\\bparticipants?\\b|\\bpeople\\b",
+        pattern: "\\b(mute|unmute)\\b|\\b(start|stop|turn) (the )?(camera|video|audio)\\b"
+            + "|\\bturn (camera|video) (on|off)\\b|\\bshare (content|screen)\\b"
+            + "|\\bmicrophone\\b|\\bcamera\\b|\\braise (your )?hand\\b"
+            + "|\\bparticipants?\\b|\\bpeople\\b"
+            + "|\\bgallery view\\b|\\bspeaker view\\b|\\brecord(ing)?\\b|\\bbreakout\\b|\\breactions\\b",
         options: [.caseInsensitive])
 
     static func looksInCall(_ nodes: [AXNode]) -> Bool {

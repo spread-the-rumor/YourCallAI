@@ -92,6 +92,16 @@ function resolveSpeakers({
     return hit && hit.score >= 0.85 ? hit.name : name;
   };
 
+  // Same human? Exact key first, then a roster-style fuzzy match so a mononym read off a meeting
+  // tile ("Sagar") is recognised as the account holder ("Sagar Bansal"). 0.7 is what matchToRoster
+  // scores a first-name hit; anything looser would start merging distinct people.
+  const isSamePerson = (a, b) => {
+    if (!a || !b) return false;
+    if (nameKey(a) === nameKey(b)) return true;
+    const hit = matchToRoster(a, [b]);
+    return !!hit && hit.score >= 0.7;
+  };
+
   const put = (channel, dz, entry) => {
     const key = mapKey(channel, dz);
     if (speakerMap[key]) return false;
@@ -139,6 +149,14 @@ function resolveSpeakers({
     if (!Number.isFinite(channel) || !Number.isFinite(dz)) continue;
     const conf = (value && typeof value.confidence === 'number') ? value.confidence
       : (typeof agentConfidence === 'number' ? agentConfidence : AGENT_CONFIDENCE);
+    // The local user is on channel 0 by construction, so they cannot also be a channel-1 voice.
+    // The AI tier has always enforced this; the agent vote did not, and Teams labels the user's
+    // own tile ("Myself video, Sagar, …") like any other participant — so a captured meeting
+    // really did resolve 338 remote segments to the signed-in user.
+    // matchToRoster, not nameKey: the agent reads the display name off the tile, which is often
+    // the mononym "Sagar" while the account is "Sagar Bansal". nameKey demands an exact match and
+    // would let that straight through.
+    if (channel !== 0 && user && isSamePerson(canonical(name), user)) continue;
     put(channel, dz, {
       name: canonical(name),
       source: 'native-agent',

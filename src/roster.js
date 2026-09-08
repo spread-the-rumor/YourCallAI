@@ -190,13 +190,34 @@ const rosterNames = (roster) => (roster || []).map((r) => (typeof r === 'string'
 //   real Teams roster  (5 people)  →  60%
 //   the Meet pollution (22 entries) →  32%
 // A plain multi-word test does NOT separate them (55% vs 60%) — the *exactly two* constraint does.
+// The word-count rule alone REJECTS legitimate rosters, measured:
+//   ["Sagar","Vicky","Priya"]        (Meet guests, first names)  → 0% two-word → rejected
+//   ["Sagar","Vicky Rana","iPhone"]  (Zoom, mixed + a device)     → 33%        → rejected
+// Meet and Zoom guests routinely join under a single first name, so on those platforms the
+// heuristic threw away a correct roster and fell back to unconstrained inference.
+//
+// It cannot be fixed by scoring names better. personScore() cannot separate them — measured,
+// "Back" scores 0.85 exactly like "Sagar", and "History Navigation" scores 1.00 exactly like
+// "Vicky Rana". Name shape carries no signal here.
+//
+// What DOES separate them is structural: a `participants-panel` source means the agent found a
+// real accessible participants list inside a window that passed the in-call check. The captured
+// pollution came from the tile-grid fallback in a browser window, never from a panel. So trust
+// the structure when we have it, and fall back to the shape heuristic only when we don't.
 const MIN_TWO_WORD_SHARE = 0.5;
 const MAX_TRUSTWORTHY = 20; // a meeting this large is rare; a polluted scrape reaching it is not
+const STRUCTURAL_SOURCES = new Set(['participants-panel']);
 
 function rosterIsTrustworthy(roster) {
   const names = rosterNames(roster);
   if (!names.length) return false;
   if (names.length > MAX_TRUSTWORTHY) return false;
+
+  // Structural evidence outranks name shape: a participants panel is a real roster even when
+  // everyone in it goes by one name.
+  const entries = (roster || []).filter((r) => r && typeof r === 'object');
+  if (entries.length && entries.every((r) => STRUCTURAL_SOURCES.has(r.source))) return true;
+
   const twoWord = names.filter((n) => n.trim().split(/\s+/).length === 2).length;
   return twoWord >= 1 && twoWord / names.length >= MIN_TWO_WORD_SHARE;
 }

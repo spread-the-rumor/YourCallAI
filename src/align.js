@@ -45,12 +45,19 @@ function parseSpeakerEvents(jsonlPath) {
   return { events, roster: [...roster], rosterSources, diagnostics };
 }
 
-// Each event holds from its ts until the next event; the last one gets a 15s cap.
+// Each event holds from its ts for at most MAX_HOLD_MS, or until the next event if that comes
+// sooner. The cap applies to EVERY interval, not just the last: a real speaking signal repeats
+// every few seconds, so when events are dense this is a no-op. When they are sparse it is the
+// difference between honest silence and a confident lie — a captured 17-minute meeting produced
+// only 3 events, and the unbounded "hold until the next event" rule let ONE of them claim ~25
+// minutes of transcript, voting that name onto every voice it overlapped.
+const MAX_HOLD_MS = 15000;
+
 function toIntervals(events) {
   return events.map((e, i) => ({
     name: e.name,
     start: e.ts,
-    end: events[i + 1] ? events[i + 1].ts : e.ts + 15000,
+    end: Math.min(events[i + 1] ? events[i + 1].ts : Infinity, e.ts + MAX_HOLD_MS),
     // Weight ties the vote to how the agent identified the speaker (structural read > regex).
     weight: typeof e.confidence === 'number' ? Math.max(0, Math.min(1, e.confidence)) : 1,
   }));

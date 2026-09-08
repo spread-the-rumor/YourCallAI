@@ -22,6 +22,9 @@
     .title { font-size: 13px; font-weight: 700; }
     .sub { font-size: 11px; color: rgba(246, 246, 246, 0.6); margin-top: 2px; max-width: 170px;
            white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    /* The capture warning has to stay actionable ("switch your speaker to…"), so it wraps
+       instead of being ellipsised at 170px like a meeting title. */
+    .sub.wrap { white-space: normal; max-width: 230px; }
     button { -webkit-app-region: no-drag; cursor: pointer; border: none; border-radius: 999px; font-size: 12px; }
     .primary { background: #FDE4C3; color: #2b2113; font-weight: 700; padding: 8px 16px; }
     .primary:hover { filter: brightness(1.08); }
@@ -49,6 +52,8 @@
       <button id="keep" class="ghost hidden">Keep going</button>
       <!-- ending mode -->
       <button id="keep-ending" class="primary hidden">Keep recording</button>
+      <!-- capture-degraded mode (warn only — recording continues) -->
+      <button id="capture-ok" class="ghost hidden">Got it</button>
     </div>
   </div>
 </body>

@@ -56,7 +56,7 @@ function renderStatus() {
   const labels = {
     idle: state.flags.deepgram ? 'Idle' : 'Idle — add Deepgram key in Settings',
     'meeting-detected': 'Meeting detected',
-    recording: 'Recording',
+    recording: detail || 'Recording',
     processing: detail || 'Processing…',
     transcribing: detail || 'Transcribing…',
     error: detail || 'Error',

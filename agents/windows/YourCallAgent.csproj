@@ -11,6 +11,12 @@
          Layer 1 speaker names never worked in any installer. -->
     <ImplicitUsings>enable</ImplicitUsings>
     <PublishSingleFile>true</PublishSingleFile>
+    <!-- REQUIRED with PublishSingleFile. Without it .NET bundles only the MANAGED assemblies and
+         leaves the native ones (WPF/UIAutomation: PresentationNative_cor3, wpfgfx_cor3, vcruntime…)
+         as loose files beside the exe. build-agent.mjs copies just the exe into agents/dist, so
+         every UIA call died with DllNotFoundException inside OSVersionHelper -> the agent could not
+         enumerate a single window and silently emitted no roster for whole meetings. -->
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
     <SelfContained>true</SelfContained>
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
     <AssemblyName>YourCallAgent</AssemblyName>

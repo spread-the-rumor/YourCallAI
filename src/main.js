@@ -176,6 +176,12 @@ function notify(info) {
     let title, body;
     if (info.kind === 'silence') { title = 'Still recording?'; body = 'No one has spoken for 30s — open Your Call AI to stop.'; }
     else if (info.kind === 'ending') { title = 'Meeting ended'; body = 'Stopping the recording shortly…'; }
+    else if (info.kind === 'capture-degraded') {
+      title = 'Audio capture problem';
+      body = info.micDead && info.sysDead ? 'No audio is reaching the recorder — still recording.'
+        : info.sysDead ? 'Meeting audio isn’t being captured — still recording.'
+          : 'Your microphone isn’t being captured — still recording.';
+    }
     else { title = 'Meeting detected'; body = `${platform} — open Your Call AI to start recording.`; }
     const n = new Notification({ title, body });
     n.on('click', () => { if (mainWindow && !mainWindow.isDestroyed()) { mainWindow.show(); mainWindow.focus(); } });
@@ -275,6 +281,7 @@ async function startRecording(source, platform = '', title = '') {
     videoStream: fs.createWriteStream(path.join(dir, 'video.webm')),
     audioStream: fs.createWriteStream(path.join(dir, 'audio.webm')),
     speakersStream: fs.createWriteStream(path.join(dir, 'speakers.jsonl'), { flags: 'a' }),
+    captureStream: fs.createWriteStream(path.join(dir, 'capture.jsonl'), { flags: 'a' }),
     agent: null,
     stopResolve: null,
   };
@@ -330,6 +337,7 @@ async function finalizeRecording(failedMessage = null) {
     closeStream(current.videoStream),
     closeStream(current.audioStream),
     closeStream(current.speakersStream),
+    closeStream(current.captureStream),
   ]);
   await patchMeta(current.dir, {
     endedAt: nowIso(),
@@ -386,6 +394,42 @@ ipcMain.on('capture-audio', (e, active) => { if (active) lastFarEndSoundTs = Dat
 ipcMain.on('capture-silence', () => {
   if (!rec || pendingStop) return; // don't overlay the "ending" countdown
   showPopup({ kind: 'silence', platform: rec.meta.platform, title: rec.meta.title });
+});
+
+// Capture diagnostics. Mirrors speakers.jsonl: append-only JSONL next to the recording, so a
+// "it recorded nothing" report can be diagnosed after the fact instead of guessed at.
+ipcMain.on('capture-diag', (e, evt) => {
+  if (!rec) return;
+  try { rec.captureStream.write(JSON.stringify({ ts: Date.now(), ...evt }) + '\n'); }
+  catch (err) { console.error('[capture] diag write failed:', err.message); }
+});
+
+// A stream is dead but capture is NOT — never finalize here. Warn and keep recording: a
+// half-captured meeting still transcribes (mic-only lands on ch0), a stopped one is gone.
+ipcMain.on('capture-degraded', (e, info) => {
+  if (!rec || pendingStop) return;
+  const both = info.micDead && info.sysDead;
+  const detail = both ? 'No audio reaching the recorder'
+    : info.sysDead ? 'Meeting audio not captured' : 'Microphone not captured';
+  patchMeta(rec.dir, { captureHealth: { ...info, at: nowIso() } }).catch(() => {});
+  emitStatus('recording', `⚠ ${detail} — still recording`);
+  showPopup({ kind: 'capture-degraded', ...info, platform: rec.meta.platform, title: rec.meta.title });
+});
+
+// The default output changed mid-recording. WASAPI does not follow it, so the loopback may now
+// be watching an endpoint nobody plays to — the recorder re-runs its warm-up check to find out.
+ipcMain.on('capture-device-changed', () => {
+  if (!rec || pendingStop) return;
+  emitStatus('recording', 'Audio device changed — reconnecting…');
+});
+
+// Loopback was re-bound to the new default output and verified live. Clear the warning and
+// dismiss any degraded popup: capture recovered on its own, so leaving an alarm up would lie.
+ipcMain.on('capture-recovered', () => {
+  if (!rec || pendingStop) return;
+  patchMeta(rec.dir, { captureHealth: { recovered: true, at: nowIso() } }).catch(() => {});
+  hidePopup();
+  emitStatus('recording', rec.meta.platform ? `Recording ${rec.meta.platform}` : 'Recording huddle');
 });
 
 // ---------- post-recording pipeline (§11) ----------

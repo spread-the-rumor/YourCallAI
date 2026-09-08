@@ -312,4 +312,202 @@ assert.strictEqual(a2.diagnostics.malformedLines, 1, 'truncated line counted, no
 assert.strictEqual(a2.rosterSources[0].source, 'participants-panel', 'roster source preserved for ranking');
 assert.ok(a2.votes['1:0'].confidence > 0.6, 'winning share expressed as a confidence');
 
+// --- audioHealth.js: "dead capture" must be distinguishable from "quiet meeting" (the
+// earphones bug). The whole fix rests on the gap between a live noise floor and digital zero.
+const { computeRms, createHealth, describeMediaError, looksBluetooth,
+  DEAD_RMS, SILENCE_RMS } = require('../src/recorder/audioHealth');
+
+assert.strictEqual(computeRms(new Float32Array(2048)), 0, 'memset-zero buffer → exactly 0');
+const quietBuf = Float32Array.from({ length: 2048 }, (_, i) => 3e-4 * Math.sin(i));
+const quietRms = computeRms(quietBuf);
+assert.ok(quietRms > DEAD_RMS && quietRms < SILENCE_RMS,
+  'a live-but-quiet noise floor sits above DEAD_RMS and below SILENCE_RMS — the premise');
+
+// Dead system loopback while the mic is live-but-quiet → flag system only, not the mic.
+const hDead = createHealth({ startedAt: 0 });
+let evDead = null;
+for (let t = 0; t <= 8000; t += 1000) evDead = hDead.tick(t, 4e-4, 0) || evDead;
+assert.ok(evDead && evDead.type === 'warmup' && evDead.sysDead && !evDead.micDead,
+  'zero system + live mic → sysDead only');
+
+// THE false-positive guard: a genuinely silent meeting with both paths live must never be
+// reported as broken. The warmup event still fires (it is the baseline log line), but with
+// nothing marked dead — that distinction is what drives the popup.
+const hQuiet = createHealth({ startedAt: 0 });
+let evQuiet = null;
+for (let t = 0; t <= 8000; t += 1000) evQuiet = hQuiet.tick(t, 4e-4, 2e-4) || evQuiet;
+assert.ok(evQuiet && evQuiet.type === 'warmup', 'healthy run still logs a baseline');
+assert.ok(!evQuiet.micDead && !evQuiet.sysDead,
+  'quiet meeting must NOT be reported as broken capture');
+
+// Startup zeros inside the grace window are normal ramp-up, not evidence of a dead device.
+const hGrace = createHealth({ startedAt: 0 });
+let evGrace = null;
+hGrace.tick(500, 0, 0);
+hGrace.tick(1000, 0, 0);
+for (let t = 2000; t <= 8000; t += 1000) evGrace = hGrace.tick(t, 4e-4, 4e-4) || evGrace;
+assert.ok(evGrace && !evGrace.micDead && !evGrace.sysDead,
+  'zeros within the grace window do not trip the check');
+
+// An absent stream (null RMS = no track at all) is its own failure, not silence.
+const hAbsent = createHealth({ startedAt: 0 });
+let evAbsent = null;
+for (let t = 0; t <= 8000; t += 1000) evAbsent = hAbsent.tick(t, 4e-4, null) || evAbsent;
+assert.ok(evAbsent && evAbsent.sysDead, 'missing system track reported as dead');
+
+// rearm() re-runs the verdict over a fresh window (used on default-device change).
+const hRearm = createHealth({ startedAt: 0 });
+for (let t = 0; t <= 8000; t += 1000) hRearm.tick(t, 4e-4, 4e-4);
+hRearm.rearm(10000);
+let evRearm = null;
+for (let t = 10000; t <= 18000; t += 1000) evRearm = hRearm.tick(t, 4e-4, 0) || evRearm;
+assert.ok(evRearm && evRearm.sysDead, 'rearm re-detects a loopback that died after a swap');
+
+// The existing 30s silence UX must survive the rewrite.
+const hSil = createHealth({ startedAt: 0 });
+let evSil = null;
+for (let t = 0; t <= 31000; t += 1000) { const e = hSil.tick(t, 4e-4, 4e-4); if (e && e.type === 'silence') evSil = e; }
+assert.ok(evSil, 'silence latch still fires after 30s below SILENCE_RMS');
+
+// system-dead detector. These cases come from a real captured failure + probe run — the
+// isolated-zero and quiet-meeting traps below both occurred on live hardware.
+const deadArgs = { startedAt: 0, warmupMs: 1000, graceMs: 0 };
+
+// Sustained zero system + live mic → dead endpoint, recovery should fire.
+const hSys = createHealth(deadArgs);
+let evSys = null;
+for (let t = 0; t <= 20000; t += 1000) { const e = hSys.tick(t, 4e-4, 0); if (e && e.type === 'system-dead') evSys = e; }
+assert.ok(evSys, 'sustained zero system audio while the mic is live → system-dead');
+
+// TRAP 1 (measured): a healthy loopback emits an isolated ~6e-6 sample and recovers next tick.
+// One dead reading must never trigger a re-acquire.
+const hBlip = createHealth(deadArgs);
+let evBlip = null;
+for (let t = 0; t <= 20000; t += 1000) {
+  const sys = (t === 8000) ? 0.000006 : 0.05; // one blip in an otherwise healthy stream
+  const e = hBlip.tick(t, 4e-4, sys);
+  if (e && e.type === 'system-dead') evBlip = e;
+}
+assert.strictEqual(evBlip, null, 'an isolated zero sample must NOT be treated as a dead endpoint');
+
+// TRAP 2 (measured): with nothing playing, a HEALTHY endpoint also reads zero. Without the mic
+// gate this would re-acquire in a loop through every quiet stretch of a meeting.
+const hQuietRoom = createHealth(deadArgs);
+let evQuietRoom = null;
+for (let t = 0; t <= 20000; t += 1000) { const e = hQuietRoom.tick(t, 0, 0); if (e && e.type === 'system-dead') evQuietRoom = e; }
+assert.strictEqual(evQuietRoom, null, 'silent room (mic also silent) must NOT trigger recovery');
+
+// Fires once, then re-arms only after real audio returns.
+const hOnce = createHealth(deadArgs);
+let deaths = 0;
+for (let t = 0; t <= 40000; t += 1000) { const e = hOnce.tick(t, 4e-4, 0); if (e && e.type === 'system-dead') deaths++; }
+assert.strictEqual(deaths, 1, 'system-dead fires once, not every tick');
+
+assert.ok(/in use by another app/.test(describeMediaError('microphone', { name: 'NotReadableError', message: 'x' })),
+  'NotReadableError explains a busy/failed device');
+assert.ok(/microphone/.test(describeMediaError('microphone', { name: 'Whatever', message: 'x' })),
+  'unknown errors still name the stream that failed');
+assert.strictEqual(looksBluetooth({ label: 'Headphones (WH-1000XM4 Stereo)' }), true);
+assert.strictEqual(looksBluetooth({ label: 'Speakers (Realtek(R) Audio)' }), false);
+assert.strictEqual(looksBluetooth(null), false, 'no device → not bluetooth, never throws');
+
+// --- rosterIsTrustworthy across platforms. Meet/Zoom guests routinely join under a single first
+// name, and the word-count heuristic alone REJECTED those legitimate rosters (measured: 0% and 33%
+// two-word) — throwing away a correct closed set. Structural evidence (a real participants panel)
+// now outranks name shape. Note personScore cannot help here: "Back" scores 0.85 exactly like
+// "Sagar", "History Navigation" scores 1.00 exactly like "Vicky Rana".
+const { rosterIsTrustworthy: trust } = require('../src/roster');
+const asPanel = (n) => n.map((x) => ({ name: x, source: 'participants-panel', confidence: 0.9 }));
+const asGrid = (n) => n.map((x) => ({ name: x, source: 'tile-grid', confidence: 0.75 }));
+
+assert.ok(trust(asPanel(['Sagar', 'Vicky', 'Priya'])), 'Meet: first-name-only guests from a real panel are a real roster');
+assert.ok(trust(asPanel(['Sagar', 'Vicky Rana', 'iPhone'])), 'Zoom: mixed mononyms + a device name still a real roster');
+assert.ok(trust(asPanel(['Sagar', 'Vicky'])), 'a two-guest call is trustworthy');
+assert.ok(trust(asPanel(['Carlos Brito', 'Hernan Zapata', 'Tarun Jain', 'SBPM Dev'])), 'Teams captured roster (regression)');
+// The two real pollution datasets from CLAUDE.md must still be rejected.
+assert.ok(!trust(asGrid(['Back', 'Forward', 'Reload', 'Work', 'History Navigation', 'PDF Creator',
+  'Mentions', 'REPORTS', 'Bookmarks', 'Downloads', 'Extensions', 'Profile', 'Search', 'Home',
+  'Refresh', 'Settings', 'Help', 'New Tab', 'Close', 'Minimize', 'Maximize', 'Restore'])),
+  'captured Google Meet Chrome-toolbar pollution stays rejected');
+assert.ok(!trust(asGrid(['Bold', 'Italic', 'Code', 'Strikethrough', 'Link', 'Ordered list',
+  'Bulleted list', 'Blockquote', 'Code block', 'Attach'])),
+  'captured Slack formatting-toolbar pollution stays rejected');
+assert.ok(!trust(asGrid(['Back', 'Work', 'Code', 'Home'])),
+  'a SMALL junk set from the tile-grid fallback is still rejected — size alone is not the test');
+assert.ok(trust(['Carlos Brito', 'Hernan Zapata']), 'legacy bare-string rosters still work');
+assert.ok(!trust(['Back', 'Forward', 'Reload', 'Work', 'Home', 'Search']), 'legacy junk still rejected');
+
+// --- the agent vote must never put the signed-in user on a remote channel. Teams labels the
+// user's own tile ("Myself video, Sagar, …") like any participant, and a real captured meeting
+// resolved a channel-1 voice to the signed-in user at 0.95 confidence because of it.
+const selfVote = resolveSpeakers({
+  transcript: mk('some remote person talking'),
+  userName: 'Sagar',
+  alignment: { '1:0': { name: 'Sagar', confidence: 0.95 } },
+});
+assert.strictEqual(selfVote.transcript[1].speaker, 'Speaker 1',
+  'the ch0 user must never be assigned to a ch1 voice by the agent vote');
+assert.deepStrictEqual(selfVote.unresolved, ['Speaker 1'], 'it stays honestly unresolved');
+// A genuine remote name still comes through — the guard must not block everyone.
+const otherVote = resolveSpeakers({
+  transcript: mk('some remote person talking'),
+  userName: 'Sagar',
+  alignment: { '1:0': { name: 'Hernan Zapata', confidence: 0.9 } },
+});
+assert.strictEqual(otherVote.transcript[1].speaker, 'Hernan Zapata',
+  'a real remote speaker is still named by the agent vote');
+
+// --- align.js: a sparse active-speaker event must NOT claim the span up to the next one.
+// Regression for a real 17-minute meeting that emitted only 3 events, where the unbounded hold
+// let ONE event own ~25 minutes and vote its name onto every voice it overlapped.
+const sparseJsonl = path.join(os.tmpdir(), `yc-selfcheck3-${process.pid}.jsonl`);
+fs.writeFileSync(sparseJsonl, [
+  JSON.stringify({ ts: base, type: 'roster', names: ['Hernan Zapata', 'Tarun Jain'], source: 'participants-panel', confidence: 0.9 }),
+  JSON.stringify({ ts: base, type: 'active-speaker', name: 'Hernan Zapata', confidence: 0.75, strategy: 'suffix-delta' }),
+  JSON.stringify({ ts: base + 1500000, type: 'active-speaker', name: 'Tarun Jain', confidence: 0.75, strategy: 'suffix-delta' }),
+].join('\n'));
+// A speaker talking 10 minutes after the first event — far past its 15s hold, long before the next.
+const lateSegs = utterancesToSegments([
+  { channel: 1, speaker: 0, start: 600, end: 640, transcript: 'much later in the meeting', words: [{ word: 'later', start: 600, end: 601 }] },
+], base, 'Sagar');
+const lateAlign = alignSpeakers(lateSegs, sparseJsonl);
+fs.unlinkSync(sparseJsonl);
+assert.ok(!lateAlign.renamed['1:0'],
+  'a stale event must not claim a voice 10 minutes later — silence beats a confident wrong name');
+
+// The cap must be a no-op when the signal is dense: events 3s apart still attribute normally.
+const denseJsonl = path.join(os.tmpdir(), `yc-selfcheck4-${process.pid}.jsonl`);
+fs.writeFileSync(denseJsonl, [
+  JSON.stringify({ ts: base, type: 'roster', names: ['Hernan Zapata', 'Tarun Jain'], source: 'participants-panel', confidence: 0.9 }),
+  ...[0, 3000, 6000, 9000].map((off) => JSON.stringify({
+    ts: base + off, type: 'active-speaker', name: 'Hernan Zapata', confidence: 0.75, strategy: 'suffix-delta',
+  })),
+].join('\n'));
+const denseSegs = utterancesToSegments([
+  { channel: 1, speaker: 0, start: 1, end: 9, transcript: 'talking throughout', words: [{ word: 'talking', start: 1, end: 2 }] },
+], base, 'Sagar');
+const denseAlign = alignSpeakers(denseSegs, denseJsonl);
+fs.unlinkSync(denseJsonl);
+assert.strictEqual(denseAlign.renamed['1:0'], 'Hernan Zapata',
+  'dense events still attribute — the cap must not break the working case');
+
+// --- inferSpeakerNames: elimination fallback is deduction, not guessing.
+const { completeByElimination, CONVERSATIONAL_MAX, parseInferenceResponse: parseInf } =
+  require('../src/ai/inferSpeakerNames');
+const elim = completeByElimination(['Speaker 2'], ['Tarun Jain'], 'Sagar Bansal');
+assert.strictEqual(elim['Speaker 2'].name, 'Tarun Jain', '1 label + 1 unused name → assign');
+assert.ok(elim['Speaker 2'].confidence < 0.85, 'elimination renders as unverified, never as fact');
+assert.deepStrictEqual(completeByElimination(['Speaker 2', 'Speaker 3'], ['Tarun Jain'], ''), {},
+  'ambiguous (2 labels, 1 name) → assign nothing');
+assert.deepStrictEqual(completeByElimination(['Speaker 2'], ['Sagar Bansal'], 'Sagar Bansal'), {},
+  'the channel-0 user is never assigned to a channel-1 voice');
+assert.ok(CONVERSATIONAL_MAX < 0.85,
+  'conversational tier stays below the verified threshold so it shows the dotted underline');
+
+// The closed-set guard must still reject anything off-roster (unchanged behaviour, re-asserted
+// because the new tiers route through this same function).
+const offRoster = parseInf('{"Speaker 2":{"name":"Someone Else","confidence":0.9}}',
+  ['Speaker 2'], ['Carlos Brito', 'Hernan Zapata'], 'Sagar Bansal');
+assert.deepStrictEqual(offRoster, {}, 'a name not on the roster is still rejected outright');
+
 console.log('selfcheck: all assertions passed');

@@ -12,6 +12,11 @@ const { matchToRoster, rosterNames, nameKey, rosterIsTrustworthy } = require('..
 
 const DEFAULT_CONFIDENCE = 0.6; // legacy flat-string responses carry no confidence of their own
 const GENERIC_RE = /^Speaker \d+$/;
+// Ceilings for the weaker tiers. Both sit below the 0.85 the renderer uses to draw a name as
+// settled, so anything inferred from conversational flow (rather than a stated introduction)
+// shows the dotted underline + "?" and reads as a suggestion — which is what it is.
+const CONVERSATIONAL_MAX = 0.7;
+const COMPLETION_CONFIDENCE = 0.55;
 
 // Pure: validate a raw model response against the labels we asked about and the roster we allow.
 // Accepts both the object shape {"Speaker 2":{"name":..,"confidence":..}} and the legacy flat
@@ -99,6 +104,43 @@ function buildPrompt(generic, roster, subject) {
     + '"Speaker 3": null}';
 }
 
+// The strict pass demands a stated introduction or someone being addressed by name. Recurring
+// internal meetings contain neither — nobody says "Hi, I'm Tarun" in the daily standup — so it
+// correctly resolves nothing and every voice stays "Speaker N". This tier is allowed to reason
+// from conversational structure instead, against the SAME closed roster, and its answers are
+// capped below the "verified" threshold so they render as suggestions.
+function buildConversationalPrompt(labels, allowed, subject) {
+  return 'You are matching generic speaker labels in a meeting transcript to a known list of '
+    + 'attendees. The attendee list is COMPLETE and correct.\n'
+    + `The people in this meeting are EXACTLY: ${allowed.join(', ')}. `
+    + 'You MUST choose each name from that list verbatim, or null. Never output a name not on it.\n'
+    + (subject ? `Meeting subject: ${subject}\n` : '')
+    + 'There are no self-introductions here, so use conversational evidence: who is addressed by '
+    + 'name and who answers next; who hands off work to whom; who reports on which area across the '
+    + 'meeting; who asks versus who decides; references like "as I mentioned" tied to an earlier turn.\n'
+    + 'Be decisive where the structure is clear, but output null rather than a coin-flip — a wrong '
+    + 'name is worse than no name. Do not assign the same person to two labels.\n'
+    + 'Respond with ONLY a JSON object mapping each label to null or '
+    + '{"name": <name>, "confidence": <0-1>, "evidence": "<short quote>"}.';
+}
+
+// Pure. Last resort for the one case that is deduction rather than guessing: a single unnamed
+// voice and a single roster member nobody has been matched to. Anything less clear-cut is left
+// alone. Never assigns the ch0 user (they are on channel 0 by construction).
+function completeByElimination(unresolvedLabels, unusedNames, userName) {
+  if (unresolvedLabels.length !== 1 || unusedNames.length !== 1) return {};
+  const name = unusedNames[0];
+  if (userName && nameKey(name) === nameKey(userName)) return {};
+  return {
+    [unresolvedLabels[0]]: {
+      name,
+      confidence: COMPLETION_CONFIDENCE,
+      evidence: 'only remaining participant',
+      source: 'ai-inference',
+    },
+  };
+}
+
 // roster: string[] | [{name, confidence}] — the closed set. opts.subject: meeting title context.
 // opts.userName: the channel-0 speaker, excluded from ch1 results.
 async function inferSpeakerNames(transcript, roster, opts = {}) {
@@ -136,6 +178,27 @@ async function inferSpeakerNames(transcript, roster, opts = {}) {
         console.warn('[inferSpeakerNames] second pass:', err.message);
       }
     }
+
+    // Tier 3: conversational inference over the closed roster, for what evidence-only could not
+    // reach. Only worth running when a trustworthy roster still has unmatched people in it.
+    const stillUnresolved = generic.filter((l) => !first[l]);
+    const usedNow = new Set(Object.values(first).map((e) => nameKey(e.name)));
+    const stillUnused = trusted.filter((n) => !usedNow.has(nameKey(n)));
+    if (stillUnresolved.length && stillUnused.length) {
+      try {
+        const third = await inferConversational(stillUnresolved, stillUnused, text, opts);
+        for (const [k, v] of Object.entries(third)) if (!first[k]) first[k] = v;
+      } catch (err) {
+        console.warn('[inferSpeakerNames] conversational pass:', err.message);
+      }
+    }
+
+    // Tier 4: pure elimination, no model call.
+    const finalUnresolved = generic.filter((l) => !first[l]);
+    const finalUsed = new Set(Object.values(first).map((e) => nameKey(e.name)));
+    const finalUnused = trusted.filter((n) => !finalUsed.has(nameKey(n)));
+    Object.assign(first, completeByElimination(finalUnresolved, finalUnused, opts.userName));
+
     return first;
   } catch (err) {
     console.warn('[inferSpeakerNames]', err.message);
@@ -157,4 +220,24 @@ async function inferSecondPass(labels, unusedNames, text, opts) {
   return parseInferenceResponse(raw, labels, unusedNames, opts.userName);
 }
 
-module.exports = { inferSpeakerNames, parseInferenceResponse };
+// Same guard pipeline as every other tier (closed set, ch0-user exclusion, one-person-one-label),
+// then clamped: conversational reasoning can be right often, but it is never *evidence*, so it
+// must not be able to present itself as settled.
+async function inferConversational(labels, unusedNames, text, opts) {
+  const raw = await chatCompletion([
+    { role: 'system', content: buildConversationalPrompt(labels, unusedNames, opts.subject) },
+    {
+      role: 'user',
+      content: `Labels still unidentified: ${labels.join(', ')}\n`
+        + `Attendees not yet matched to any label: ${unusedNames.join(', ')}\n\n`
+        + `TRANSCRIPT:\n${text}`,
+    },
+  ], { temperature: 0 });
+  const parsed = parseInferenceResponse(raw, labels, unusedNames, opts.userName);
+  for (const entry of Object.values(parsed)) {
+    entry.confidence = Math.min(entry.confidence, CONVERSATIONAL_MAX);
+  }
+  return parsed;
+}
+
+module.exports = { inferSpeakerNames, parseInferenceResponse, completeByElimination, CONVERSATIONAL_MAX };

@@ -25,7 +25,15 @@ using System.Windows.Automation;
 
 internal static class Agent
 {
-    private const string HeuristicsVersion = "2026-08-structural2-incall";
+    private const string HeuristicsVersion = "2026-09-deep-walk";
+    // CollectNodes is a BREADTH-first walk with a hard node cap. Teams participant rows sit at
+    // depth ~14 (see MinWebContentDepth), and a Chromium/WebView2 tree is very wide, so a 400-node
+    // budget was exhausted on shallow levels and NEVER reached the roster — three consecutive
+    // meetings emitted zero roster events while --dump (which used 1200) appeared to work.
+    // Deep enough to reach web content, and the poll is slowed to pay for the extra UIA calls;
+    // the roster changes on the order of seconds, so 2x/s bought nothing.
+    private const int NodeBudget = 3000;
+    private const int PollIntervalMs = 2500;
     private static string? _lastSpeaker;
     private static string _lastRosterKey = "";
     // Roster names carried between polls: the decoration-delta strategy needs the clean names
@@ -33,15 +41,21 @@ internal static class Agent
     private static readonly HashSet<string> KnownNames = new(StringComparer.OrdinalIgnoreCase);
     private static readonly Dictionary<string, string> LastDecorations = new(StringComparer.OrdinalIgnoreCase);
 
+    // [STAThread] is REQUIRED. System.Windows.Automation's static initializer (CacheRequest) throws
+    // TypeInitializationException on an MTA thread, which .NET uses by default for a console app.
+    // Every call into UIA then fails, so the agent enumerated ZERO windows and silently emitted no
+    // roster for entire meetings — the failure looked like a bad heuristic but nothing was ever read.
+    [STAThread]
     private static void Main(string[] args)
     {
         if (args.Contains("--dump")) { Dump(); return; }
+        if (args.Contains("--windows")) { DumpWindows(); return; }
         Console.Error.WriteLine($"[agent] started, heuristics={HeuristicsVersion}");
         while (true)
         {
             try { Poll(); }
             catch (Exception ex) { Console.Error.WriteLine($"[agent] poll error: {ex.Message}"); }
-            Thread.Sleep(500); // ~2×/s
+            Thread.Sleep(PollIntervalMs);
         }
     }
 
@@ -50,14 +64,25 @@ internal static class Agent
     {
         AutomationElementCollection windows;
         try { windows = AutomationElement.RootElement.FindAll(TreeScope.Children, Condition.TrueCondition); }
-        catch { yield break; }
+        catch (Exception ex)
+        {
+            // Never silently swallow this: if the root enumeration fails the agent is completely
+            // blind, and every downstream heuristic is irrelevant.
+            TopLevelWindows = -1;
+            Console.Error.WriteLine($"[agent] window enumeration failed: {ex.GetType().Name}: {ex.Message}");
+            for (var inner = ex.InnerException; inner != null; inner = inner.InnerException)
+                Console.Error.WriteLine($"[agent]   caused by: {inner.GetType().FullName}: {inner.Message}");
+            yield break;
+        }
+        TopLevelWindows = windows.Count;
+        ProcNameFailures = 0;
 
         foreach (AutomationElement w in windows)
         {
             string title, proc = "";
             try { title = w.Current.Name ?? ""; } catch { continue; }
             try { proc = Process.GetProcessById(w.Current.ProcessId).ProcessName.ToLowerInvariant(); }
-            catch { /* process exited or access denied — fall back to the title below */ }
+            catch { ProcNameFailures++; /* exited or access denied — fall back to the title below */ }
 
             string family =
                 Regex.IsMatch(proc, @"chrome|msedge|edge|chromium|brave|opera|vivaldi") ? "browser"
@@ -79,17 +104,22 @@ internal static class Agent
         string? rosterSource = null;
         int expectedCount = 0;
         Candidate? best = null;
+        int windowsSeen = 0, inCallSeen = 0, maxNodes = 0, deepest = 0;
 
         // No early return: a Meet tab AND the Teams app can both be open, and the old code stopped
         // at the first match, silently losing whichever came second.
         foreach (var (window, family, _) in MeetingWindows())
         {
             List<Node> nodes;
-            try { nodes = UiaHelpers.CollectNodes(window); }
+            try { nodes = UiaHelpers.CollectNodes(window, NodeBudget); }
             catch { continue; }
             if (nodes.Count == 0) continue;
 
+            windowsSeen++;
             var obs = Heuristics.Observe(nodes, family, KnownNames, LastDecorations);
+            if (obs.InCall) inCallSeen++;
+            if (obs.NodeCount > maxNodes) maxNodes = obs.NodeCount;
+            if (obs.MaxDepth > deepest) deepest = obs.MaxDepth;
             // A real participants panel outranks a tile-grid guess regardless of size, so an
             // ordinary browser window's incidental "list of capitalised words" cannot displace the
             // meeting's actual roster (and then poison KnownNames for the rest of the call).
@@ -106,6 +136,7 @@ internal static class Agent
 
         foreach (var n in roster) KnownNames.Add(n);
         Emit(best, roster, rosterSource, expectedCount);
+        EmitDiagnostics(windowsSeen, inCallSeen, maxNodes, deepest, roster.Count, rosterSource);
     }
 
     private static void Emit(Candidate? active, List<string> roster, string? rosterSource, int expectedCount)
@@ -139,6 +170,49 @@ internal static class Agent
         }
     }
 
+    // Heartbeat so "found nobody" is distinguishable from "never looked". Three meetings in a row
+    // emitted zero rosters with no way to tell whether the agent was blind, gated out, or starved of
+    // nodes. Emitted only when the picture changes, so the log stays small.
+    internal static int TopLevelWindows;
+    internal static int ProcNameFailures;
+    private static string _lastDiag = "";
+    private static void EmitDiagnostics(int windows, int inCall, int nodes, int depth, int rosterSize, string? source)
+    {
+        // Bucket the node count so normal jitter does not spam a line every poll.
+        var key = $"{windows}|{inCall}|{nodes / 250}|{depth / 5}|{rosterSize}|{source}|{TopLevelWindows}|{ProcNameFailures}";
+        if (key == _lastDiag) return;
+        _lastDiag = key;
+        Console.WriteLine(JsonSerializer.Serialize(new
+        {
+            ts = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+            type = "agent-diag", windows, inCall, nodes, depth,
+            rosterSize, source = source ?? "none",
+            topLevelWindows = TopLevelWindows, procNameFailures = ProcNameFailures,
+        }));
+        Console.Out.Flush();
+    }
+
+    // Diagnostic: every top-level window UIA can see, with the process that owns it and how the
+    // family classifier labelled it. Answers "is the meeting window even visible to us?" — which is
+    // upstream of every heuristic and was the question we could not answer for three meetings.
+    private static void DumpWindows()
+    {
+        AutomationElementCollection windows;
+        try { windows = AutomationElement.RootElement.FindAll(TreeScope.Children, Condition.TrueCondition); }
+        catch (Exception ex) { Console.WriteLine($"ENUMERATION FAILED: {ex.GetType().Name}: {ex.Message}"); return; }
+        Console.WriteLine($"top-level windows: {windows.Count}");
+        foreach (AutomationElement w in windows)
+        {
+            string title = "", proc = "", cls = "";
+            int pid = 0;
+            try { title = w.Current.Name ?? ""; } catch { }
+            try { cls = w.Current.ClassName ?? ""; } catch { }
+            try { pid = w.Current.ProcessId; } catch { }
+            try { proc = Process.GetProcessById(pid).ProcessName.ToLowerInvariant(); } catch { proc = "<denied>"; }
+            Console.WriteLine(JsonSerializer.Serialize(new { pid, proc, cls, title }));
+        }
+    }
+
     // Diagnostic: dump every candidate window's a11y tree so heuristics can be checked against a
     // real UI instead of guessed at. Not used in normal operation.
     private static void Dump()
@@ -147,7 +221,7 @@ internal static class Agent
         {
             Console.WriteLine(JsonSerializer.Serialize(new { type = "window", family, title }));
             List<Node> nodes;
-            try { nodes = UiaHelpers.CollectNodes(window, 1200); } catch { continue; }
+            try { nodes = UiaHelpers.CollectNodes(window, NodeBudget); } catch { continue; }
             foreach (var n in nodes)
             {
                 Console.WriteLine(JsonSerializer.Serialize(new
@@ -167,7 +241,8 @@ internal sealed record Node(
 internal sealed record Candidate(string Name, double Confidence, string Strategy);
 
 internal sealed record Observation(
-    Candidate? Active, List<string> Roster, string? RosterSource, int ExpectedCount);
+    Candidate? Active, List<string> Roster, string? RosterSource, int ExpectedCount,
+    bool InCall = false, int NodeCount = 0, int MaxDepth = 0);
 
 internal static class UiaHelpers
 {
@@ -342,12 +417,19 @@ internal static class Heuristics
     // gate, and kept to the few words that are near-universal across meeting clients. This is the
     // one place English strings are unavoidable — a localized client will simply yield no names
     // and fall through to AI inference, which is the documented degradation, not a break.
+    // Measured against the real button labels of each client. Zoom is the reason for most of the
+    // additions: its leave button is often bare "End", and its controls are "Start Video" /
+    // "Stop Video" / "Mute" rather than the Teams phrasings this originally encoded. A window that
+    // matches neither contributes NOTHING (Observe returns empty), so a miss here is a silent
+    // whole-meeting failure, not a degradation.
     private static readonly Regex LeaveControl = new(
-        @"^(leave|leave call|leave meeting|hang up|end call|end meeting|disconnect)\b",
+        @"^(leave|hang ?up|end|disconnect|exit)\b",
         RegexOptions.IgnoreCase | RegexOptions.Compiled);
     private static readonly Regex CallControl = new(
-        @"\b(mute|unmute) (mic|microphone)\b|\bturn (camera|video) (on|off)\b|\bshare (content|screen)\b"
-        + @"|\bmicrophone\b|\bcamera\b|\braise your hand\b|\bparticipants?\b|\bpeople\b",
+        @"\b(mute|unmute)\b|\b(start|stop|turn) (the )?(camera|video|audio)\b"
+        + @"|\bturn (camera|video) (on|off)\b|\bshare (content|screen)\b"
+        + @"|\bmicrophone\b|\bcamera\b|\braise (your )?hand\b|\bparticipants?\b|\bpeople\b"
+        + @"|\bgallery view\b|\bspeaker view\b|\brecord(ing)?\b|\bbreakout\b|\breactions\b",
         RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
     private static bool LooksInCall(List<Node> nodes)
@@ -369,12 +451,26 @@ internal static class Heuristics
         List<Node> nodes, string family, HashSet<string> knownNames,
         Dictionary<string, string> lastDecorations)
     {
-        // Not in a call → contribute nothing. Prevents an idle Slack/Chrome window from poisoning
-        // the roster (and therefore KnownNames) for the rest of the meeting.
-        if (!LooksInCall(nodes)) return new Observation(null, new List<string>(), null, 0);
+        // The in-call check used to RETURN EARLY, contributing nothing. That made a single missed
+        // control label a silent whole-meeting failure — measured three times in a row, zero roster
+        // events. It now only *downgrades*: a real participants panel is still reported (the JS side
+        // re-validates every roster through rosterIsTrustworthy, so pollution is caught there), while
+        // a tile-grid guess from a window that does not look like a call is still discarded — that
+        // was the actual Slack/Chrome poisoning case.
+        bool inCall = LooksInCall(nodes);
 
         var (roster, source) = FindRoster(nodes, family);
         int expected = FindExpectedCount(nodes);
+        int maxDepth = 0;
+        foreach (var n in nodes) if (n.Depth > maxDepth) maxDepth = n.Depth;
+
+        // Not in a call -> contribute NOTHING. Briefly relaxed to "report a panel anyway", which a
+        // live test immediately disproved: an ordinary Gemini web page yielded the shape of a
+        // participants panel and produced the roster ["Targets: LinkedIn", "The Tech: Undetected
+        // headless browsers"] — and that junk passes every downstream guard (isPersonName true,
+        // rosterIsTrustworthy true), so it would have poisoned the closed set. The gate was never
+        // the cause of the empty rosters; the agent was blind (missing native DLLs). Keep it strict.
+        if (!inCall) return new Observation(null, new List<string>(), null, 0, false, nodes.Count, maxDepth);
 
         // The pool of names to test for decoration: this poll's roster plus everything seen
         // earlier in the meeting (the panel is often closed while people talk).
@@ -384,7 +480,7 @@ internal static class Heuristics
         var active = FindActiveByDecoration(nodes, pool, lastDecorations)
                      ?? FindActiveByPhrase(nodes, pool);
 
-        return new Observation(active, roster, source, expected);
+        return new Observation(active, roster, source, expected, true, nodes.Count, maxDepth);
     }
 
     // Roster = the best-scoring List/DataGrid/Tree whose ListItem children look like people.
