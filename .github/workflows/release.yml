@@ -8,6 +8,10 @@ on:
 jobs:
   release:
     strategy:
+      # Windows and macOS are independent builds publishing to the same draft. Without this, one
+      # platform failing CANCELS the other mid-publish - which is exactly what happened on v2.3.0:
+      # the mac ffmpeg build failed and killed a perfectly good Windows job during its upload.
+      fail-fast: false
       matrix:
         include:
           - os: windows-latest

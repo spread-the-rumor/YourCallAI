@@ -517,6 +517,15 @@ agent exe.
   Building it is also **better provenance**: the source tarball is GPG-signed by the FFmpeg
   release key (`FCF986EA15E6E293A5644F10B4322F04D67658D8`, verified before pinning), whereas the
   Windows pin trusts a third party's autobuild. Both platforms use the same release (9.0.1).
+- **`--disable-autodetect` is the load-bearing flag**, and disabling libs one at a time is not a
+  substitute. The first attempt named `--disable-lzma --disable-bzlib --disable-sdl2` and the
+  v2.3.0 build still linked **Homebrew's `libxcb` + `libX11`** (x11grab) from the runner image —
+  i.e. a "Library not loaded" crash on every user's Mac, and the one class of bug CI can never
+  reproduce, because Homebrew is sitting right there. `assertSelfContained()` caught it and failed
+  the build. `--disable-autodetect` makes the result a function of the flags instead of the
+  runner's image. **It also disables `THREADS_LIST` and the hwaccels**, so `--enable-pthreads`,
+  `--enable-videotoolbox`, `--enable-audiotoolbox` and `--enable-zlib` must be named explicitly;
+  forgetting `--enable-pthreads` yields a silently single-threaded ffmpeg.
 - **No external libraries are enabled on macOS**, which is what keeps it LGPL — and costs nothing:
   `h264_videotoolbox` encodes on every Mac, and VP8/VP9/Opus/AAC decoding is native to FFmpeg.
   The consequence to know: **macOS has no software H.264 fallback.** If VideoToolbox fails to
@@ -687,8 +696,15 @@ keys. GitHub Actions secrets (for the installer build): `SLACK_CLIENT_ID`, `ASAN
 
 - **Ship:** `npm run ship -- "<msg>" <patch|minor|major>` (or `/ship`) — commits, bumps version,
   tags `vX.Y.Z`, pushes → triggers `.github/workflows/release.yml`.
+  Note `ship.mjs` runs `git add -A`, so anything untracked and unignored goes in; `vendor/ffmpeg/*`
+  is gitignored precisely so the 110 MB binary cannot be committed by it.
 - **release.yml:** builds Windows + macOS installers → **draft** GitHub Release; separate `deploy-api`
   job runs `vercel deploy --prod`. Also runs on `workflow_dispatch` (re-build without a bump).
+- **The matrix sets `fail-fast: false`.** The two platforms are independent builds uploading to the
+  same draft, and the default cancels one when the other fails: on v2.3.0 the macOS ffmpeg build
+  failed and **killed a healthy Windows job mid-upload**, leaving the draft holding `RELEASES` and
+  the `.nupkg` but no `Setup.exe`. A partially-uploaded draft must be deleted, not published —
+  Squirrel reads `RELEASES` and would hand clients a missing installer.
 - Draft release must be **published manually** (`gh release edit vX.Y.Z --draft=false`).
 - **Dev:** `npm start` (electron-forge). Main-process code changes need a **full restart** — kill all
   `electron.exe` and relaunch (single-instance lock can hand off to a stale process; delete

@@ -71,13 +71,21 @@ const DARWIN_SOURCE = {
     '--disable-ffplay', '--disable-ffprobe', // we ship ffmpeg only (§5)
     '--disable-network',                     // every input is a local file; drops http/tls entirely
     '--disable-debug',
-    // The autodetected optional libs are the one way a Homebrew dylib could get linked in on a
-    // CI runner and then be missing on a user's Mac. None of them are needed. (zlib and iconv
-    // stay enabled: those resolve from the macOS SDK, which is present on every target.)
-    '--disable-lzma', '--disable-bzlib', '--disable-sdl2',
-    // System frameworks, so LGPL-clean. Explicit rather than autodetected: if a future SDK
-    // stopped providing VideoToolbox we want a failed build, not a silently encoder-less binary.
+    // THE important flag. It turns off every optional library configure would otherwise pick up
+    // from whatever happens to be installed on the build machine. Disabling them one at a time
+    // was tried first and was not enough: CI still linked Homebrew's libxcb + libX11 (x11grab),
+    // which is a "Library not loaded" crash on every user's Mac and the one failure a CI runner
+    // can never reproduce, since Homebrew is right there. assertSelfContained() caught it; this
+    // makes the build deterministic rather than a function of the runner's image.
+    '--disable-autodetect',
+    // --disable-autodetect also switches off THREADS_LIST and the hwaccels, so everything we
+    // actually need has to be asked for by name. Omitting --enable-pthreads here would silently
+    // produce a SINGLE-THREADED ffmpeg and make every Mac transcode several times slower.
+    '--enable-pthreads',
+    // System frameworks, so LGPL-clean. Explicit also means a failed build rather than a
+    // silently encoder-less binary if a future SDK stops providing VideoToolbox.
     '--enable-videotoolbox', '--enable-audiotoolbox',
+    '--enable-zlib', // libz from the SDK (/usr/lib); the matroska and mov demuxers use it
   ],
   // Proof the built binary is actually usable, run on the machine that built it. These cover
   // exactly what src/ffmpeg.js and src/normalize.js ask of it.
