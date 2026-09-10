@@ -8,3 +8,7 @@ agents/dist/*
 agents/windows/bin/
 agents/windows/obj/
 .DS_Store
+
+# Bundled ffmpeg (provisioned by scripts/fetch-ffmpeg.mjs, never committed)
+vendor/ffmpeg/*
+!vendor/ffmpeg/.gitkeep

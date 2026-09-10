@@ -1,0 +1,3 @@
+# Bundled ffmpeg lands here. Provision it with:  npm run fetch:ffmpeg
+# Shipped via forge.config.js extraResource; resolved at runtime by src/ffmpeg.js.
+# Never committed — see scripts/fetch-ffmpeg.mjs for the pinned URL + SHA-256.

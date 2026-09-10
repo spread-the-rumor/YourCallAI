@@ -30,14 +30,20 @@ function stripLocal(m) {
 }
 
 // Recompute localhost URLs, but only if the recording actually exists on THIS machine.
+//
+// This used to hardcode 'video.webm'. Once the pipeline started producing video.mp4 that check
+// went false, videoUrl came back null, putRaw shallow-merged the null over a perfectly good
+// local record, and renderActionRow (which gates on m.videoUrl) silently dropped the ▶ Recording
+// and ⬇ Download buttons — for signed-in users only, on every launch, with the file sitting
+// right there on disk. Resolve the real filename instead.
 function rehydrate(m) {
-  const recordingsDir = path.join(app.getPath('userData'), 'recordings', m.id);
+  const dir = path.join(app.getPath('userData'), 'recordings', m.id);
   const server = require('./server');
-  const hasVideo = fs.existsSync(path.join(recordingsDir, 'video.webm'));
-  const hasTranscript = fs.existsSync(path.join(recordingsDir, 'transcript.json'));
+  const media = require('./media');
+  const hasTranscript = fs.existsSync(path.join(dir, 'transcript.json'));
   return {
     ...m,
-    videoUrl: hasVideo ? `http://localhost:${server.PORT}/recordings/${m.id}/video.webm` : null,
+    videoUrl: media.mediaUrl(m.id, dir, server.PORT),
     transcriptUrl: hasTranscript ? `http://localhost:${server.PORT}/recordings/${m.id}/transcript.json` : null,
   };
 }

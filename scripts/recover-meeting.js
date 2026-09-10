@@ -118,7 +118,7 @@ async function main() {
     content: summary,
     summary,
     transcript,
-    videoUrl: `http://localhost:${SERVER_PORT}/recordings/${recordingId}/video.webm`,
+    videoUrl: require('../src/media').mediaUrl(recordingId, dir, SERVER_PORT),
     transcriptUrl: `http://localhost:${SERVER_PORT}/recordings/${recordingId}/transcript.json`,
     speakerMap,
     chat: [],

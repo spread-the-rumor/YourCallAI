@@ -12,7 +12,38 @@ const LEVEL_MS = 1000;         // how often we sample the level
 const DIAG_LEVEL_EVERY = 15;   // log a level sample every 15 ticks (~matches the 15s timeslice)
 const DEVICE_DEBOUNCE_MS = 750; // one Bluetooth connect fires ondevicechange several times
 
-async function startCapture() {
+// Video container/codec preference, best first. Tried in order with a REAL constructor call,
+// not just isTypeSupported — see the loop in startCapture for why that distinction matters.
+//
+// H.264 first because it makes the post-recording normalization a LOSSLESS STREAM COPY (seconds)
+// instead of a full transcode (minutes of CPU). Measured on Chromium 138 / Electron 37:
+//   video/mp4;codecs=avc1.640028,mp4a.40.2  -> supported; emits FRAGMENTED mp4
+//                                              (ftyp moov moof mdat ... mfra), no stss index
+//   video/webm;codecs=vp9,opus              -> supported; emits live webm with NO Cues and
+//                                              NO usable duration (ffmpeg reads "Duration: N/A")
+// Both therefore still need the normalize pass to become seekable — the difference is only what
+// that pass costs. Chromium may hand back a lower LEVEL than asked for (640028 came back as
+// 64001f); that is fine, the profile is what matters.
+//
+// The full mime INCLUDING the audio codec is probed on purpose. Asking for bare 'avc1' can get
+// you 'video/mp4;codecs=avc1,opus', which passes, muxes happily, and then will not play in
+// QuickTime — Opus in MP4 is legal but unsupported there.
+const VIDEO_MIMES = [
+  'video/mp4;codecs=avc1.640028,mp4a.40.2', // High — best for screen text (CABAC, 8x8 transform)
+  'video/mp4;codecs=avc1.4D401F,mp4a.40.2', // Main
+  'video/mp4;codecs=avc1.42E01E,mp4a.40.2', // Baseline
+  'video/x-matroska;codecs=avc1,opus',      // H.264 without an mp4 muxer: copy video, re-encode audio
+  'video/webm;codecs=vp9,opus',             // the pre-change default; full transcode downstream
+  'video/webm;codecs=vp8,opus',
+];
+
+// 1.5 Mbps was tuned for VP9. H.264 needs roughly 1.5-2x the bits for equivalent screencast
+// quality, and small text is exactly where the difference shows.
+function videoBitrateFor(mime) {
+  return /avc1|h264/i.test(mime) ? 3_000_000 : 1_500_000;
+}
+
+async function startCapture({ forceVideoMime = '' } = {}) {
   let mic;
   let display;
   try {
@@ -64,20 +95,65 @@ async function startCapture() {
     const stereoDest = ctx.createMediaStreamDestination();
     merger.connect(stereoDest);
 
-    const videoMime = MediaRecorder.isTypeSupported('video/webm;codecs=vp9,opus')
-      ? 'video/webm;codecs=vp9,opus'
-      : 'video/webm;codecs=vp8,opus';
-    const recA = new MediaRecorder(videoMix, { mimeType: videoMime, videoBitsPerSecond: 1_500_000 });
+    // recA is constructed in ITS OWN loop+catch, deliberately. It used to be one statement
+    // inside the big try below, so any rejection ran window.capture.error() -> 'capture-error'
+    // -> finalizeRecording(message), which closed the AUDIO stream too and failed the whole
+    // recording — destroying the transcript of a meeting whose audio was captured perfectly.
+    // A dead video recorder must cost the video and NOTHING else: recB is what feeds Deepgram.
+    //
+    // isTypeSupported is necessary but NOT sufficient — it reports codec-string parseability
+    // plus a static capability check, and the muxer/encoder can still fail to initialise for
+    // this particular track configuration. So probe, then actually construct, then fall through.
+    let recA = null;
+    let videoMime = null;
+    // YCAI_FORCE_VIDEO_MIME pins the container: it is how the VP9/transcode path gets tested on
+    // a machine where mp4 recording works, and how a user on bad hardware is unblocked without
+    // waiting for a release. Passed in from main with 'start-capture'.
+    const mimes = forceVideoMime ? [forceVideoMime, ...VIDEO_MIMES] : VIDEO_MIMES;
+    for (const m of mimes) {
+      if (!MediaRecorder.isTypeSupported(m)) continue;
+      try {
+        recA = new MediaRecorder(videoMix, { mimeType: m, videoBitsPerSecond: videoBitrateFor(m) });
+        videoMime = m;
+        break;
+      } catch (err) {
+        window.capture.diag({ type: 'mime-rejected', mime: m, name: err && err.name, message: err && err.message });
+      }
+    }
+    if (recA) {
+      window.capture.format({ videoMime });
+      window.capture.diag({ type: 'video-format', mime: videoMime });
+    } else {
+      // Audio-only from here. Every §7/§11 stage downstream reads audio.webm, so the transcript,
+      // speaker names, summary and action items are all unaffected by losing the video.
+      window.capture.diag({ type: 'error', which: 'video', name: 'NoVideoEncoder', message: 'no usable video mime' });
+      window.capture.degraded({ videoDead: true, reason: 'no-video-encoder' });
+    }
+
+    // recB stays in the outer try on purpose: no audio really IS fatal (ch0 anchors §7).
     const recB = new MediaRecorder(stereoDest.stream, { mimeType: 'audio/webm;codecs=opus', audioBitsPerSecond: 96_000 });
 
     // Track in-flight chunk writes so stop can flush everything before signalling main.
     const pending = new Set();
     const pipe = (rec, name) => {
+      if (!rec) return; // recA is null when no video encoder could be constructed
       rec.ondataavailable = (e) => {
         if (!e.data || !e.data.size) return;
         const p = e.data.arrayBuffer().then((buf) => window.capture.sendChunk(name, buf));
         pending.add(p);
         p.finally(() => pending.delete(p));
+      };
+      // A MediaRecorder that errors mid-meeting simply STOPS emitting chunks, and until now
+      // nothing noticed: the liveness heartbeat is driven by the AudioContext SOURCES (the
+      // analyser taps below), not by the recorders — so isAudioActive() kept returning true
+      // and the user got a 5-minute video of a 50-minute meeting with no warning at all.
+      // Warn and keep recording; never finalize, since the other recorder may be perfectly fine.
+      rec.onerror = (e) => {
+        const err = e && e.error;
+        window.capture.diag({ type: 'rec-error', which: name, name: err && err.name, message: err && err.message });
+        window.capture.degraded(name === 'video'
+          ? { videoDead: true, reason: 'recorder-error' }
+          : { micDead: true, sysDead: true, reason: 'recorder-error' });
       };
     };
     pipe(recA, 'video');
@@ -240,7 +316,7 @@ async function startCapture() {
       debounce = setTimeout(onDeviceChange, DEVICE_DEBOUNCE_MS);
     };
 
-    recA.start(15000);
+    recA?.start(15000);
     recB.start(15000);
     state = { recA, recB, streams: [display, mic, monoDest.stream, stereoDest.stream], ctx, pending, levelTimer, debounce };
   } catch (err) {
@@ -258,7 +334,7 @@ async function stopCapture() {
   clearTimeout(debounce);
   navigator.mediaDevices.ondevicechange = null;
   const stopped = (rec) => new Promise((resolve) => {
-    if (rec.state === 'inactive') return resolve();
+    if (!rec || rec.state === 'inactive') return resolve(); // recA is null when video never started
     rec.onstop = resolve;
     try { rec.stop(); } catch { resolve(); }
   });
@@ -269,5 +345,5 @@ async function stopCapture() {
   window.capture.stopped();
 }
 
-window.capture.onStart(startCapture);
+window.capture.onStart((opts) => startCapture(opts));
 window.capture.onStop(stopCapture);

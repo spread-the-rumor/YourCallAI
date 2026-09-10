@@ -4,7 +4,11 @@ module.exports = {
     asar: {
       unpack: '**/node_modules/{get-windows,get-windows/**,koffi,koffi/**}/**',
     },
-    extraResource: ['./agents/dist'],
+    // Two entries, deliberately separate: agents/windows/build.ps1 deletes everything in
+    // agents/dist except the agent exe, so an ffmpeg dropped in there would vanish on every
+    // agent build. extraResource on a directory lands as resources/<basename>/ — see
+    // ffmpegPath() in src/ffmpeg.js, which probes both plausible layouts.
+    extraResource: ['./agents/dist', './vendor/ffmpeg'],
     // Google SSO deep link — macOS registers the scheme from Info.plist via this.
     // (Windows registration is handled at install time by app.setAsDefaultProtocolClient.)
     protocols: [{ name: 'Your Call AI', schemes: ['yourcallai'] }],

@@ -11,6 +11,8 @@ if (require('electron-squirrel-startup')) app.quit();
 const store = require('./store');
 const settingsStore = require('./settingsStore');
 const server = require('./server');
+const media = require('./media');
+const normalize = require('./normalize');
 const detector = require('./detector');
 const { startNameAgent } = require('./agents');
 const { transcribeRecording } = require('./transcribe');
@@ -177,10 +179,11 @@ function notify(info) {
     if (info.kind === 'silence') { title = 'Still recording?'; body = 'No one has spoken for 30s — open Your Call AI to stop.'; }
     else if (info.kind === 'ending') { title = 'Meeting ended'; body = 'Stopping the recording shortly…'; }
     else if (info.kind === 'capture-degraded') {
-      title = 'Audio capture problem';
-      body = info.micDead && info.sysDead ? 'No audio is reaching the recorder — still recording.'
-        : info.sysDead ? 'Meeting audio isn’t being captured — still recording.'
-          : 'Your microphone isn’t being captured — still recording.';
+      title = info.videoDead ? 'Video capture problem' : 'Audio capture problem';
+      body = info.videoDead ? 'The screen video isn’t being recorded — audio and transcript are unaffected.'
+        : info.micDead && info.sysDead ? 'No audio is reaching the recorder — still recording.'
+          : info.sysDead ? 'Meeting audio isn’t being captured — still recording.'
+            : 'Your microphone isn’t being captured — still recording.';
     }
     else { title = 'Meeting detected'; body = `${platform} — open Your Call AI to start recording.`; }
     const n = new Notification({ title, body });
@@ -265,6 +268,10 @@ async function startRecording(source, platform = '', title = '') {
   const perms = await ensureMacPermissions();
   if (!perms.ok) { emitStatus('error', perms.error); return perms; }
   cancelPendingStop('new recording');
+  // A transcode saturating the CPU during capture drops video frames and can glitch the WASAPI
+  // loopback — that would trade a cosmetic seeking problem for a corrupted recording. The queue
+  // resumes in stopRecording; the source file is untouched so the work is never lost.
+  normalize.pauseForRecording();
   lastFarEndSoundTs = Date.now(); // assume the meeting is live at the moment we start
 
   const id = rid();
@@ -278,10 +285,15 @@ async function startRecording(source, platform = '', title = '') {
 
   rec = {
     id, dir, meta,
-    videoStream: fs.createWriteStream(path.join(dir, 'video.webm')),
-    audioStream: fs.createWriteStream(path.join(dir, 'audio.webm')),
-    speakersStream: fs.createWriteStream(path.join(dir, 'speakers.jsonl'), { flags: 'a' }),
-    captureStream: fs.createWriteStream(path.join(dir, 'capture.jsonl'), { flags: 'a' }),
+    // videoStream stays null until 'capture-format' tells us which container MediaRecorder
+    // actually chose — the filename depends on it (capture.mp4 / .mkv / .webm) and only the
+    // renderer knows. 'capture-chunk' opens it lazily as a backstop; the first chunk is a
+    // whole timeslice away, so the format message always wins the race in practice.
+    videoStream: null,
+    videoFile: null,
+    audioStream: openRecStream(dir, media.AUDIO_NAME),
+    speakersStream: openRecStream(dir, 'speakers.jsonl', { flags: 'a' }),
+    captureStream: openRecStream(dir, 'capture.jsonl', { flags: 'a' }),
     agent: null,
     stopResolve: null,
   };
@@ -290,12 +302,33 @@ async function startRecording(source, platform = '', title = '') {
   });
 
   const win = createRecorderWindow();
-  win.webContents.once('did-finish-load', () => win.webContents.send('start-capture'));
+  win.webContents.once('did-finish-load', () => win.webContents.send('start-capture', {
+    forceVideoMime: process.env.YCAI_FORCE_VIDEO_MIME || '',
+  }));
 
   hidePopup();
   emitStatus('recording', platform ? `Recording ${platform}` : 'Recording huddle');
   checkDiskSpace();
   return { ok: true, recordingId: id };
+}
+
+// A WriteStream that emits 'error' with no listener throws an uncaught exception in the MAIN
+// process — the app dies mid-recording and takes the audio with it. The try/catch around
+// stream.write() does NOT cover this: fs stream write errors surface asynchronously via the
+// event, not from the write call. Disk-full is the realistic trigger, and video normalization
+// doubles peak disk use, so guard every stream rather than only the new one.
+function openRecStream(dir, name, opts) {
+  const s = fs.createWriteStream(path.join(dir, name), opts);
+  s.on('error', (err) => {
+    console.error(`[capture] ${name} write failed:`, err.message);
+    if (!rec || rec.dir !== dir) return;
+    const full = err.code === 'ENOSPC';
+    patchMeta(dir, { captureHealth: { streamError: `${name}: ${err.message}`, at: nowIso() } }).catch(() => {});
+    // Warn, never finalize — the other streams may still be writing fine (same contract as
+    // capture-degraded).
+    emitStatus('recording', full ? `⚠ Disk full — ${name} stopped recording` : `⚠ Cannot write ${name}`);
+  });
+  return s;
 }
 
 function closeStream(stream) {
@@ -321,7 +354,7 @@ function buildPlaceholderMeeting(id, meta, failedMessage) {
     content: summary,
     summary,
     transcript: null,
-    videoUrl: `http://localhost:${server.PORT}/recordings/${id}/video.webm`,
+    videoUrl: media.mediaUrl(id, path.join(recordingsDir, id)),
     transcriptUrl: null,
     speakerMap: {},
     chat: [],
@@ -371,14 +404,35 @@ async function stopRecording() {
   }
   await Promise.race([stopped, new Promise((r) => setTimeout(r, 10000))]);
   const id = await finalizeRecording();
+  // AFTER finalizeRecording, which is what clears `rec`. This used to be a setTimeout(…, 0) at
+  // the top of the function, which fired during the await above — while rec was still set — so
+  // drain()'s `if (isRecording()) return` swallowed it every single time and the queue this
+  // recording displaced was never resumed.
+  normalize.resume();
   emitStatus('processing', 'Recording saved — transcribing…');
   if (id && !quitting) runPipeline(id); // fire-and-forget; queue recovers it on next launch otherwise
   return { ok: true, recordingId: id };
 }
 
+// The renderer's chosen video mime, sent before the first chunk. Names the capture file and is
+// recorded in meta.json so the normalizer knows what it is parsing and support can tell which
+// codec produced any given recording.
+function openVideoStream(name) {
+  if (!rec || rec.videoStream) return;
+  rec.videoFile = name;
+  rec.videoStream = openRecStream(rec.dir, name);
+}
+ipcMain.on('capture-format', (e, info) => {
+  if (!rec) return;
+  const name = media.captureNameFor(info && info.videoMime);
+  openVideoStream(name);
+  patchMeta(rec.dir, { video: { mime: (info && info.videoMime) || null, file: name } }).catch(() => {});
+});
 ipcMain.on('capture-chunk', (e, { rec: which, buf }) => {
   if (!rec) return;
+  if (which === 'video' && !rec.videoStream) openVideoStream('capture.webm');
   const stream = which === 'video' ? rec.videoStream : rec.audioStream;
+  if (!stream) return; // no video encoder existed; audio-only recording
   try { stream.write(Buffer.isBuffer(buf) ? buf : Buffer.from(buf)); }
   catch (err) { console.error('[capture] chunk write failed:', err.message); }
 });
@@ -409,8 +463,11 @@ ipcMain.on('capture-diag', (e, evt) => {
 ipcMain.on('capture-degraded', (e, info) => {
   if (!rec || pendingStop) return;
   const both = info.micDead && info.sysDead;
-  const detail = both ? 'No audio reaching the recorder'
-    : info.sysDead ? 'Meeting audio not captured' : 'Microphone not captured';
+  // videoDead first: without this branch a dead video recorder rendered "Microphone not
+  // captured", which is actively wrong and sends the user to the wrong setting.
+  const detail = info.videoDead ? 'Screen video not captured — audio still recording'
+    : both ? 'No audio reaching the recorder'
+      : info.sysDead ? 'Meeting audio not captured' : 'Microphone not captured';
   patchMeta(rec.dir, { captureHealth: { ...info, at: nowIso() } }).catch(() => {});
   emitStatus('recording', `⚠ ${detail} — still recording`);
   showPopup({ kind: 'capture-degraded', ...info, platform: rec.meta.platform, title: rec.meta.title });
@@ -457,6 +514,12 @@ async function runPipeline(recordingId) {
       const saved = await store.upsertMeeting(ph);
       if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('recording-complete', saved);
     }
+
+    // Fire-and-forget, NEVER awaited. transcribeRecording blocks on a Deepgram call that is
+    // almost entirely network wait, so the conversion overlaps it for free and (on the stream-copy
+    // path) is done in seconds. Not awaiting also keeps pipelineRunning meaning "expensive AI
+    // work", so the 12s before-quit grace keeps its current semantics.
+    normalize.enqueue(recordingId);
 
     await patchMeta(dir, { status: 'transcribing' });
     emitStatus('transcribing', 'Transcribing with Deepgram…');
@@ -533,7 +596,7 @@ async function runPipeline(recordingId) {
       content: existing?.content && existing.content !== existing.summary ? existing.content : summary,
       summary,
       transcript,
-      videoUrl: `http://localhost:${server.PORT}/recordings/${recordingId}/video.webm`,
+      videoUrl: media.mediaUrl(recordingId, dir),
       transcriptUrl: transcript ? `http://localhost:${server.PORT}/recordings/${recordingId}/transcript.json` : null,
       speakerMap: resolvedSpeakerMap || existing?.speakerMap || {},
       // Why each name was chosen, so the UI can mark low-confidence ones unverified and a support
@@ -614,9 +677,18 @@ async function retentionSweep() {
   const meetings = await store.loadMeetings().catch(() => []);
   for (const m of meetings) {
     if (m.videoUrl && new Date(m.date).getTime() < cutoff) {
+      // An on-demand or legacy conversion targets exactly these old recordings. Deleting the
+      // .part out from under a running ffmpeg fails with EBUSY on Windows and, worse, silently
+      // succeeds on macOS/Linux — where ffmpeg keeps writing to the unlinked inode and the
+      // finished video.mp4 reappears after retention thought it was gone.
+      if (normalize.currentId() === m.recordingId) continue;
       const dir = path.join(recordingsDir, m.recordingId);
-      await fsp.rm(path.join(dir, 'video.webm'), { force: true }).catch(() => {});
-      await fsp.rm(path.join(dir, 'audio.webm'), { force: true }).catch(() => {});
+      // Every name we might have written, not just the two literals this used to delete — an
+      // mp4 recording would otherwise survive AUTO_DELETE_DAYS forever.
+      for (const name of media.allMediaNames()) {
+        await fsp.rm(path.join(dir, name), { force: true }).catch(() => {});
+      }
+      await fsp.rm(path.join(dir, media.AUDIO_NAME), { force: true }).catch(() => {});
       await store.updateMeeting(m.id, { videoUrl: null });
     }
   }
@@ -624,7 +696,16 @@ async function retentionSweep() {
 
 // ---------- IPC: meetings ----------
 
-ipcMain.handle('list-meetings', () => store.loadMeetings());
+// videoUrl is derived here rather than trusted from disk. It is written at three different
+// points in a recording's life (placeholder, pipeline upsert, sync rehydrate) and the file it
+// names can change afterwards when the normalizer swaps capture.* for video.mp4 — so the stored
+// value is treated as a cache nobody reads. This makes a dead ▶ Recording link unrepresentable.
+ipcMain.handle('list-meetings', async () => {
+  const meetings = await store.loadMeetings();
+  return meetings.map((m) => (m.recordingId
+    ? { ...m, videoUrl: media.mediaUrl(m.recordingId, path.join(recordingsDir, m.recordingId)) }
+    : m));
+});
 ipcMain.handle('update-meeting', (e, id, patch) => {
   const allowed = {};
   for (const k of ['title', 'content', 'chat']) if (k in (patch || {})) allowed[k] = patch[k];
@@ -769,16 +850,66 @@ ipcMain.handle('save-transcript', async (e, meetingId, format) => {
   return { ok: true, filePath };
 });
 
+// Hand the recording to whatever plays it best. shell.openPath gives the OS video player —
+// frame stepping, playback speed, real fullscreen — but only an MP4 can rely on that: QuickTime
+// and Windows Media Player refuse a live-muxed WebM outright, where a browser at least plays it.
+// The choice has to live here because only main can resolve which file actually exists.
+// Opt-in bulk conversion of pre-change recordings. Never automatic — see convertLegacy().
+ipcMain.handle('count-legacy-recordings', () => normalize.countLegacy().catch(() => 0));
+ipcMain.handle('convert-legacy-recordings', () => normalize.convertLegacy()
+  .catch((err) => ({ ok: false, error: err.message })));
+
+ipcMain.handle('open-recording', async (e, meetingId) => {
+  const meeting = await store.getMeeting(meetingId);
+  if (!meeting || !meeting.recordingId) return { ok: false, error: 'Meeting not found.' };
+  const dir = path.join(recordingsDir, meeting.recordingId);
+
+  // Convert first if this recording has not been converted yet. Instant when it already has.
+  const conv = await normalize.ensureMp4(meeting.recordingId);
+  const found = conv.ok ? conv.media : media.resolveMedia(dir);
+  if (!found) return { ok: false, error: conv.error || 'Recording file not found (may have been auto-deleted).' };
+
+  if (found.ext === '.mp4') {
+    const err = await shell.openPath(found.path); // '' on success
+    if (!err) return { ok: true, opened: 'os' };
+    console.warn('[open-recording] openPath failed, falling back to browser:', err);
+  }
+  // Still not an mp4 (conversion unavailable or failed): a browser is the only thing that
+  // reliably plays a live-muxed WebM — QuickTime and Media Player refuse it outright.
+  const url = media.mediaUrl(meeting.recordingId, dir);
+  if (!url) return { ok: false, error: conv.error || 'Recording is not being served.' };
+  await shell.openExternal(url);
+  return { ok: true, opened: 'browser' };
+});
+
 ipcMain.handle('save-recording', async (e, meetingId) => {
   const meeting = await store.getMeeting(meetingId);
-  if (!meeting) return { ok: false, error: 'Meeting not found.' };
-  const src = path.join(recordingsDir, meeting.recordingId, 'video.webm');
-  try { await fsp.access(src); } catch { return { ok: false, error: 'Recording file not found (may have been auto-deleted).' }; }
+  // recordingId guard: path.join(dir, undefined) throws ERR_INVALID_ARG_TYPE, which surfaces as
+  // an unhandled rejection in the renderer. Reachable for a meeting synced from another machine.
+  if (!meeting || !meeting.recordingId) return { ok: false, error: 'Meeting not found.' };
+  const dir = path.join(recordingsDir, meeting.recordingId);
+  const found = media.resolveMedia(dir);
+  if (!found) return { ok: false, error: 'Recording file not found (may have been auto-deleted).' };
+
+  // Decide the extension BEFORE prompting: we offer .mp4 whenever we can actually produce one,
+  // and the honest extension otherwise. Offering .mp4 over a file we cannot convert would hand
+  // the user something Windows refuses to open.
+  const target = found.normalized || normalize.isAvailable() ? { ext: '.mp4' } : found;
+
+  // Dialog FIRST, then convert. A conversion can take minutes, and a modal appearing after the
+  // user has switched apps is worse than picking the destination up front.
   const { canceled, filePath } = await dialog.showSaveDialog(mainWindow, {
-    defaultPath: `${meeting.title.replace(/[\\/:*?"<>|·]/g, '-')}.webm`,
-    filters: [{ name: 'WebM video', extensions: ['webm'] }],
+    defaultPath: media.downloadName(meeting.title, target),
+    filters: [media.downloadFilter(target)],
   });
   if (canceled || !filePath) return { ok: false, canceled: true };
+
+  let src = found.path;
+  if (target.ext === '.mp4') {
+    const conv = await normalize.ensureMp4(meeting.recordingId);
+    if (!conv.ok) return { ok: false, error: conv.error };
+    src = conv.media.path;
+  }
   // Stream to disk — never buffer the whole file in memory.
   try {
     await new Promise((resolve, reject) => {
@@ -851,6 +982,26 @@ if (!gotLock) {
     }).catch(() => {});
 
     recordingsDir = path.join(app.getPath('userData'), 'recordings');
+    normalize.configure({
+      recordingsDir,
+      isRecording: () => !!rec,
+      emitProgress: (id, pct) => emitProgress(id, 'normalizing', `${pct}%`),
+      // The URL is derived at read time, so nothing needs repointing — but a meeting the user
+      // has open right now will not re-render on its own.
+      onNormalized: (id) => {
+        store.getMeeting(id).then((m) => {
+          if (!m || !mainWindow || mainWindow.isDestroyed()) return;
+          mainWindow.webContents.send('meeting-updated', {
+            ...m,
+            videoUrl: media.mediaUrl(id, path.join(recordingsDir, id)),
+          });
+        }).catch(() => {});
+      },
+      saveEncoder: (enc) => settingsStore.saveSettings({ VIDEO_ENCODER: enc }).catch(() => {}),
+      // A visible conversion drives the status pill; hand it back when it ends, or the pill
+      // stays stuck on "Preparing video 99%" forever.
+      onJobDone: () => { if (!pipelineRunning.size) emitStatus(rec ? 'recording' : 'idle'); },
+    });
     await fsp.mkdir(recordingsDir, { recursive: true }).catch(() => {});
 
     // Capture plumbing must exist before the recorder window ever asks (§5)
@@ -901,6 +1052,9 @@ if (!gotLock) {
 
     recoverAndRequeue().catch((e) => console.error('[recover]', e.message));
     retentionSweep().catch((e) => console.error('[retention]', e.message));
+    // Re-derives what still needs converting purely from the files on disk, so an interrupted
+    // transcode resumes even for a recording whose pipeline already reported 'complete'.
+    normalize.sweep().catch((e) => console.error('[normalize]', e.message));
     auth.init().catch((e) => console.error('[auth]', e.message)); // restore session + sync if signed in
   });
 
@@ -910,6 +1064,10 @@ if (!gotLock) {
     // checked, so closing the app during post-recording processing killed the pipeline. That is
     // now recoverable (the card is persisted at stop and recoverAndRequeue re-runs on launch), but
     // we still give a brief grace so the fast final stages (names/summary/persist) can complete.
+    // A transcode is fully redoable from an untouched source, so quit must never wait for it —
+    // and Electron does not reap children, so an unkilled ffmpeg keeps 100% CPU and a handle on
+    // the output file after the window is gone.
+    normalize.killCurrent('quit', { requeue: false });
     if (rec || pipelineRunning.size) {
       e.preventDefault();
       quitting = true;
@@ -921,6 +1079,12 @@ if (!gotLock) {
       app.quit(); // anything still transcribing resumes on next launch via the requeue
     }
   });
+
+  // The before-quit path already kills it, but that handler is skipped entirely when nothing is
+  // recording and no pipeline is in flight — and an orphaned ffmpeg would hold 100% CPU and a
+  // file handle after the app is gone.
+  app.on('will-quit', () => { normalize.killCurrent('will-quit', { requeue: false }); });
+  process.on('exit', () => { normalize.killCurrent('process-exit', { requeue: false }); });
 
   app.on('window-all-closed', () => {
     if (process.platform !== 'darwin') app.quit();

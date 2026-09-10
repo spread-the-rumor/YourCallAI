@@ -29,6 +29,25 @@ jobs:
         if: runner.os == 'macOS'
         run: sh agents/macos/build.sh
 
+      # Bundled ffmpeg for video normalization (§5). Keyed off the runner's platform/arch, so
+      # each job provisions its own pinned build. Fails the job if it cannot: shipping an
+      # installer without ffmpeg silently degrades every recording to an unseekable capture file.
+      #
+      # macOS COMPILES ffmpeg (no LGPL prebuilt exists - see scripts/fetch-ffmpeg.mjs), which
+      # costs several minutes. The cache makes that a once-per-pin cost rather than a
+      # once-per-release one; the key covers the script, so changing the pin rebuilds. On a hit
+      # the fetch step still runs and re-verifies the binary, so a bad cache entry cannot ship.
+      - name: Cache bundled ffmpeg
+        uses: actions/cache@v4
+        with:
+          path: vendor/ffmpeg
+          key: ffmpeg-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/fetch-ffmpeg.mjs') }}
+
+      - name: Fetch ffmpeg
+        run: node scripts/fetch-ffmpeg.mjs
+        env:
+          CI: 'true'
+
       - run: npm ci
 
       # Both jobs publish to the same draft GitHub Release; publish the draft to go live.

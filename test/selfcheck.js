@@ -510,4 +510,151 @@ const offRoster = parseInf('{"Speaker 2":{"name":"Someone Else","confidence":0.9
   ['Speaker 2'], ['Carlos Brito', 'Hernan Zapata'], 'Sagar Bansal');
 assert.deepStrictEqual(offRoster, {}, 'a name not on the roster is still rejected outright');
 
+// --- media.js: the recording-media resolver (§5). The whole normalize state machine is read
+// off the filesystem rather than from meta.status, because runPipeline writes status:'complete'
+// BEFORE its final upsert while recoverAndRequeue only requeues recorded/transcribing/failed —
+// so anything keyed off status and finishing late would be unresumable forever. These
+// assertions pin the probe order and every disk state that machine can be in.
+const media = require('../src/media');
+const mediaDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ycai-media-'));
+const touch = (...names) => {
+  fs.readdirSync(mediaDir).forEach((f) => fs.unlinkSync(path.join(mediaDir, f)));
+  names.forEach((n) => fs.writeFileSync(path.join(mediaDir, n), 'x'));
+};
+
+assert.strictEqual(media.resolveMedia(mediaDir), null, 'empty dir resolves to no media');
+assert.strictEqual(media.needsNormalize(mediaDir).action, 'none', 'nothing on disk → nothing to do');
+
+touch('capture.webm');
+assert.strictEqual(media.resolveMedia(mediaDir).name, 'capture.webm');
+assert.strictEqual(media.needsNormalize(mediaDir).action, 'normalize', 'a capture file IS the flag');
+
+touch('video.mp4');
+assert.strictEqual(media.resolveMedia(mediaDir).name, 'video.mp4');
+assert.ok(media.resolveMedia(mediaDir).normalized, 'video.mp4 reports itself normalized');
+assert.strictEqual(media.needsNormalize(mediaDir).action, 'none', 'already converted → skip');
+
+touch('video.mp4', 'capture.webm');
+assert.strictEqual(media.resolveMedia(mediaDir).name, 'video.mp4',
+  'normalized output wins the probe order over the capture it came from');
+assert.strictEqual(media.needsNormalize(mediaDir).action, 'cleanup',
+  'crashed between rename and unlink → drop the leftover source, do not re-convert');
+
+touch('capture.webm', 'video.mp4.part');
+const partState = media.needsNormalize(mediaDir);
+assert.strictEqual(partState.action, 'normalize');
+assert.ok(partState.stale, 'a .part is always reported for deletion: +faststart relocates moov '
+  + 'at the end, so a partial one has no usable index by construction');
+
+// Legacy recordings must resolve (they still play and download) but must NEVER be swept into a
+// conversion. Otherwise the first launch after an update transcodes a user's whole library.
+touch('video.webm');
+assert.strictEqual(media.resolveMedia(mediaDir).name, 'video.webm', 'pre-change recordings still resolve');
+assert.strictEqual(media.resolveMedia(mediaDir).ext, '.webm');
+assert.strictEqual(media.needsNormalize(mediaDir).action, 'none',
+  'legacy video.webm is never auto-converted — Phase 6 does it opt-in');
+
+// A zero-byte file is not media. The recorder can leave one behind when it errors right after
+// the write stream was opened; treating it as playable gives a dead ▶ link and makes
+// needsNormalize burn all three conversion attempts on an empty file.
+touch();
+fs.writeFileSync(path.join(mediaDir, 'capture.mp4'), '');
+assert.strictEqual(media.resolveMedia(mediaDir), null, 'a 0-byte capture is not playable media');
+assert.strictEqual(media.needsNormalize(mediaDir).action, 'none', 'a 0-byte capture is not converted');
+
+// ...but a 0-byte .part must still be reported for deletion: +faststart relocates moov at the
+// very end, so any partial .part is unusable by construction.
+touch('capture.webm');
+fs.writeFileSync(path.join(mediaDir, 'video.mp4.part'), '');
+assert.ok(media.needsNormalize(mediaDir).stale, 'an empty .part is still cleaned up');
+
+fs.rmSync(mediaDir, { recursive: true, force: true });
+
+assert.strictEqual(media.captureNameFor('video/mp4;codecs=avc1.640028,mp4a.40.2'), 'capture.mp4');
+assert.strictEqual(media.captureNameFor('video/x-matroska;codecs=avc1,opus'), 'capture.mkv');
+assert.strictEqual(media.captureNameFor('video/webm;codecs=vp9,opus'), 'capture.webm');
+assert.strictEqual(media.captureNameFor(undefined), 'capture.webm', 'unknown mime falls back to webm');
+
+// The download name/filter follow the file that actually exists. Offering an .mp4 filter over a
+// .webm file yields something Windows refuses to open — worse than the honest extension.
+assert.strictEqual(media.downloadName('Team sync · Mon 3/4', { ext: '.mp4' }), 'Team sync - Mon 3-4.mp4');
+assert.deepStrictEqual(media.downloadFilter({ ext: '.webm' }), { name: 'WebM video', extensions: ['webm'] });
+assert.deepStrictEqual(media.downloadFilter({ ext: '.mp4' }), { name: 'MP4 video', extensions: ['mp4'] });
+assert.ok(media.allMediaNames().includes('video.mp4') && media.allMediaNames().includes('video.webm')
+  && media.allMediaNames().includes('video.mp4.part'),
+  'retention must know every artifact, or an mp4 outlives AUTO_DELETE_DAYS forever');
+
+// --- ffmpeg.js: the pure halves (argument builders and output parsers). No binary, no Electron.
+const ffm = require('../src/ffmpeg');
+
+// -f mp4 must be present on EVERY path. We write to "video.mp4.part" so a crash can never leave
+// a half-file under the real name, and ffmpeg picks its muxer from the extension — which is
+// ".part". Without an explicit format every conversion dies instantly with "Unable to choose an
+// output format". This was a real bug, caught only by running it.
+for (const ext of ['.mp4', '.mkv', '.webm']) {
+  const args = ffm.buildArgs({ src: 'in' + ext, dst: 'out.mp4.part', ext, encoder: 'h264_mf', threads: 4 });
+  const fi = args.indexOf('-f');
+  assert.ok(fi >= 0 && args[fi + 1] === 'mp4', `-f mp4 required for a ${ext} source`);
+  assert.strictEqual(args[args.length - 1], 'out.mp4.part', 'output path is last');
+  assert.ok(args.includes('+faststart'), `${ext}: faststart is the entire point`);
+  // Optional audio: loopback can hand back a stream with no audio track at all, and a mandatory
+  // -map 0:a:0 would fail the whole job rather than just omitting the track.
+  assert.ok(args.includes('0:a:0?'), `${ext}: audio mapping must be optional`);
+  // VFR: getDisplayMedia suppresses unchanged frames, and letting ffmpeg force a constant rate
+  // accumulates A/V drift that only shows up ~40 minutes into a recording.
+  assert.ok(args.includes('passthrough'), `${ext}: -fps_mode passthrough`);
+}
+
+// An H.264 source is a stream copy — no encoder, no scaling, no re-encode. This is what makes
+// the common path seconds instead of minutes.
+const mp4Args = ffm.buildArgs({ src: 'capture.mp4', dst: 'o.part', ext: '.mp4' });
+assert.ok(mp4Args.includes('-c') && mp4Args[mp4Args.indexOf('-c') + 1] === 'copy',
+  'a fragmented-mp4 source is remuxed losslessly');
+assert.ok(!mp4Args.includes('-vf'), 'no filtering on the copy path');
+
+// MKV holds H.264 already, so only the audio is re-encoded: Opus in MP4 is legal but QuickTime
+// and Safari refuse it.
+const mkvArgs = ffm.buildArgs({ src: 'capture.mkv', dst: 'o.part', ext: '.mkv' });
+assert.strictEqual(mkvArgs[mkvArgs.indexOf('-c:v') + 1], 'copy', 'mkv keeps the H.264 video');
+assert.strictEqual(mkvArgs[mkvArgs.indexOf('-c:a') + 1], 'aac', 'mkv audio must become AAC');
+
+// The transcode path needs even dimensions: H.264 4:2:0 forbids odd ones, and fractional display
+// scaling produces them. Missing this fails on EVERY encoder, which reads as "ffmpeg is broken".
+const webmArgs = ffm.buildArgs({ src: 'capture.webm', dst: 'o.part', ext: '.webm', encoder: 'h264_qsv', threads: 3 });
+assert.ok(webmArgs.join(' ').includes('scale=trunc(iw/2)*2:trunc(ih/2)*2'), 'even dimensions enforced');
+assert.strictEqual(webmArgs[webmArgs.indexOf('-pix_fmt') + 1], 'yuv420p');
+assert.strictEqual(webmArgs[webmArgs.indexOf('-c:v') + 1], 'h264_qsv');
+assert.strictEqual(webmArgs[webmArgs.indexOf('-threads') + 1], '3');
+assert.ok(webmArgs.includes('-g'), 'explicit GOP — this IS the seek granularity of a transcode');
+
+// libx264 is GPL and this project is MIT, so the shipped build deliberately lacks it. If it ever
+// reappears in the candidate list, the licensing decision has been silently reversed.
+assert.ok(!ffm.CANDIDATES.includes('libx264'), 'libx264 (GPL) must never be a candidate');
+assert.ok(ffm.CANDIDATES[ffm.CANDIDATES.length - 1] === 'libopenh264',
+  'software encoder is the last resort, hardware first');
+
+// `ffmpeg -encoders` parsing, against real output shape.
+assert.deepStrictEqual(ffm.parseEncoders([
+  'Encoders:',
+  ' V..... = Video',
+  ' ------',
+  ' V....D libopenh264          OpenH264 H.264 / AVC (codec h264)',
+  ' V....D h264_nvenc           NVIDIA NVENC H.264 encoder (codec h264)',
+  ' A....D aac                  AAC (Advanced Audio Coding)',
+  ' V..... h264_qsv             H.264 / AVC (Intel Quick Sync Video acceleration) (codec h264)',
+].join('\n')), ['libopenh264', 'h264_nvenc', 'h264_qsv'], 'video encoders only, audio ignored');
+
+// -progress output is key=value terminated by progress=continue/end, and a line can be split
+// across chunk boundaries — the parser must buffer the partial tail.
+const seen = [];
+const feed = ffm.createProgressParser((f) => seen.push(f));
+feed('frame=12\nout_time_us=500000\npro');
+feed('gress=continue\n');
+assert.strictEqual(seen.length, 1, 'a key=value line split across chunks is still parsed');
+assert.strictEqual(ffm.outTimeMs(seen[0]), 500, 'out_time_us converts to ms');
+feed('out_time_us=N/A\nprogress=continue\n');
+assert.strictEqual(ffm.outTimeMs(seen[1]), null, 'N/A early in the run is not a number');
+feed('out_time_ms=2000000\nprogress=end\n');
+assert.strictEqual(ffm.outTimeMs(seen[2]), 2000, 'out_time_ms fallback');
+
 console.log('selfcheck: all assertions passed');

@@ -36,12 +36,15 @@ window.popup.onShow((info) => {
   } else if (kind === 'capture-degraded') {
     // Warn only — recording continues. A half-captured meeting still transcribes; a stopped
     // one is gone. The Bluetooth hint is added only when it is actually relevant.
-    titleEl.textContent = info.micDead && info.sysDead ? 'No audio is being captured'
-      : info.sysDead ? 'Meeting audio isn’t being captured'
-        : 'Your mic isn’t being captured';
-    detailEl.textContent = info.sysDead && info.bluetooth
-      ? 'Still recording. Your output is a Bluetooth headset — try switching the meeting’s speaker to your laptop.'
-      : 'Still recording — check your audio device.';
+    titleEl.textContent = info.videoDead ? 'Screen video isn’t being recorded'
+      : info.micDead && info.sysDead ? 'No audio is being captured'
+        : info.sysDead ? 'Meeting audio isn’t being captured'
+          : 'Your mic isn’t being captured';
+    detailEl.textContent = info.videoDead
+      ? 'Still recording. Audio, transcript and summary are unaffected — only the video is missing.'
+      : info.sysDead && info.bluetooth
+        ? 'Still recording. Your output is a Bluetooth headset — try switching the meeting’s speaker to your laptop.'
+        : 'Still recording — check your audio device.';
   } else if (kind === 'ending') {
     titleEl.textContent = 'Meeting ended';
     let remaining = info.seconds || 15;

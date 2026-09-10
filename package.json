@@ -15,7 +15,8 @@
     "publish": "electron-forge publish",
     "ship": "node scripts/ship.mjs",
     "test": "node test/selfcheck.js",
-    "build:agent": "node scripts/build-agent.mjs"
+    "build:agent": "node scripts/build-agent.mjs",
+    "fetch:ffmpeg": "node scripts/fetch-ffmpeg.mjs"
   },
   "author": "Rumor Avenue",
   "license": "MIT",

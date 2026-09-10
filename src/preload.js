@@ -7,6 +7,7 @@ const on = (channel) => (cb) => ipcRenderer.on(channel, (e, payload) => cb(paylo
 contextBridge.exposeInMainWorld('api', {
   onStatus: on('status'),
   onRecordingComplete: on('recording-complete'),
+  onMeetingUpdated: on('meeting-updated'), // e.g. video finished normalizing, long after the pipeline
   onTranscribeProgress: on('transcribe-progress'),
 
   listMeetings: invoke('list-meetings'),
@@ -46,6 +47,9 @@ contextBridge.exposeInMainWorld('api', {
   extractActionItems: invoke('extract-action-items'),
 
   saveTranscript: invoke('save-transcript'),
+  openRecording: invoke('open-recording'), // OS video player for mp4, browser for a capture file
+  countLegacyRecordings: invoke('count-legacy-recordings'),
+  convertLegacyRecordings: invoke('convert-legacy-recordings'),
   saveRecording: invoke('save-recording'),
   renameSpeaker: invoke('rename-speaker'),
 

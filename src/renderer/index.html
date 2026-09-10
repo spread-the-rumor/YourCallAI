@@ -61,6 +61,7 @@
       <div id="editor" class="editor hidden">
         <input id="note-title" class="note-title" type="text">
         <div class="meta-line" id="meta-line"></div>
+
         <div class="view-toggle segmented">
           <button data-view="summary" class="seg-toggle active">Summary</button>
           <button data-view="transcript" class="seg-toggle">Transcript</button>
@@ -111,6 +112,17 @@
         <div class="settings-actions">
           <button id="settings-save" class="btn primary pill">Save</button>
           <span id="settings-status" class="muted"></span>
+        </div>
+
+        <!-- Older recordings are left alone by default; converting them is a deliberate action
+             because it is minutes of CPU per recording. Hidden entirely when there are none. -->
+        <div id="legacy-block" class="account-block hidden">
+          <h3>Older recordings</h3>
+          <p id="legacy-status" class="muted"></p>
+          <div class="settings-actions">
+            <button id="legacy-convert" class="btn pill">Convert to MP4</button>
+            <span id="legacy-result" class="muted"></span>
+          </div>
         </div>
       </div>
 

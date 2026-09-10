@@ -12,6 +12,9 @@ const KEYS = [
   'USER_DISPLAY_NAME',
   'AUTO_DELETE_DAYS',
   'THEME', // 'dark' | 'light' — UI theme preference
+  // The H.264 encoder that actually passed a real test encode on this machine (§5). Cached so
+  // the validation probe runs once per install rather than once per conversion.
+  'VIDEO_ENCODER',
 ];
 
 const VERCEL_URL = PROXY_URL;

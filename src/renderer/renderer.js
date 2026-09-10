@@ -210,12 +210,24 @@ function renderActionRow(m) {
     return b;
   };
   if (m.videoUrl) {
-    add('▶ Recording', () => window.open(m.videoUrl, '_blank'));
+    // Both go through main, which converts the recording to MP4 first if it has not been
+    // converted yet — instant once it has. The status pill carries the percentage during a
+    // conversion; these just show that something is happening.
+    add('▶ Open in player', async (b) => {
+      b.disabled = true; b.textContent = 'Opening…';
+      const r = await api.openRecording(m.id);
+      b.disabled = false;
+      b.textContent = r && !r.ok ? `⚠ ${(r.error || 'Could not open').slice(0, 48)}` : '▶ Open in player';
+      if (r && !r.ok) setTimeout(() => { b.textContent = '▶ Open in player'; }, 4000);
+      reload();
+    });
     add('⬇ Download', async (b) => {
       b.disabled = true; b.textContent = 'Saving…';
       const r = await api.saveRecording(m.id);
-      b.disabled = false; b.textContent = r.ok ? '✓ Saved' : (r.canceled ? '⬇ Download' : '⚠ Failed');
-      setTimeout(() => { b.textContent = '⬇ Download'; }, 2500);
+      b.disabled = false;
+      b.textContent = r.ok ? '✓ Saved' : (r.canceled ? '⬇ Download' : `⚠ ${(r.error || 'Failed').slice(0, 48)}`);
+      setTimeout(() => { b.textContent = '⬇ Download'; }, r.ok ? 2500 : 4000);
+      reload();
     });
   }
   if (m.transcript) {
@@ -753,6 +765,7 @@ async function openSettings() {
       <input data-key="${key}" type="${SECRET.test(key) ? 'password' : 'text'}" value="${esc(values[key] || '')}">`;
     box.appendChild(f);
   }
+  renderLegacy();
   $('modal-backdrop').classList.remove('hidden');
   $('settings-view').classList.remove('hidden');
   showTab('profile');
@@ -795,6 +808,21 @@ async function renderAsana() {
 }
 
 // ---------- account / sync ----------
+// Pre-change recordings play and download exactly as before; they just are not seekable. The
+// block hides itself when there is nothing to convert, so most users never see it.
+async function renderLegacy() {
+  const block = $('legacy-block');
+  const status = $('legacy-status');
+  let n = 0;
+  try { n = await api.countLegacyRecordings(); } catch { n = 0; }
+  block.classList.toggle('hidden', !n);
+  if (!n) return;
+  status.textContent = `${n} recording${n === 1 ? '' : 's'} made before MP4 support. `
+    + 'They still play, but cannot be scrubbed. Converting is minutes of CPU each and runs one at a time in the background.';
+  $('legacy-convert').disabled = false;
+  $('legacy-convert').textContent = 'Convert to MP4';
+}
+
 async function renderAccount() {
   const { enabled, user } = await api.getUser();
   const block = $('account-block');
@@ -894,11 +922,25 @@ async function init() {
     patchLocal(meeting);
     reload().then(() => selectMeeting(meeting.id));
   });
-  api.onTranscribeProgress(({ stage }) => {
+  api.onTranscribeProgress(({ stage, detail }) => {
     if (stage === 'transcribing') state.status = { state: 'transcribing', detail: 'Transcribing…' };
     if (stage === 'resolving-names') state.status = { state: 'processing', detail: 'Resolving speaker names…' };
     if (stage === 'summarizing') state.status = { state: 'processing', detail: 'Generating summary…' };
+    // Maps onto the existing 'processing' state rather than introducing a new one: renderStatus's
+    // labels map falls through via `labels[st] || st`, so a new state string would render the
+    // literal word "normalizing" in the pill.
+    if (stage === 'normalizing') state.status = { state: 'processing', detail: `Preparing video${detail ? ` ${detail}` : '…'}` };
     renderStatus();
+  });
+
+  // Video normalization finishes independently of the pipeline and can land minutes later.
+  // Deliberately NOT the recording-complete channel: that one calls reload().then(selectMeeting),
+  // which would yank the user out of whatever they were reading.
+  api.onMeetingUpdated((meeting) => {
+    if (!meeting) return;
+    patchLocal(meeting);
+    renderList();
+    if (meeting.id === state.currentId) renderEditor(); // reads current() from state
   });
 
   $('btn-huddle').addEventListener('click', async () => {
@@ -910,6 +952,19 @@ async function init() {
     else await api.startDetectedRecording();
   });
   $('user-chip').addEventListener('click', openSettings);
+
+  $('legacy-convert').addEventListener('click', async (e) => {
+    const b = e.currentTarget;
+    b.disabled = true; b.textContent = 'Queueing…';
+    const r = await api.convertLegacyRecordings();
+    $('legacy-result').textContent = r && r.ok
+      ? `Queued ${r.queued} — converting in the background, one at a time.`
+      : `⚠ ${(r && r.error) || 'Failed'}`;
+    b.textContent = 'Convert to MP4';
+    // Renaming the sources means they are no longer "legacy"; re-read so the count is honest.
+    await renderLegacy();
+    await reload();
+  });
   $('settings-close').addEventListener('click', closeSettings);
   $('modal-backdrop').addEventListener('click', closeSettings);
   document.addEventListener('keydown', (e) => {
