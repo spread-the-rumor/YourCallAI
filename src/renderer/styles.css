@@ -182,7 +182,7 @@ body {
 
 .record-btn { background: linear-gradient(135deg, var(--green), #2aa84a); color: #fff; border: none; font-weight: 700; }
 .huddle-btn { }
-.record-btn.stop, .huddle-btn.stop { background: linear-gradient(135deg, var(--red), #d63a30); color: #fff; border: none; font-weight: 700; }
+.record-btn.stop { background: linear-gradient(135deg, var(--red), #d63a30); color: #fff; border: none; font-weight: 700; }
 
 /* ---------- search + range filter ---------- */
 .search-row { display: flex; gap: var(--s2); }

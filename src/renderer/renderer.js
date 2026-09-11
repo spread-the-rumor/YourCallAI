@@ -68,14 +68,15 @@ function renderStatus() {
   else if (st === 'error') pill.classList.add('error');
 
   const recBtn = $('btn-record'), huddleBtn = $('btn-huddle');
+  // While recording there is exactly ONE stop control (#btn-record). Huddle is a *start* path
+  // only; a second stop button beside it just made users guess which one ends the meeting.
   if (st === 'recording') {
     recBtn.classList.remove('hidden');
     recBtn.classList.add('stop');
     recBtn.textContent = '■ Stop Recording';
-    huddleBtn.classList.add('stop');
-    huddleBtn.textContent = '■ Stop';
+    huddleBtn.classList.add('hidden');
   } else {
-    huddleBtn.classList.remove('stop');
+    huddleBtn.classList.remove('hidden', 'stop');
     huddleBtn.textContent = '🎙 Huddle';
     recBtn.classList.remove('stop');
     recBtn.textContent = '● Start Recording';
