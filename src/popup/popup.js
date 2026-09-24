@@ -12,7 +12,8 @@ const btn = { start: $('start'), dismiss: $('dismiss'), stop: $('stop'), keep: $
 let countdownTimer = null;
 const stopCountdown = () => { if (countdownTimer) { clearInterval(countdownTimer); countdownTimer = null; } };
 
-// info = { kind: 'detected' | 'silence' | 'ending' | 'capture-degraded', platform, title, seconds }
+// info = { kind: 'detected' | 'silence' | 'ending' | 'capture-degraded' | 'capture-endpoint-switched',
+//          platform, title, seconds, deviceName }
 window.popup.onShow((info) => {
   stopCountdown();
   const kind = info.kind || 'detected';
@@ -24,8 +25,8 @@ window.popup.onShow((info) => {
   btn.stop.classList.toggle('hidden', kind !== 'silence');
   btn.keep.classList.toggle('hidden', kind !== 'silence');
   btn.keepEnding.classList.toggle('hidden', kind !== 'ending');
-  btn.captureOk.classList.toggle('hidden', kind !== 'capture-degraded');
-  detailEl.classList.toggle('wrap', kind === 'capture-degraded');
+  btn.captureOk.classList.toggle('hidden', kind !== 'capture-degraded' && kind !== 'capture-endpoint-switched');
+  detailEl.classList.toggle('wrap', kind === 'capture-degraded' || kind === 'capture-endpoint-switched');
 
   if (kind === 'detected') {
     titleEl.textContent = 'Meeting detected';
@@ -42,9 +43,18 @@ window.popup.onShow((info) => {
           : 'Your mic isn’t being captured';
     detailEl.textContent = info.videoDead
       ? 'Still recording. Audio, transcript and summary are unaffected — only the video is missing.'
-      : info.sysDead && info.bluetooth
-        ? 'Still recording. Your output is a Bluetooth headset — try switching the meeting’s speaker to your laptop.'
-        : 'Still recording — check your audio device.';
+      // Naming the endpoint is the difference between a message the user can act on and one they
+      // can only dismiss: Windows is pointed at this device and nothing is playing to it.
+      : info.reason === 'no-live-endpoint' && info.deviceName
+        ? `Still recording. Windows is set to “${info.deviceName}” but nothing is playing there — switch your output to the device you can hear the meeting on.`
+        : info.sysDead && info.bluetooth
+          ? 'Still recording. Your output is a Bluetooth headset — try switching the meeting’s speaker to your laptop.'
+          : 'Still recording — check your audio device.';
+  } else if (kind === 'capture-endpoint-switched') {
+    // We changed the Windows default output. That is a system-wide change the user did not make,
+    // and it is deliberately NOT restored afterwards, so say so plainly rather than burying it.
+    titleEl.textContent = 'Meeting audio recovered';
+    detailEl.textContent = `Switched Windows output to “${info.deviceName}” so the meeting is captured. Still recording — this stays selected after the meeting.`;
   } else if (kind === 'ending') {
     titleEl.textContent = 'Meeting ended';
     let remaining = info.seconds || 15;

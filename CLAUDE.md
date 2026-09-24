@@ -430,6 +430,97 @@ one delivers memset-zero buffers. `DEAD_RMS = 1e-5` sits in that gap. The existi
 `SILENCE_RMS = 0.0025` sits *above* the noise floor, which is exactly why it can only ever say
 "quiet" and never "dead" — **do not reuse it for health checks.**
 
+### The probe threshold was inside the noise (fixed 2026-09-24)
+
+`probeStreamAlive` gated on `DEAD_RMS` (1e-5), and that gate sat **in the middle of a single
+cluster**, not between two. Measured across **51 real recovery probes** from 7 captured meetings:
+15 readings at 8.9e-6–9.8e-6 (called dead) and 25 at 1.0e-5–2.0e-5 (called ALIVE) — i.e. **69% of
+every "alive" verdict** was physically indistinguishable from a dead one, and only 4 probes of 51
+ever saw real audio (≥1e-3). The verdict was decided by jitter in the fifth decimal.
+
+That is worse than having no probe: it launders a coin flip into recorded evidence
+(`recover-ok, maxRms: 0.0000102`) and then **swaps a working source out for a dead one** — exactly
+how the 2026-09-17 meeting lost 45 minutes. Accepting a candidate now requires `ALIVE_RMS = 1e-4`
+(10× above the ambiguous band, ~1000× below real speech), and the probe no longer early-exits on
+a noise-floor reading. `DEAD_RMS` is still correct for the *warm-up* verdict; the two thresholds
+answer different questions and must not be merged.
+
+Three more failures from the same meeting, all of which produced **zero** user-visible signal:
+- **`all-dead`** (`TOTAL_DEATH_MS = 45 s`). `system-dead` requires the mic to carry signal, so
+  "everything is dead" — the worst case — was the one state it could structurally never see.
+  Note the flat test is `<=` deadRms: the real capture logged `sysRms` exactly `0.00001`.
+  Evaluated **before** the 30 s `silence` event, which would otherwise mask it every time.
+- **A mic `trackended` only logged.** A track that ends never revives, so it now warns at once.
+- **The level timer had no try/catch and silently died at t=150 s**, taking every detector with
+  it — `setInterval` keeps its schedule after a callback throws, so the timer "ran" for 46 more
+  minutes doing nothing. Now wrapped, plus an `AudioContext` `onstatechange` watchdog (a
+  suspended context freezes the graph *and* the MediaRecorder feed), plus `capture-alive` — an
+  **unconditional** per-tick pulse to main. `capture-audio` only fires when there IS sound, so
+  main could never distinguish a quiet meeting from a dead monitor; its absence now alarms after
+  `MONITOR_DEAD_MS`. That is **45 s, calibrated, not guessed**: across 23 real recordings the
+  worst healthy start→first-event gap was **15.9 s**, so the obvious 15 s would false-alarm.
+
+Verified by replaying every real `capture.jsonl` through the new detectors: **29 healthy
+recordings clean, 0 false positives.**
+
+## Meeting audio follows the Windows DEFAULT output — and that is the bug (v2.3.3)
+
+**Chromium loopback can only ever capture the Windows default render endpoint.** Electron 37's
+`setDisplayMediaRequestHandler` accepts `'loopback' | 'loopbackWithMute' | WebFrameMain` and
+nothing else (`electron.d.ts`) — there is **no API to loopback a named device**, and a loopback
+track carries no endpoint identity (`getSettings()` has none), which is why `devices.js` can only
+*infer* the endpoint from the current default.
+
+Connecting an external display makes **its** speakers the Windows default. Measured live
+2026-09-22: default was `E24-30 (HD Audio Driver for Display Audio)`, the meeting played out of
+`Speakers (Realtek)`, `sysRms` was **exactly 0 for the whole 18 minutes**, and six recovery
+attempts all re-bound to the same silent monitor. Same root cause as 2026-09-17, where the default
+flipped `Headphones → E24-30` mid-meeting. **Re-acquiring `getDisplayMedia` can never fix this** —
+it returns the default, which is the problem.
+
+So the only lever is to change the Windows default itself, which needs native code. `--audio` is a
+second mode on the **existing** agent binary (no new module, no packaging change — `extraResource`
+already ships `agents/dist`):
+- `--audio list` → every render endpoint with `isDefault` and a **peak level** read via
+  `IAudioMeterInformation`, which does **not** open a capture stream. This is the primitive
+  Electron cannot provide: it answers "which device has sound *right now*" for **every** endpoint,
+  while the renderer can only ever measure the one it is bound to. Measured on real hardware:
+  silence `0.000000`, ordinary speech `0.557926`; `LIVE_PEAK = 0.01` sits in that gap. It is a
+  **peak**, not an RMS — do not compare it against `ALIVE_RMS`.
+  Sampled 10× over ~1 s and kept as a max, because an instantaneous meter reads 0 between words.
+- `--audio set <id>` → `IPolicyConfig::SetDefaultEndpoint` for all three roles (eConsole drives
+  loopback; setting only it leaves media/calls split).
+
+`--audio` **must be routed before the UIA poll loop and must `Environment.Exit`** — it is one-shot
+and does no UIA work.
+
+**Escalation, in `recoverSystemAudio`.** Two plain re-acquires (covers a genuine endpoint glitch),
+then ask main to switch the default; the existing `ondevicechange` listener fires and the normal
+recovery path re-binds. **No new splice logic** — `MediaRecorder` is bound to
+`stereoDest`/`monoDest`, not to `sysSrc`, so the recording never stops.
+- The switch is **one-shot per dead stretch** (`endpointSwitchTried`), reset only on success.
+- `devicechange` gets a **shorter cooldown, not an exemption**. Exempting it is unbounded:
+  Windows fires it repeatedly and a switch onto another silent device re-triggers it. Simulated
+  over 30 min of a permanently dead endpoint, the exempt version ran **1763 probes vs 90** — at 4 s
+  each that is continuous probing competing with the capture it is repairing. Regression-tested.
+- **Nothing live to switch to → select nothing.** `chooseLiveEndpoint` never returns the current
+  default (if it were live we would already be recording it) and never picks below `LIVE_PEAK`, so
+  a genuinely silent meeting cannot cause the app to reassign the user's audio device.
+
+**The switch is deliberately NOT restored** when recording ends (user's call — a restore that only
+runs on a clean stop is a promise the crash path breaks). It is a system-wide change the user did
+not make, so the popup names the device and says it stays selected.
+
+**Everything degrades to today's behaviour**: missing binary, an older binary without `--audio`, or
+a Windows build where `IPolicyConfig` has gone (it is **undocumented** — stable since Win 7 and
+what nircmd/SoundVolumeView use, but not contractual) all return null/`{ok:false}` and fall back to
+warning the user. `agentBinaryPath()` is wrapped in try/catch because it runs **on the recovery
+path during a live recording**. **macOS keeps notify-only** — no equivalent API without a virtual
+audio device.
+
+**The failure message must name the device.** "Meeting audio not captured" tells the user nothing;
+`no-live-endpoint` now reads *"Windows is set to “X” but nothing is playing there."*
+
 **UX: warn, keep recording, never auto-stop.** A false positive that kills a real meeting is
 unrecoverable; a false negative costs one dismissable popup (`capture-degraded`). Mic failure is
 fatal (ch0 anchors §7); system-audio failure is not — a mic-only recording still transcribes.

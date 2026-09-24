@@ -15,6 +15,7 @@ const media = require('./media');
 const normalize = require('./normalize');
 const detector = require('./detector');
 const { startNameAgent } = require('./agents');
+const audioEndpoints = require('./audioEndpoints');
 const { transcribeRecording } = require('./transcribe');
 const { alignSpeakers } = require('./align');
 const { mergeRoster } = require('./roster');
@@ -56,6 +57,19 @@ let pendingStop = null; // { timer, watch } while the ending countdown runs
 const AUDIO_ACTIVE_MS = 20000;
 const STOP_COUNTDOWN_MS = 15000;
 const isAudioActive = () => !!rec && (Date.now() - lastFarEndSoundTs < AUDIO_ACTIVE_MS);
+
+// Health-monitor watchdog. lastTickTs is stamped by every 'capture-alive'; if those stop while
+// a recording is live, the renderer's monitor (and therefore every capture detector) is gone.
+let lastTickTs = 0;
+let monitorWatchdog = null;
+let monitorDeadReported = false;
+// 45s, not 15s. Measured across 23 real recordings on this machine, the gap between
+// startRecording() and the renderer's first capture event reached 15.9s on a cold start
+// (window creation + getUserMedia + the 400ms profile-settle + getDisplayMedia). A 15s
+// threshold therefore false-alarms on a slow but perfectly healthy start, and a warning the
+// user learns to dismiss is worse than no warning. 45s is ~3x the measured worst case and
+// still catches a dead monitor inside the first minute.
+const MONITOR_DEAD_MS = 45000;
 const PLATFORM_LABELS = { 'google-meet': 'Google Meet', zoom: 'Zoom', teams: 'Microsoft Teams' };
 
 // ---------- helpers ----------
@@ -185,6 +199,10 @@ function notify(info) {
           : info.sysDead ? 'Meeting audio isn’t being captured — still recording.'
             : 'Your microphone isn’t being captured — still recording.';
     }
+    else if (info.kind === 'capture-endpoint-switched') {
+      title = 'Meeting audio recovered';
+      body = `Switched Windows output to ${info.deviceName} — still recording.`;
+    }
     else { title = 'Meeting detected'; body = `${platform} — open Your Call AI to start recording.`; }
     const n = new Notification({ title, body });
     n.on('click', () => { if (mainWindow && !mainWindow.isDestroyed()) { mainWindow.show(); mainWindow.focus(); } });
@@ -309,6 +327,10 @@ async function startRecording(source, platform = '', title = '') {
   hidePopup();
   emitStatus('recording', platform ? `Recording ${platform}` : 'Recording huddle');
   checkDiskSpace();
+  // Armed here rather than on the first tick: if the renderer never starts its monitor at all
+  // (window failed to load, capture threw during setup), that is exactly the silent failure
+  // this is meant to catch, and waiting for a first tick would mean waiting forever.
+  startMonitorWatchdog();
   return { ok: true, recordingId: id };
 }
 
@@ -361,8 +383,32 @@ function buildPlaceholderMeeting(id, meta, failedMessage) {
   };
 }
 
+// Starts the health-monitor watchdog. Separate from the capture detectors on purpose: those
+// all live in the renderer, so they cannot report their own death. This runs in main.
+function startMonitorWatchdog() {
+  clearInterval(monitorWatchdog);
+  lastTickTs = Date.now();
+  monitorDeadReported = false;
+  monitorWatchdog = setInterval(() => {
+    if (!rec || monitorDeadReported) return;
+    if (Date.now() - lastTickTs < MONITOR_DEAD_MS) return;
+    monitorDeadReported = true; // once per recording; the user gets one popup, not one a second
+    const detail = 'Capture health monitor stopped — recording may be incomplete';
+    appendCaptureDiag({ type: 'monitor-dead', sinceMs: Date.now() - lastTickTs });
+    patchMeta(rec.dir, { captureHealth: { monitorDead: true, at: nowIso() } }).catch(() => {});
+    emitStatus('recording', `⚠ ${detail}`);
+    showPopup({ kind: 'capture-degraded', micDead: true, sysDead: true, reason: 'monitor-dead',
+      platform: rec.meta.platform, title: rec.meta.title });
+  }, 5000);
+}
+function stopMonitorWatchdog() {
+  clearInterval(monitorWatchdog);
+  monitorWatchdog = null;
+}
+
 async function finalizeRecording(failedMessage = null) {
   if (!rec) return null;
+  stopMonitorWatchdog();
   const current = rec;
   rec = null;
   current.agent?.stop();
@@ -444,6 +490,13 @@ ipcMain.on('capture-error', async (e, message) => {
 });
 // Recorder liveness heartbeat: meeting audio is flowing → keeps the detector's (A) signal alive.
 ipcMain.on('capture-audio', (e, active) => { if (active) lastFarEndSoundTs = Date.now(); });
+
+// Watchdog for the health monitor ITSELF, not for the audio it measures. On 2026-09-17 the
+// renderer's level timer stopped at t=150s and the app recorded 46 more minutes having lost
+// every detector at once — main had no way to know, because 'capture-audio' only arrives when
+// there IS sound, so silence and death look identical from here. 'capture-alive' arrives every
+// tick unconditionally, so its ABSENCE is unambiguous evidence the monitor died.
+ipcMain.on('capture-alive', () => { lastTickTs = Date.now(); });
 // 30s of no speech → ask the user whether to stop (ignored = keep recording).
 ipcMain.on('capture-silence', () => {
   if (!rec || pendingStop) return; // don't overlay the "ending" countdown
@@ -452,11 +505,12 @@ ipcMain.on('capture-silence', () => {
 
 // Capture diagnostics. Mirrors speakers.jsonl: append-only JSONL next to the recording, so a
 // "it recorded nothing" report can be diagnosed after the fact instead of guessed at.
-ipcMain.on('capture-diag', (e, evt) => {
+function appendCaptureDiag(evt) {
   if (!rec) return;
   try { rec.captureStream.write(JSON.stringify({ ts: Date.now(), ...evt }) + '\n'); }
   catch (err) { console.error('[capture] diag write failed:', err.message); }
-});
+}
+ipcMain.on('capture-diag', (e, evt) => appendCaptureDiag(evt));
 
 // A stream is dead but capture is NOT — never finalize here. Warn and keep recording: a
 // half-captured meeting still transcribes (mic-only lands on ch0), a stopped one is gone.
@@ -487,6 +541,70 @@ ipcMain.on('capture-recovered', () => {
   patchMeta(rec.dir, { captureHealth: { recovered: true, at: nowIso() } }).catch(() => {});
   hidePopup();
   emitStatus('recording', rec.meta.platform ? `Recording ${rec.meta.platform}` : 'Recording huddle');
+});
+
+// Repeated recovery failure = the Windows default output is an endpoint nobody plays to, and the
+// renderer cannot do anything about it: Chromium's loopback follows the default by construction
+// (Electron exposes no way to loopback a named device). So main asks the native agent which
+// endpoint is actually carrying audio and makes THAT the default. The renderer's existing
+// ondevicechange listener then fires and re-binds through the normal recovery path — no new
+// splice logic, and the recording never stops.
+//
+// Per the user's decision this is NOT restored when the recording ends: the switch stands, so the
+// notification below is the only signal it happened and must name the device.
+ipcMain.on('capture-switch-endpoint', async (e, info) => {
+  if (!rec || pendingStop) return;
+  const reason = (info && info.reason) || 'unknown';
+
+  if (!audioEndpoints.isAvailable()) {
+    appendCaptureDiag({ type: 'endpoint-switch-skipped', reason, why: 'agent-unavailable' });
+    return; // the capture-degraded warning already on screen stays; nothing more we can do
+  }
+
+  let target = null;
+  let current = null;
+  try {
+    [target, current] = await Promise.all([
+      audioEndpoints.pickLiveEndpoint(),
+      audioEndpoints.currentDefault(),
+    ]);
+  } catch (err) {
+    appendCaptureDiag({ type: 'endpoint-switch-failed', reason, error: err.message });
+    return;
+  }
+
+  if (!target) {
+    // Nothing else is playing either. That is the honest "the meeting really is silent" answer —
+    // but say WHICH device we are listening to, because "Meeting audio not captured" alone tells
+    // the user nothing they can act on.
+    appendCaptureDiag({ type: 'endpoint-switch-none', reason, currentDefault: current && current.name });
+    if (current) {
+      showPopup({
+        kind: 'capture-degraded', micDead: false, sysDead: true, reason: 'no-live-endpoint',
+        deviceName: current.name, platform: rec.meta.platform, title: rec.meta.title,
+      });
+    }
+    return;
+  }
+
+  const res = await audioEndpoints.setDefaultEndpoint(target.id);
+  if (!res || !res.ok) {
+    appendCaptureDiag({ type: 'endpoint-switch-failed', reason, code: res && res.code, error: res && res.error });
+    return;
+  }
+
+  appendCaptureDiag({
+    type: 'endpoint-switched', reason,
+    from: current && current.name, to: target.name, peak: target.peak,
+  });
+  patchMeta(rec.dir, { captureHealth: { endpointSwitched: { to: target.name, at: nowIso() } } }).catch(() => {});
+  emitStatus('recording', `Switched meeting audio to ${target.name}`);
+  showPopup({
+    kind: 'capture-endpoint-switched',
+    deviceName: target.name,
+    platform: rec.meta.platform,
+    title: rec.meta.title,
+  });
 });
 
 // ---------- post-recording pipeline (§11) ----------
@@ -988,8 +1106,23 @@ if (!gotLock) {
       emitProgress: (id, pct) => emitProgress(id, 'normalizing', `${pct}%`),
       // The URL is derived at read time, so nothing needs repointing — but a meeting the user
       // has open right now will not re-render on its own.
-      onNormalized: (id) => {
-        store.getMeeting(id).then((m) => {
+      onNormalized: (id, info) => {
+        const patch = {};
+        // Persist truncation on the meeting record so it survives a restart and syncs like any
+        // other field. Only set when partial: writing `capture: null` on every healthy
+        // recording would be noise, and upsertMeeting shallow-merges.
+        if (info && info.partial) {
+          patch.capture = {
+            partial: true,
+            capturedMs: info.outMs,
+            expectedMs: info.wallMs,
+            at: nowIso(),
+          };
+        }
+        // updateMeeting(id, patch), not upsertMeeting(meeting): upsert takes a whole record
+        // keyed on recordingId and would need the existing one read first.
+        const done = Object.keys(patch).length ? store.updateMeeting(id, patch) : Promise.resolve();
+        done.catch(() => {}).then(() => store.getMeeting(id)).then((m) => {
           if (!m || !mainWindow || mainWindow.isDestroyed()) return;
           mainWindow.webContents.send('meeting-updated', {
             ...m,

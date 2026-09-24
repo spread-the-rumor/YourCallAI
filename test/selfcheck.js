@@ -315,7 +315,7 @@ assert.ok(a2.votes['1:0'].confidence > 0.6, 'winning share expressed as a confid
 // --- audioHealth.js: "dead capture" must be distinguishable from "quiet meeting" (the
 // earphones bug). The whole fix rests on the gap between a live noise floor and digital zero.
 const { computeRms, createHealth, describeMediaError, looksBluetooth,
-  DEAD_RMS, SILENCE_RMS } = require('../src/recorder/audioHealth');
+  DEAD_RMS, SILENCE_RMS, ALIVE_RMS, TOTAL_DEATH_MS } = require('../src/recorder/audioHealth');
 
 assert.strictEqual(computeRms(new Float32Array(2048)), 0, 'memset-zero buffer → exactly 0');
 const quietBuf = Float32Array.from({ length: 2048 }, (_, i) => 3e-4 * Math.sin(i));
@@ -402,6 +402,177 @@ const hOnce = createHealth(deadArgs);
 let deaths = 0;
 for (let t = 0; t <= 40000; t += 1000) { const e = hOnce.tick(t, 4e-4, 0); if (e && e.type === 'system-dead') deaths++; }
 assert.strictEqual(deaths, 1, 'system-dead fires once, not every tick');
+
+// --- The 2026-09-17 regression: BOTH channels dead, which system-dead can never see ---------
+// Real capture (rec_1789659499976_0sap): a wired-headset/external-display device swap killed
+// the loopback AND ended the mic track at t=154s. micRms went to exactly 0, sysRms to 1e-5,
+// and the app recorded 45 more minutes of nothing, emitting no event of any kind, then saved
+// status:'complete'. system-dead is mic-gated by design, so it was structurally blind here.
+const totalArgs = { startedAt: 0, warmupMs: 1000, graceMs: 0, deathMs: 12000, totalDeathMs: 45000 };
+
+const hAll = createHealth(totalArgs);
+let evAll = null;
+for (let t = 0; t <= 60000; t += 1000) { const e = hAll.tick(t, 0, 1e-5); if (e && e.type === 'all-dead') evAll = e; }
+assert.ok(evAll, 'both channels at digital zero → all-dead (the case system-dead cannot reach)');
+
+// The exact shape that produced silence before: system-dead must STILL not fire here (no mic
+// signal to gate it), proving all-dead is the only thing standing between this and 45 lost min.
+const hAllSys = createHealth(totalArgs);
+let sawSysDead = false;
+for (let t = 0; t <= 60000; t += 1000) { const e = hAllSys.tick(t, 0, 0); if (e && e.type === 'system-dead') sawSysDead = true; }
+assert.strictEqual(sawSysDead, false, 'system-dead stays mic-gated — all-dead is what covers this');
+
+// A briefly-silent room must NOT be called dead. Everyone muted with nothing playing is real
+// and common; it is why TOTAL_DEATH_MS (45s) is far longer than SYSTEM_DEATH_MS (12s).
+const hPause = createHealth(totalArgs);
+let evPause = null;
+for (let t = 0; t <= 30000; t += 1000) { const e = hPause.tick(t, 0, 0); if (e && e.type === 'all-dead') evPause = e; }
+assert.strictEqual(evPause, null, '30s of quiet is a pause, not a dead capture');
+
+// Recovery of either channel clears the latch.
+const hRevive = createHealth(totalArgs);
+let evRevive = null;
+for (let t = 0; t <= 30000; t += 1000) hRevive.tick(t, 0, 0);
+for (let t = 31000; t <= 90000; t += 1000) { const e = hRevive.tick(t, 4e-4, 0); if (e && e.type === 'all-dead') evRevive = e; }
+assert.strictEqual(evRevive, null, 'audio returning on either channel re-arms the all-dead latch');
+
+// Fires once, not every tick (same contract as system-dead).
+const hAllOnce = createHealth(totalArgs);
+let allDeaths = 0;
+for (let t = 0; t <= 120000; t += 1000) { const e = hAllOnce.tick(t, 0, 0); if (e && e.type === 'all-dead') allDeaths++; }
+assert.strictEqual(allDeaths, 1, 'all-dead fires once, not every tick');
+
+// rearm() must clear the death latches, or a swap would inherit the old stream's verdict.
+const hRearmDeath = createHealth(totalArgs);
+for (let t = 0; t <= 60000; t += 1000) hRearmDeath.tick(t, 0, 0); // latch all-dead
+hRearmDeath.rearm(60000);
+let evAfterRearm = null;
+for (let t = 61000; t <= 130000; t += 1000) { const e = hRearmDeath.tick(t, 0, 0); if (e && e.type === 'all-dead') evAfterRearm = e; }
+assert.ok(evAfterRearm, 'rearm() clears the all-dead latch so a dead REPLACEMENT is still caught');
+
+// --- The probe threshold: 69% of "alive" verdicts were coin flips --------------------------
+// Every maxRms below is a REAL value from capture.jsonl across the 7 captured meetings. The old
+// gate was DEAD_RMS (1e-5) and it ran straight through the middle of a single cluster: the
+// "dead" readings (8.9e-6..9.8e-6) and the "alive" ones (1.0e-5..2.0e-5) are the same
+// distribution. Do not "tidy" these numbers — they are the evidence the threshold was wrong.
+const PROBED_DEAD = [0.000008972737472267878, 0.00000929761040688235, 0.000009412265628106857,
+  0.000009613464901080184, 0.000009793173556828217];
+const PROBED_CALLED_ALIVE = [0.00001018257123319357, 0.000010738029319514931,
+  0.000011191974469023798, 0.00001463081862954751, 0.000017898130912077267];
+const PROBED_REAL_AUDIO = [0.018618555930159375, 0.03299436015520964, 0.03645773664479114,
+  0.0997792014183612];
+
+for (const v of PROBED_DEAD) {
+  assert.ok(v < ALIVE_RMS, `${v} (probed dead) is below ALIVE_RMS`);
+}
+// The heart of the fix: these were all accepted as live replacements and swapped into the
+// graph. Under ALIVE_RMS every one is correctly rejected, so a working source is never
+// disconnected in favour of a reading that is indistinguishable from silence.
+for (const v of PROBED_CALLED_ALIVE) {
+  assert.ok(v > DEAD_RMS, `${v} passed the OLD gate — that is why this fixture exists`);
+  assert.ok(v < ALIVE_RMS, `${v} must NOT be accepted as proof of life under ALIVE_RMS`);
+}
+for (const v of PROBED_REAL_AUDIO) {
+  assert.ok(v >= ALIVE_RMS, `${v} is real audio and must still be accepted`);
+}
+// The separation that makes the new gate meaningful: real audio is ~1000x the ambiguous band.
+assert.ok(Math.min(...PROBED_REAL_AUDIO) / Math.max(...PROBED_CALLED_ALIVE) > 100,
+  'real audio and the ambiguous band differ by orders of magnitude — ALIVE_RMS sits in the gap');
+assert.ok(ALIVE_RMS > DEAD_RMS, 'the accept bar is strictly above the dead floor');
+
+// --- audioEndpoints: choosing where to move the Windows default ----------------------------
+// Context: Chromium loopback can ONLY capture the Windows DEFAULT output (Electron exposes no
+// named-device option). Measured live 2026-09-22, the default was the external monitor while the
+// meeting played out of the laptop speakers, so six recovery attempts all re-bound to silence and
+// the far end was never recorded. Switching the default is the only lever, so picking the RIGHT
+// target is the whole feature.
+const { chooseLiveEndpoint, LIVE_PEAK } = require('../src/audioEndpoints');
+
+// The real 2026-09-22 shape: Windows default is the monitor, the sound is on the speakers.
+const REAL_CASE = [
+  { id: 'monitor', name: 'E24-30 (HD Audio Driver for Display Audio)', isDefault: true, peak: 0 },
+  { id: 'speakers', name: 'Speakers (Realtek(R) Audio)', isDefault: false, peak: 0.557926 },
+];
+assert.strictEqual(chooseLiveEndpoint(REAL_CASE).id, 'speakers',
+  'picks the endpoint that actually carries audio, not the Windows default');
+
+// Never pick the current default: if it were live we would already be recording it, so selecting
+// it would "switch" to the same silent device and the escalation would have achieved nothing.
+assert.strictEqual(chooseLiveEndpoint([
+  { id: 'a', name: 'A', isDefault: true, peak: 0.9 },
+  { id: 'b', name: 'B', isDefault: false, peak: 0 },
+]), null, 'never selects the current default, even when it is the loud one');
+
+// Genuinely silent machine: nothing to switch to. Must be null, NOT a coin-flip pick — this is
+// what stops the app from reassigning the user's audio device during a quiet meeting.
+assert.strictEqual(chooseLiveEndpoint([
+  { id: 'a', name: 'A', isDefault: true, peak: 0 },
+  { id: 'b', name: 'B', isDefault: false, peak: 0 },
+  { id: 'c', name: 'C', isDefault: false, peak: 0.0001 }, // noise floor, below LIVE_PEAK
+]), null, 'silence everywhere selects nothing rather than guessing');
+
+// Loudest wins when several are live.
+assert.strictEqual(chooseLiveEndpoint([
+  { id: 'a', name: 'A', isDefault: true, peak: 0 },
+  { id: 'b', name: 'B', isDefault: false, peak: 0.05 },
+  { id: 'c', name: 'C', isDefault: false, peak: 0.40 },
+]).id, 'c', 'picks the loudest live endpoint');
+
+// A single endpoint cannot be a switch target — there is nowhere else to go.
+assert.strictEqual(chooseLiveEndpoint([
+  { id: 'only', name: 'Speakers', isDefault: true, peak: 0.5 },
+]), null, 'one endpoint means nothing to switch to');
+
+// Degradation: a missing/old binary yields null from listEndpoints, and that must not throw.
+assert.strictEqual(chooseLiveEndpoint(null), null, 'null endpoint list degrades quietly');
+assert.strictEqual(chooseLiveEndpoint([]), null, 'empty endpoint list degrades quietly');
+// Malformed rows must not crash the picker (a driver can report a device with no peak).
+assert.strictEqual(chooseLiveEndpoint([
+  { id: 'a', isDefault: true, peak: 0 },
+  { id: 'b', isDefault: false },
+  null,
+]), null, 'rows without a usable peak are ignored, not crashed on');
+
+// The threshold sits between digital silence and audible playback — both measured on real
+// hardware via `YourCallAgent.exe --audio list` (silence 0.000000, speech 0.557926).
+assert.ok(LIVE_PEAK > 0 && LIVE_PEAK < 0.5,
+  'LIVE_PEAK sits between measured silence (0.0) and measured speech (0.56)');
+
+// --- Recovery escalation must be BOUNDED and the endpoint switch must be ONE-SHOT -----------
+// Mirrors the state machine in recorder.js recoverSystemAudio (softFailures / endpointSwitchTried
+// / the two cooldowns). Every recovery attempt costs a real 4s probe, so an unbounded loop does
+// not just waste CPU during a meeting — it competes with the capture it is trying to repair.
+function simulateRecovery({ deviceChangeStorm, minutes = 30 }) {
+  const SOFT_ATTEMPTS = 2, RECOVER_COOLDOWN_MS = 20000, DEVICE_COOLDOWN_MS = 6000;
+  let softFailures = 0, lastAttemptTs = 0, endpointSwitchTried = false;
+  let probes = 0, switches = 0, t = 0;
+  const attempt = (reason) => {
+    const cooldown = reason === 'devicechange' ? DEVICE_COOLDOWN_MS : RECOVER_COOLDOWN_MS;
+    if (t - lastAttemptTs < cooldown) return;
+    lastAttemptTs = t;
+    probes++;
+    // every attempt fails: the endpoint is permanently dead
+    if (++softFailures >= SOFT_ATTEMPTS && !endpointSwitchTried) { endpointSwitchTried = true; switches++; }
+  };
+  for (t = 0; t <= minutes * 60000; t += 1000) {
+    attempt('system-dead');
+    // Worst case: the switch landed on another silent device, so Windows keeps firing devicechange.
+    if (deviceChangeStorm && switches > 0) attempt('devicechange');
+  }
+  return { probes, switches };
+}
+
+const steady = simulateRecovery({ deviceChangeStorm: false });
+assert.strictEqual(steady.switches, 1, 'endpoint switch is one-shot, not once per failed probe');
+assert.ok(steady.probes <= 100, `a permanently dead endpoint stays bounded (got ${steady.probes} probes/30min)`);
+
+// The regression this guards: 'devicechange' was originally EXEMPT from the cooldown rather than
+// given a shorter one. Simulated over the same 30 minutes that ran 1763 probes — ~59/min, each
+// costing a 4s probe, i.e. permanently probing.
+const storm = simulateRecovery({ deviceChangeStorm: true });
+assert.strictEqual(storm.switches, 1, 'a devicechange storm still switches only once');
+assert.ok(storm.probes < 400,
+  `devicechange must be rate-limited, not exempt (got ${storm.probes} probes/30min; the exempt version ran 1763)`);
 
 assert.ok(/in use by another app/.test(describeMediaError('microphone', { name: 'NotReadableError', message: 'x' })),
   'NotReadableError explains a busy/failed device');

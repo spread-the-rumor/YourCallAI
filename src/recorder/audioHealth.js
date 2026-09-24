@@ -12,7 +12,21 @@
 // roughly 1e-4..1e-3 RMS. A BROKEN path delivers memset-zero buffers: bit-exactly 0.0, forever.
 // SILENCE_RMS (0.0025) sits ABOVE the live noise floor, which is exactly why it can only say
 // "quiet" and can never say "dead". DEAD_RMS sits below it, in the gap.
-const DEAD_RMS = 1e-5;          // ~ -100 dBFS
+const DEAD_RMS = 1e-5;          // ~ -100 dBFS. Kept for the WARM-UP verdict only (see below).
+
+// Measured across 51 real recovery probes from 7 captured meetings (Sept 2026, wired headset +
+// external display). The probe results did NOT form two clusters around DEAD_RMS — they formed
+// ONE cluster straddling it: 15 probes at 8.9e-6..9.8e-6 (called dead) and 25 at 1.0e-5..2.0e-5
+// (called ALIVE), i.e. 69% of every "alive" verdict landed in a band that is physically
+// indistinguishable from the dead one. Only 4 probes of 51 ever saw real audio (>= 1e-3).
+//
+// So DEAD_RMS is the wrong gate for ACCEPTING a replacement stream. An idle-but-functional
+// endpoint and a genuinely dead one both sit at ~1e-5; what separates a stream worth swapping
+// in is real signal, an order of magnitude up. ALIVE_RMS is that bar. Consequence, and it is
+// deliberate: a candidate that reads 1.2e-5 is no longer accepted as proof of life, so we stop
+// swapping a working graph for a coin flip.
+const ALIVE_RMS = 1e-4;         // ~ -80 dBFS: the bottom of a real noise floor, 10x above the
+                                // ambiguous band. Used to ACCEPT a recovery candidate.
 const WARMUP_MS = 8000;         // 3s risks a false alarm mid Bluetooth HFP handshake (1-3s);
                                 // 30s loses half a meeting before we say anything.
 const WARMUP_GRACE_MS = 1500;   // WASAPI/AudioContext genuinely emit zeros while ramping up.
@@ -22,6 +36,14 @@ const SILENCE_MS = 30000;       // no sound this long → "still recording?" pop
 // not the room. Measured: a healthy loopback throws isolated zero samples that recover next
 // tick, so this must be sustained; 12s also outlasts a Bluetooth profile switch.
 const SYSTEM_DEATH_MS = 12000;
+// BOTH channels at digital zero this long. This is the case the mic-gated detector above can
+// structurally never see: it requires the mic to carry signal, so "everything is dead" — the
+// single worst outcome — was the one state that suppressed the alarm forever. Measured on the
+// 2026-09-17 meeting: mic and system both hit 0 at t=154s and stayed there for 45 minutes with
+// no event of any kind. Longer than SYSTEM_DEATH_MS because a real room CAN be bit-exactly
+// quiet briefly (everyone muted, nothing playing); 45s of literal digital zero cannot happen
+// on a live path, which always carries a noise floor.
+const TOTAL_DEATH_MS = 45000;
 
 function computeRms(buf) {
   let sum = 0;
@@ -40,6 +62,7 @@ function createHealth(opts = {}) {
     silenceRms = SILENCE_RMS,
     silenceMs = SILENCE_MS,
     deathMs = SYSTEM_DEATH_MS,
+    totalDeathMs = TOTAL_DEATH_MS,
   } = opts;
 
   let micMax = 0;
@@ -52,6 +75,8 @@ function createHealth(opts = {}) {
   let silenceFired = false;
   let sysDeadSince = 0;
   let sysDeathReported = false;
+  let allDeadSince = 0;
+  let allDeathReported = false;
 
   return {
     // Re-run the warm-up verdict over a fresh window. Used when the default output device
@@ -64,6 +89,12 @@ function createHealth(opts = {}) {
       sysAbsent = false;
       warmupDone = false;
       warmupFrom = now;
+      // Clear the death latches as well. rearm() means "we just changed the graph, judge it
+      // fresh" — leaving a latch set would suppress the alarm on the NEW stream.
+      sysDeadSince = 0;
+      sysDeathReported = false;
+      allDeadSince = 0;
+      allDeathReported = false;
     },
 
     tick(now, micRms, sysRms) {
@@ -89,6 +120,24 @@ function createHealth(opts = {}) {
         }
       }
 
+      // TOTAL death: every channel at digital zero. Checked FIRST and deliberately ungated —
+      // the system-dead detector below requires mic signal, which makes it blind to exactly
+      // this case. A null RMS (track absent) counts as dead, not as "no reading".
+      // <=, not <: the 2026-09-17 capture logged sysRms exactly 0.00001. A reading sitting ON
+      // the dead floor is not evidence of life, and a strict < let that exact case through.
+      const micFlat = micRms == null || micRms <= deadRms;
+      const sysFlat = sysRms == null || sysRms <= deadRms;
+      if (warmupDone && micFlat && sysFlat) {
+        if (!allDeadSince) allDeadSince = now;
+        if (!allDeathReported && now - allDeadSince >= totalDeathMs) {
+          allDeathReported = true;
+          return { type: 'all-dead', since: allDeadSince };
+        }
+      } else if (!micFlat || !sysFlat) {
+        allDeadSince = 0;
+        allDeathReported = false;
+      }
+
       // Sustained-death detector for the system stream, and the reason it is SUSTAINED:
       // measured on real hardware, a healthy loopback emits an isolated ~0.000006 sample
       // mid-playback and recovers on the very next tick. One dead reading proves nothing.
@@ -106,7 +155,10 @@ function createHealth(opts = {}) {
         sysDeathReported = false;
       }
 
-      // Existing 30s silence UX, now fed by both streams rather than their sum.
+      // Existing 30s silence UX, now fed by both streams rather than their sum. Evaluated
+      // LAST on purpose: 'silence' is a soft "still recording?" nudge, while 'all-dead' means
+      // nothing is reaching disk. Silence fires at 30s and all-dead at 45s, so if silence
+      // returned first it would mask the real failure on every single dead capture.
       const loud = Math.max(micRms == null ? 0 : micRms, sysRms == null ? 0 : sysRms) >= silenceRms;
       if (loud) {
         lastSoundTs = now;
@@ -155,4 +207,6 @@ module.exports = {
   SILENCE_RMS,
   SILENCE_MS,
   SYSTEM_DEATH_MS,
+  TOTAL_DEATH_MS,
+  ALIVE_RMS,
 };

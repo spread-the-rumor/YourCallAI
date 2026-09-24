@@ -48,6 +48,11 @@ internal static class Agent
     [STAThread]
     private static void Main(string[] args)
     {
+        // --audio must be routed FIRST and must Environment.Exit: it is a one-shot query/command
+        // that prints a single JSON line, and it must never fall through into the UIA poll loop
+        // below (which never returns). It also does no UIA work at all, so it is unaffected by
+        // the [STAThread]/CacheRequest constraint that governs the rest of this file.
+        if (args.Contains("--audio")) { Environment.Exit(AudioEndpoints.Run(args)); return; }
         if (args.Contains("--dump")) { Dump(); return; }
         if (args.Contains("--windows")) { DumpWindows(); return; }
         Console.Error.WriteLine($"[agent] started, heuristics={HeuristicsVersion}");

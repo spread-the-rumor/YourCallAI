@@ -2,7 +2,7 @@
 // "it captured nothing" report was unfalsifiable after the fact. This snapshot is written to
 // capture.jsonl next to the recording.
 
-const { looksBluetooth } = require('./audioHealth');
+const { looksBluetooth, ALIVE_RMS } = require('./audioHealth');
 
 const slim = (d) => ({ deviceId: d.deviceId, groupId: d.groupId, label: d.label, kind: d.kind });
 const safeSettings = (t) => { try { return t.getSettings(); } catch { return null; } };
@@ -53,8 +53,16 @@ function defaultOutputKey(snapshot) {
 // Prove a candidate loopback stream is actually alive BEFORE committing to it. Re-acquiring
 // can hand back a stream bound to the same dead endpoint, so we measure first and only swap on
 // evidence — never disconnect a working source for an unverified replacement.
+//
+// The bar is ALIVE_RMS (1e-4), NOT DEAD_RMS (1e-5), and that change is the core fix. Measured
+// over 51 real probes: 69% of "alive" verdicts sat in 1.0e-5..2.0e-5, the same band as the
+// readings we called dead — the threshold was inside the noise, so the verdict was decided by
+// jitter. A probe that cannot tell alive from dead is worse than no probe: it launders a
+// coin flip into recorded evidence ("recover-ok, maxRms: 0.0000102") and then swaps a working
+// source out for a dead one, which is precisely how the 2026-09-17 meeting lost 45 minutes.
+//
 // Resolves { alive, maxRms }. Never throws.
-async function probeStreamAlive(ctx, stream, { ms = 2000, deadRms = 1e-5 } = {}) {
+async function probeStreamAlive(ctx, stream, { ms = 2000, aliveRms = ALIVE_RMS } = {}) {
   const track = stream && stream.getAudioTracks()[0];
   if (!track) return { alive: false, maxRms: 0 };
   let src;
@@ -75,10 +83,14 @@ async function probeStreamAlive(ctx, stream, { ms = 2000, deadRms = 1e-5 } = {})
     let sum = 0;
     for (let i = 0; i < buf.length; i++) sum += buf[i] * buf[i];
     maxRms = Math.max(maxRms, Math.sqrt(sum / buf.length));
-    if (maxRms >= deadRms) break; // one live sample is proof; no need to wait out the window
+    // Early exit only on UNAMBIGUOUS signal. The old code broke as soon as it crossed 1e-5,
+    // which meant it usually stopped listening ~100ms in, on a noise-floor reading, and never
+    // gave real audio a chance to appear. Waiting out the window is what makes a quiet-but-live
+    // endpoint distinguishable from a dead one.
+    if (maxRms >= aliveRms) break;
   }
   try { src.disconnect(); } catch { /* already torn down */ }
-  return { alive: maxRms >= deadRms, maxRms };
+  return { alive: maxRms >= aliveRms, maxRms };
 }
 
 module.exports = { snapshotDevices, defaultOutputKey, defaultOutputOf, probeStreamAlive };

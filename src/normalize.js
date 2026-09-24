@@ -466,7 +466,11 @@ async function runJob(job) {
 
   // The URL is derived at read time, so nothing needs patching — but a meeting the user has open
   // right now won't re-render on its own.
-  if (cfg.onNormalized) cfg.onNormalized(id);
+  // Pass the truncation facts on. `partial` was previously written to normalize.json and the
+  // log and nowhere else — so the app KNEW a 48-minute meeting had produced 2.5 minutes of
+  // video and still presented it as a normal recording. Silent correct detection is worth
+  // nothing to the user.
+  if (cfg.onNormalized) cfg.onNormalized(id, { partial, outMs: Math.round(result.outMs), wallMs });
 }
 
 module.exports = {

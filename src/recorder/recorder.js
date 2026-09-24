@@ -3,7 +3,7 @@
 // Two MediaRecorders: A = video + mono mix (playback), B = stereo opus
 // (ch0 mic / ch1 system) for Deepgram multichannel. 15s timeslice chunks → IPC → disk.
 
-const { computeRms, createHealth, describeMediaError, SILENCE_RMS, DEAD_RMS } = require('./audioHealth');
+const { computeRms, createHealth, describeMediaError, SILENCE_RMS, ALIVE_RMS } = require('./audioHealth');
 const { snapshotDevices, defaultOutputKey, probeStreamAlive } = require('./devices');
 
 let state = null; // { recA, recB, streams, ctx, pending, levelTimer }
@@ -167,9 +167,43 @@ async function startCapture({ forceVideoMime = '' } = {}) {
 
     // An audio track dying mid-recording used to be completely silent — the stream just stopped
     // producing samples and nothing said so.
+    // Declared HERE, above watchTrack, not at the recovery function below: watchTrack's
+    // onended closure reads it. It is only reachable after recA/recB start (far below), so the
+    // old ordering happened to work — but that is an argument about event timing, not a
+    // guarantee. Hoisting makes it a guarantee.
+    let recovering = false;
+    // Escalation state. The probe costs 4s and used to re-fire on every trigger with no counter
+    // and no cooldown: measured live 2026-09-22, six attempts across 18 minutes all re-bound to
+    // the same silent endpoint, because re-acquiring getDisplayMedia can only ever return the
+    // Windows DEFAULT. Retrying that harder is not a fix — the default itself has to change.
+    let softFailures = 0;          // consecutive re-acquire attempts that found nothing alive
+    let lastAttemptTs = 0;         // for the cooldown
+    let endpointSwitchTried = false; // the escalation is one-shot per dead stretch
+    const SOFT_ATTEMPTS = 2;       // plain re-acquires before escalating to an endpoint switch
+    const RECOVER_COOLDOWN_MS = 20000;
+    // Long enough to outlast the burst Windows emits for one hardware change (measured: 4 in a
+    // row on a single connect, already debounced by DEVICE_DEBOUNCE_MS) plus the 4s probe.
+    const DEVICE_COOLDOWN_MS = 6000;
+
     const watchTrack = (track, which) => {
       if (!track) return;
-      track.onended = () => window.capture.diag({ type: 'trackended', which });
+      track.onended = () => {
+        window.capture.diag({ type: 'trackended', which });
+        // This used to ONLY log. On 2026-09-17 the mic track ended 1s after a device swap and
+        // the app recorded 45 further minutes of nothing while showing a healthy recording.
+        // A track that has ended never revives — it is terminal by spec — so warn immediately
+        // rather than waiting out TOTAL_DEATH_MS.
+        //
+        // Still a WARNING, never a stop: per the capture-degraded contract, a false positive
+        // that kills a real meeting is unrecoverable, while a false negative costs one popup.
+        if (which === 'mic') {
+          window.capture.degraded({ micDead: true, sysDead: false, reason: 'mic-track-ended' });
+        } else if (which === 'system') {
+          // The system track can legitimately be retired by our own recovery swap; only warn
+          // when we are not mid-swap, or every successful recovery would raise a false alarm.
+          if (!recovering) window.capture.degraded({ micDead: false, sysDead: true, reason: 'system-track-ended' });
+        }
+      };
       track.onmute = () => window.capture.diag({ type: 'trackmuted', which, muted: true });
       track.onunmute = () => window.capture.diag({ type: 'trackmuted', which, muted: false });
     };
@@ -211,9 +245,55 @@ async function startCapture({ forceVideoMime = '' } = {}) {
       return computeRms(tap.buf);
     };
 
+    // A suspended/interrupted AudioContext is the quiet killer here. Chromium can suspend the
+    // context when the audio hardware changes underneath it (exactly what a headset unplug or a
+    // display-audio endpoint swap does). While suspended, the graph stops pulling samples:
+    // every analyser returns a frozen buffer AND the MediaStreamDestination feeding both
+    // MediaRecorders goes silent — so the recording continues, writing nothing, with the
+    // tracks still readyState:"live". Nothing in this file used to look at ctx.state at all.
+    ctx.onstatechange = () => {
+      window.capture.diag({ type: 'ctx-state', state: ctx.state });
+      if (ctx.state === 'running' || !state) return;
+      // 'closed' is terminal and only happens on our own teardown; anything else we try to undo.
+      if (ctx.state === 'closed') return;
+      ctx.resume().then(() => {
+        window.capture.diag({ type: 'ctx-resumed', state: ctx.state });
+      }).catch((err) => {
+        window.capture.diag({ type: 'ctx-resume-failed', name: err && err.name, message: err && err.message });
+        window.capture.degraded({ micDead: true, sysDead: true, reason: 'audiocontext-suspended' });
+      });
+    };
+
     const health = createHealth({ startedAt: Date.now() });
     let ticks = 0;
+
+    // The ENTIRE body is wrapped, because on 2026-09-17 this timer stopped producing output at
+    // t=150s and the recording ran 46 more minutes with no levels line, no silence event and
+    // no warning — every detector we have lives in here, so one throw blinds all of them at
+    // once. setInterval keeps its schedule after a callback throws, so the failure is
+    // completely invisible: the timer "runs" forever and does nothing.
+    let tickFailures = 0;
     const levelTimer = setInterval(() => {
+      try {
+        tickBody();
+        tickFailures = 0;
+      } catch (err) {
+        // Report once per failure run, not every second.
+        if (++tickFailures === 1) {
+          window.capture.diag({ type: 'tick-error', name: err && err.name, message: err && err.message });
+          window.capture.degraded({ micDead: true, sysDead: true, reason: 'health-monitor-failed' });
+        }
+      }
+    }, LEVEL_MS);
+
+    function tickBody() {
+      // Belt and braces: onstatechange above should catch a suspend, but if the event is ever
+      // missed the levels would read as a dead capture forever with no explanation. Checking
+      // here means the log always says WHY the numbers went flat.
+      if (ctx.state !== 'running') {
+        window.capture.diag({ type: 'ctx-not-running', state: ctx.state });
+        ctx.resume().catch(() => {});
+      }
       const micRms = rmsOf(micTap);
       const sysRms = rmsOf(sysTap);
       const evt = health.tick(Date.now(), micRms, sysRms);
@@ -221,6 +301,12 @@ async function startCapture({ forceVideoMime = '' } = {}) {
       // Heartbeat contract is unchanged — main.js isAudioActive()/pendingStop depend on it.
       const active = Math.max(micRms || 0, sysRms || 0) >= SILENCE_RMS;
       window.capture.audio(active);
+
+      // Unconditional per-tick pulse. `capture.audio(active)` above only reports WHEN THERE IS
+      // SOUND, so main cannot tell "quiet meeting" from "monitor stopped running" — the exact
+      // ambiguity that let 46 minutes pass unnoticed. This says "the health loop executed",
+      // nothing more, and main's watchdog alarms when it stops arriving.
+      window.capture.alive();
 
       if (++ticks % DIAG_LEVEL_EVERY === 0) {
         const r5 = (v) => (v == null ? null : Number(v.toFixed(5)));
@@ -232,6 +318,16 @@ async function startCapture({ forceVideoMime = '' } = {}) {
       // Loopback died without a devicechange we saw (driver re-route, endpoint reset). Same
       // recovery path; probeStreamAlive still gates the swap, so a false alarm costs nothing.
       if (evt.type === 'system-dead') { recoverSystemAudio('system-dead'); return; }
+      // Everything is flat. Structurally invisible to system-dead (which requires mic signal),
+      // so this is the only path that catches "the whole capture died". Try one recovery — the
+      // usual cause is a device swap that took both endpoints — and warn either way, because
+      // unlike a dead loopback this state means NOTHING is being recorded.
+      if (evt.type === 'all-dead') {
+        window.capture.diag({ type: 'all-dead', since: evt.since });
+        window.capture.degraded({ micDead: true, sysDead: true, reason: 'all-dead', bluetooth: btOutput });
+        recoverSystemAudio('all-dead');
+        return;
+      }
       // Warm-up verdict. Logged pass OR fail, so a healthy run leaves a baseline in capture.jsonl
       // and "no warmup line" unambiguously means the check never ran.
       window.capture.diag({ type: 'warmup', ...evt });
@@ -239,7 +335,7 @@ async function startCapture({ forceVideoMime = '' } = {}) {
       if ((evt.micDead || evt.sysDead) && !recovering) {
         window.capture.degraded({ micDead: evt.micDead, sysDead: evt.sysDead, reason: 'warmup', bluetooth: btOutput });
       }
-    }, LEVEL_MS);
+    }
 
     // WASAPI does not follow default-device changes: the loopback stays bound to whatever
     // endpoint was default when it started, so switching to Bluetooth mid-meeting silently
@@ -249,9 +345,21 @@ async function startCapture({ forceVideoMime = '' } = {}) {
     //
     // MediaRecorder is bound to stereoDest/monoDest, NOT to sysSrc, so swapping the source
     // under the merger keeps both recordings running — no restart, no container break.
-    let recovering = false;
     const recoverSystemAudio = async (reason) => {
       if (recovering || !state) return;
+      // Cooldown. Each attempt costs a 4s probe and the triggers re-arm on their own schedule, so
+      // without this the app spends the meeting probing instead of recording.
+      //
+      // 'devicechange' gets a SHORTER cooldown, not an exemption. It deserves priority (the
+      // hardware genuinely just changed, which is the one moment a fresh getDisplayMedia is most
+      // likely to land somewhere new — and it is how the endpoint switch below gets picked up),
+      // but exempting it outright is unbounded: Windows fires devicechange repeatedly, and a
+      // switch that lands on another silent device re-triggers it. Simulated over 30 minutes of a
+      // permanently dead endpoint, a full exemption ran 1763 probes versus 90 here.
+      const now = Date.now();
+      const cooldown = reason === 'devicechange' ? DEVICE_COOLDOWN_MS : RECOVER_COOLDOWN_MS;
+      if (now - lastAttemptTs < cooldown) return;
+      lastAttemptTs = now;
       recovering = true;
       let candidate = null;
       try {
@@ -263,10 +371,26 @@ async function startCapture({ forceVideoMime = '' } = {}) {
         // Prove the replacement is alive BEFORE touching the working graph — re-acquiring can
         // hand back a stream on the same dead endpoint, and a silent meeting looks identical
         // to a dead one by RMS alone.
-        const verdict = await probeStreamAlive(ctx, candidate, { ms: 2500, deadRms: DEAD_RMS });
+        // 4000ms, not 2500: the probe no longer exits early on a noise-floor reading, so it
+        // needs a window long enough for real meeting audio to appear during a quiet moment.
+        const verdict = await probeStreamAlive(ctx, candidate, { ms: 4000, aliveRms: ALIVE_RMS });
         if (!verdict.alive) {
-          window.capture.diag({ type: 'recover-failed', reason, maxRms: verdict.maxRms });
+          window.capture.diag({ type: 'recover-failed', reason, maxRms: verdict.maxRms, softFailures: softFailures + 1 });
           candidate.getTracks().forEach((t) => t.stop());
+          candidate = null;
+          // ESCALATE. Repeated failure means the Windows default is pointed at an endpoint nobody
+          // plays to, and no amount of re-acquiring can move us off it — loopback follows the
+          // default by construction. Ask main to find an endpoint that IS carrying audio and make
+          // it the default; the ondevicechange listener below then fires naturally and the normal
+          // recovery path re-binds. One-shot per dead stretch, so a machine with genuinely silent
+          // output never loops.
+          if (++softFailures >= SOFT_ATTEMPTS && !endpointSwitchTried) {
+            endpointSwitchTried = true;
+            window.capture.diag({ type: 'endpoint-switch-request', reason });
+            // Fire-and-forget: main owns the native call and the user-facing notification. The
+            // resulting devicechange is what drives the next recovery, not this promise.
+            window.capture.switchEndpoint({ reason });
+          }
           return;
         }
         const newTrack = candidate.getAudioTracks()[0];
@@ -285,6 +409,10 @@ async function startCapture({ forceVideoMime = '' } = {}) {
         sysTracks.forEach((t) => { t.onended = null; t.onmute = null; t.onunmute = null; try { t.stop(); } catch {} });
         state.streams.push(candidate);
         health.rearm(Date.now());
+        // Recovered: forget the failure history so a LATER dead stretch gets its own full
+        // escalation rather than inheriting a spent one.
+        softFailures = 0;
+        endpointSwitchTried = false;
         window.capture.diag({ type: 'recover-ok', reason, maxRms: verdict.maxRms });
         window.capture.recovered({ maxRms: verdict.maxRms });
       } catch (err) {

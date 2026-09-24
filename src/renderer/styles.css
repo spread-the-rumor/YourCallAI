@@ -528,3 +528,17 @@ select:focus { border-color: var(--accent); }
   }
   .btn:hover, .user-chip:hover, .meeting-item:hover, .chat-fab:hover, .icon-btn:hover { transform: none; }
 }
+
+/* Truncated-capture banner. Uses --yellow (themes in both modes) rather than --red: the
+   recording is still usable, it is just shorter than the meeting — a caution, not an error. */
+.capture-warn {
+  margin-top: var(--s2);
+  padding: var(--s2) var(--s3);
+  border: 1px solid color-mix(in srgb, var(--yellow) 45%, transparent);
+  background: color-mix(in srgb, var(--yellow) 12%, transparent);
+  border-radius: var(--r-sm);
+  font-size: var(--fs-sm);
+  color: var(--text);
+  line-height: 1.45;
+}
+.capture-warn b { font-weight: 600; }

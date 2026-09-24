@@ -185,6 +185,7 @@ function renderEditor() {
     participants.length ? participants.join(', ') : null,
   ].filter(Boolean);
   $('meta-line').textContent = parts.join('  ·  ');
+  renderCaptureWarning(m);
 
   document.querySelectorAll('.view-toggle .seg-toggle').forEach((b) =>
     b.classList.toggle('active', b.dataset.view === state.view));
@@ -193,6 +194,26 @@ function renderEditor() {
 
   if (state.view === 'summary') { $('note-content').value = m.content || ''; renderActionRow(m); renderSendBlock(m); }
   if (state.view === 'transcript') renderTranscript(m);
+}
+
+// The app has always MEASURED truncation (normalize.js compares output length against the
+// wall-clock span) and always kept it to itself: a 48-minute meeting that captured 2.5 minutes
+// was presented exactly like a healthy one. Detection the user never sees is not a feature.
+function renderCaptureWarning(m) {
+  const el = $('capture-warn');
+  const c = m.capture;
+  if (!c || !c.partial) { el.classList.add('hidden'); el.textContent = ''; return; }
+  const mins = (ms) => Math.max(1, Math.round(ms / 60000));
+  const pct = c.expectedMs ? Math.round((c.capturedMs / c.expectedMs) * 100) : null;
+  el.innerHTML = '';
+  const b = document.createElement('b');
+  b.textContent = '⚠ Incomplete recording — ';
+  el.appendChild(b);
+  el.appendChild(document.createTextNode(
+    `captured about ${mins(c.capturedMs)} min of a ${mins(c.expectedMs)} min meeting`
+    + (pct != null ? ` (${pct}%)` : '')
+    + '. Audio capture stopped early, so the transcript and summary cover only that part.'));
+  el.classList.remove('hidden');
 }
 
 function summaryFailed(m) {
