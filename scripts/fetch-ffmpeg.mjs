@@ -108,15 +108,26 @@ const DARWIN_SOURCE = {
 const PINS = {
   'win32-x64': {
     kind: 'prebuilt',
-    // Release-numbered (n9.0.1) rather than a master snapshot, and LGPL.
-    url: 'https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-09-08-23-15/ffmpeg-n9.0.1-27-g9b0578816c-win64-lgpl-9.0.zip',
+    // Release-numbered (n9.0.2) rather than a master snapshot, and LGPL.
+    //
+    // RE-PINNING IS A RECURRING CHORE, BY DESIGN OF THE UPSTREAM: BtbN deletes dated
+    // `autobuild-*` releases after roughly two weeks, so a pinned URL WILL eventually 404 and
+    // fail the Windows installer build with `download failed (HTTP 404 Not Found)`. That is what
+    // happened to the n9.0.1 pin on 2026-09-24. It is not a code bug and nothing here is wrong —
+    // just fetch the current `-win64-lgpl-` asset from the newest autobuild tag, re-verify, and
+    // update the three values below. Do NOT switch to the `latest` tag's
+    // `ffmpeg-master-latest-*` assets to dodge this: those are rolling, so the hash would change
+    // under us and the pin would stop meaning anything.
+    url: 'https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-09-24-14-14/ffmpeg-n9.0.2-3-ga5923073bf-win64-lgpl-9.0.zip',
     archive: 'zip',
     member: 'bin/ffmpeg.exe', // we extract ONLY this; ffprobe/ffplay would double the payload
     binary: 'ffmpeg.exe',
-    archiveSha256: 'ea426b29489671e4af94392ad2d0dc5628aa8afcd7ccbd42b215e93209ced6b8',
-    binarySha256: '8c8a38d3ba8c7b2f16f19dff64b3c02ac15cccebcb3dc9fb2f3f270fa7c1334a',
-    // Verified on this pin: --disable-libx264, no --enable-gpl, --enable-libopenh264, and
-    // h264_nvenc / h264_qsv / h264_amf / h264_mf all compiled in, plus vp8/vp9/opus decoders.
+    archiveSha256: 'ad4bddec89f4d5413f976ca4b4424c3aeec095afa029f739a2a03e9a360f06cd',
+    binarySha256: 'ca2b72f7607527869f8f132c504765cfbab21ab05971006c7f5dd45b72c0127f',
+    // Verified on this pin (2026-09-24, by reading FFMPEG_CONFIGURATION out of the binary, not a
+    // README): --disable-libx264 AND --disable-libx265, zero occurrences of --enable-gpl or
+    // --enable-nonfree, --enable-libopenh264 (Cisco, BSD-2) for software H.264, and
+    // libopenh264 / h264_qsv / h264_nvenc / h264_amf all present in -encoders.
   },
   'darwin-arm64': DARWIN_SOURCE,
   'darwin-x64': DARWIN_SOURCE,
