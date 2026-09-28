@@ -353,7 +353,9 @@ publish bundles only the **managed** assemblies and drops the native ones (WPF/U
 `agents/windows/build.ps1` ends with
 `Get-ChildItem agents/dist -Exclude YourCallAgent.exe,.gitkeep | Remove-Item`, deleting exactly
 those. Build output was 256 files; `agents/dist` was 1. **Never remove that csproj property.**
-A correctly-built agent exe is ~161 MB; ~153 MB means the natives are missing again.
+A correctly-built agent exe is ~161 MB; ~153 MB means the natives are missing again. (Measured
+again 2026-09-24 after adding `AudioEndpoints.cs`: 161,680,915 bytes — the audio mode is pure
+COM interop and adds no native payload.)
 
 **Diagnose blindness before ever touching a heuristic.** The agent now emits
 `{"type":"agent-diag","windows":N,"inCall":N,"nodes":N,"depth":N,"rosterSize":N,"topLevelWindows":N}`
@@ -377,6 +379,14 @@ Two related limits fixed at the same time:
 `inCall: 1`, `depth: 19`, and the real 8-person roster at `participants-panel` / 0.9. With no meeting
 open it emits zero rosters. Google Meet and Zoom remain **unverified** — the blindness fix is
 platform-independent so both are strictly better, but their panel shapes are unconfirmed.
+
+**The agent binary has a SECOND, unrelated job: `--audio` (Windows only).** It is the same exe
+because it already ships via `extraResource` and already has a spawn harness — adding a native
+module would have meant new packaging. `--audio list|set` does **no UIA work at all**, so it is
+routed **before** the poll loop in `Main` and calls `Environment.Exit`; it must never fall through
+into `Poll()`, which never returns. See the endpoint section under Audio capture for why it
+exists. Changing `AudioEndpoints.cs` needs the same `npm run build:agent` + full restart as any
+other agent change.
 
 **`npm run build:agent`** builds the binary locally. It previously existed only in CI, so
 `agents/dist` was empty in every dev checkout and Layer 1 **never ran outside a shipped installer**.
@@ -607,7 +617,8 @@ agent exe.
   `--enable-gpl --enable-libx264 --enable-version3`; evermeet.cx and osxexperts are GPL too.
   Building it is also **better provenance**: the source tarball is GPG-signed by the FFmpeg
   release key (`FCF986EA15E6E293A5644F10B4322F04D67658D8`, verified before pinning), whereas the
-  Windows pin trusts a third party's autobuild. Both platforms use the same release (9.0.1).
+  Windows pin trusts a third party's autobuild. Both platforms track the 9.0 line (macOS builds
+  9.0.1 from source; Windows is on 9.0.2 after the re-pin below).
 - **`--disable-autodetect` is the load-bearing flag**, and disabling libs one at a time is not a
   substitute. The first attempt named `--disable-lzma --disable-bzlib --disable-sdl2` and the
   v2.3.0 build still linked **Homebrew's `libxcb` + `libX11`** (x11grab) from the runner image —
@@ -634,6 +645,19 @@ agent exe.
   Buckets matter: `lavfi` is a **device**, `scale`/`testsrc` are **filters**. Listing either as a
   demuxer makes its assertion permanently unsatisfiable, which fails the build for a reason that
   has nothing to do with the build. (It was wrong exactly that way first.)
+- **The Windows pin EXPIRES, and that is upstream behaviour, not a bug.** BtbN deletes dated
+  `autobuild-*` releases after roughly two weeks, so a previously-good URL starts returning 404 and
+  the Windows installer job fails at *Fetch ffmpeg* with `download failed (HTTP 404 Not Found)`.
+  This killed the v2.4.0 build (pin was n9.0.1 from `autobuild-2026-09-08-23-15`). The fix is
+  mechanical: take the newest `autobuild-*` tag's `ffmpeg-nX.Y.Z-...-win64-lgpl-*.zip`, recompute
+  **both** hashes (`archiveSha256` of the zip, `binarySha256` of the extracted exe), and re-verify
+  the licence by reading `configuration:` out of `ffmpeg -version` — not from a README. The
+  asset name must still contain `-lgpl-`; confirm `--disable-libx264`, no `--enable-gpl`, no
+  `--enable-nonfree`, and `--enable-libopenh264`. **Do not "fix" this permanently by switching to
+  the `latest` tag's `ffmpeg-master-latest-*` assets** — those are rolling, so their hash changes
+  under us and the pin stops meaning anything.
+  A re-pin is also the moment to re-run the whole release: the tag must be deleted and re-pushed,
+  since the workflow builds from the tag.
 - CI **caches `vendor/ffmpeg`** keyed on the script's hash, so the compile is a once-per-pin cost.
   The fetch step still runs on a cache hit and re-verifies, so a bad cache entry cannot ship.
 - **Not `ffmpeg-static`:** the main process is webpack-bundled, and that package's whole API is
@@ -882,6 +906,23 @@ Slack per-user OAuth was landed across v2.0.3–v2.0.8. Bugs hit and fixed, in o
     the agent vote had no ch0-user guard, and the guard needs `matchToRoster` (mononym "Sagar" vs
     account "Sagar Bansal"), not `nameKey`.
 
+12. **"Meeting audio not captured" on every meeting with an external display (v2.3.2 → v2.4.0)** —
+    two meetings lost the far end entirely. Read as one bug; it was two, in sequence:
+    - **The liveness probe was a coin flip.** `probeStreamAlive` gated on `DEAD_RMS` (1e-5), which
+      measured across 51 real probes sat **inside a single cluster**, not between two: 15 readings
+      at 8.9e-6–9.8e-6 called dead, 25 at 1.0e-5–2.0e-5 called alive. **69% of "alive" verdicts
+      were indistinguishable from dead**, and only 4 of 51 saw real audio. So recovery would
+      **disconnect a working source and splice in a dead one**, then log `recover-ok` — which is
+      how 2026-09-17 lost 45 minutes while reporting success. Now gated on `ALIVE_RMS` (1e-4).
+    - **Recovery was structurally unwinnable.** Once the probe was honest it correctly refused
+      every candidate — six times in 18 minutes — because **re-acquiring `getDisplayMedia` can
+      only ever return the Windows default endpoint**, and the default *was* the dead one. No
+      retry count could fix that. The lever had to be the Windows default itself (`--audio`).
+    Diagnostic order that would have found this fastest: `sysRms` flat **from the very first
+    warm-up** (never worked) vs. going flat mid-meeting (died) — the former points at the wrong
+    endpoint, the latter at a device change. Then `inferredLoopbackEndpoint` in the `devices` line
+    of `capture.jsonl` vs. where the user can actually hear the meeting.
+
 ## Known follow-ups / caveats
 
 - `APP_PROXY_TOKEN` is a shared baked secret — anyone unpacking the app can relay traffic through the
@@ -892,6 +933,17 @@ Slack per-user OAuth was landed across v2.0.3–v2.0.8. Bugs hit and fixed, in o
   Harden with Electron `safeStorage` (OS keychain) if needed.
 - `.vercel/.env.production.local` has a committed `VERCEL_OIDC_TOKEN` — rotate / gitignore.
 - Old draft releases v2.0.6 / v2.0.7 / **v2.2.3** linger — safe to delete.
+- **The auto endpoint switch is NOT reverted** when a recording ends — a deliberate call (a
+  restore that only runs on a clean stop is a promise the crash path breaks), but it means the app
+  changes a system-wide Windows setting the user did not change. The popup naming the device is
+  the only signal, so it must never be quietly softened. Revisit if it surprises people.
+- **`IPolicyConfig` is undocumented.** Stable since Windows 7 and what nircmd/SoundVolumeView use,
+  but not contractual — if a Windows update drops it, `--audio set` returns
+  `{ok:false,code:'no-policy-config'}` and the app degrades to notify-only. That path is coded and
+  intended, not a crash, but it has **never been exercised on a real machine that lacks it**.
+- **The auto-switch is Windows-only.** macOS has no equivalent default-output API without a
+  virtual audio device, so it keeps notify-only. The mismatch *can* still happen there (macOS also
+  re-points the default when a display or headset connects), it just cannot be auto-repaired.
 - **Speaker names on Google Meet and Zoom are unverified.** Teams desktop is confirmed working end
   to end (2026-09-08). The v2.2.5 blindness fix is platform-independent, so both are strictly better
   than before, but neither participants-panel shape has been observed live. If names do not resolve,
