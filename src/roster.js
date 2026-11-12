@@ -27,7 +27,18 @@ const PARTICLES = new Set(['van', 'von', 'de', 'del', 'della', 'da', 'di', 'du',
 // so a real "System" in someone's name (or a person actually called Nav) is unaffected.
 const NON_PERSON_EXACT = new Set(['system', 'workspaces', 'workspace', 'profile', 'default',
   'guest', 'admin', 'administrator', 'untitled', 'new tab', 'home', 'general', 'unknown',
-  'me', 'you', 'everyone', 'notifications', 'menu', 'toolbar', 'main', 'body', 'null']);
+  'me', 'you', 'everyone', 'notifications', 'menu', 'toolbar', 'main', 'body', 'null',
+  // Slack's huddle window: its formatting toolbar and tab labels were emitted as participants and
+  // as active speakers ("Code", "Huddles" at 0.9+) in five real huddles. Mirrors Program.cs.
+  'code', 'bold', 'italic', 'strikethrough', 'link', 'quote', 'code block', 'huddle', 'huddles',
+  'activity', 'later', 'directories', 'canvases', 'lists', 'dms', 'threads', 'files',
+  // Meet's tile grid, captured as a "participant" (72j6).
+  'backgrounds and effects']);
+// Recording bots and shared room/dev accounts: present in the roster, but never a speaker anyone
+// wants named in a summary. Kept out of the candidate set entirely.
+const BOT_RE = /\b(notetaker|note taker|fireflies|otter(\.ai)?|read\.ai|fathom|tl;?dv|grain|recorder|bot|assistant|copilot|meeting room|conference room)\b/i;
+// Slack names its participant rows "View <name>'s profile".
+const PROFILE_ROW_RE = /^\s*View\s+(.+?)['’]s\s+profile\s*$/i;
 
 // Words that mean this string is a control, not a person.
 const UI_WORDS = new Set(['turn', 'mute', 'unmute', 'join', 'leave', 'share', 'sharing', 'stop',
@@ -39,6 +50,8 @@ const UI_WORDS = new Set(['turn', 'mute', 'unmute', 'join', 'leave', 'share', 's
 // "Priya Shah (She/Her), Host  🎤" -> "Priya Shah"
 function normalizeName(raw) {
   let s = String(raw == null ? '' : raw);
+  const prof = PROFILE_ROW_RE.exec(s);
+  if (prof) s = prof[1];
   s = s.replace(GLYPH_RE, ' ');
   s = s.replace(/\((?:[^()]*)\)/g, ' ');   // parenthesised pronouns / "(Guest)" / "(External)"
   s = s.replace(/\[[^\]]*\]/g, ' ');
@@ -80,6 +93,7 @@ function personScore(raw) {
   const t = tokens(n);
   if (!t.length || t.length > 5) return 0;
   if (NON_PERSON_EXACT.has(nameKey(n))) return 0;
+  if (BOT_RE.test(n)) return 0;
   if (t.some((w) => UI_WORDS.has(w))) return 0;
   if (t.every((w) => ROLE_WORDS.includes(w))) return 0;
 
@@ -130,7 +144,50 @@ function matchToRoster(candidate, roster) {
   const lastHits = names.filter((n) => { const t = tokens(n); return t[t.length - 1] === cLast; });
   if (lastHits.length === 1) return { name: lastHits[0], score: 0.7 };
 
+  // Speech-to-text spelling: "Ramiro" for Ramir, "Filipe" for Felipe, "Hernán" for Hernan. A name
+  // the transcript misspells could never be matched back, so the person stayed "Speaker N" even
+  // when the model identified them. A small edit distance on the first token (or the whole key)
+  // is accepted only when it singles out exactly one roster member, and scores below the exact
+  // tiers so it renders as unverified.
+  const close = names.filter((n) => {
+    const t = tokens(n);
+    return nearlyEqual(cFirst, t[0]) || nearlyEqual(cKey, nameKey(n))
+      || (c.length === 1 && t.length > 1 && nearlyEqual(cFirst, t[t.length - 1]));
+  });
+  if (close.length === 1) return { name: close[0], score: 0.65 };
+
+  // Short form of a first name: "Nav" for Navroop, "Sam" for Samuel. Seen in real titles
+  // ("Starlink touchpoint - Nav") and speech. Single token, ≥3 letters, one unique extension.
+  if (c.length === 1 && cFirst.length >= 3) {
+    const pre = names.filter((n) => { const f = tokens(n)[0]; return f.length > cFirst.length && f.startsWith(cFirst); });
+    if (pre.length === 1) return { name: pre[0], score: 0.6 };
+  }
+
   return null; // ambiguous (two Priyas) — better unresolved than wrong
+}
+
+// Levenshtein distance, early-exit above `max`.
+function editDistance(a, b, max = 3) {
+  if (Math.abs(a.length - b.length) > max) return max + 1;
+  let prev = Array.from({ length: b.length + 1 }, (_, j) => j);
+  for (let i = 1; i <= a.length; i++) {
+    const cur = [i];
+    let best = i;
+    for (let j = 1; j <= b.length; j++) {
+      cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+      if (cur[j] < best) best = cur[j];
+    }
+    if (best > max) return max + 1;
+    prev = cur;
+  }
+  return prev[b.length];
+}
+// Tolerance grows with length: none under 4 letters (Nav ≠ Nat), 1 up to 7, 2 beyond.
+function nearlyEqual(a, b) {
+  if (!a || !b || a === b) return false;
+  const len = Math.min(a.length, b.length);
+  const max = len < 4 ? 0 : len < 8 ? 1 : 2;
+  return max > 0 && editDistance(a, b, max) <= max;
 }
 
 // Merge roster sources into one ranked, de-duplicated list.
@@ -161,15 +218,29 @@ function mergeRoster(sources) {
     }
   }
 
-  // Canonicalise spellings against the dictionaries without adding entries.
+  // Canonicalise spellings against the dictionaries without adding entries. A dictionary may also
+  // EXPAND a partial name when exactly one of its people extends it ("Brito" → "Carlos Brito",
+  // the way live Teams sometimes labels a tile), which is still the same person, not a new one.
   for (const dict of dictionaries) {
     for (const entry of byKey.values()) {
       const hit = matchToRoster(entry.name, dict.names);
-      if (hit && hit.score >= 0.85 && nameKey(hit.name) === nameKey(entry.name)) entry.name = hit.name;
+      if (hit && hit.score >= 0.85 && nameKey(hit.name) === nameKey(entry.name)) { entry.name = hit.name; continue; }
+      const t = tokens(entry.name);
+      if (t.length !== 1) continue;
+      const ext = (dict.names || []).filter((n) => { const d = tokens(n); return d.length > 1 && d.includes(t[0]); });
+      if (ext.length === 1) entry.name = normalizeName(ext[0]);
     }
   }
 
-  return [...byKey.values()].sort((a, b) => b.confidence - a.confidence || a.name.localeCompare(b.name));
+  // One person, two labels: "Brito" and "Carlos Brito" from different polls. Keep the fuller one.
+  const merged = [...byKey.values()];
+  const out = merged.filter((e) => {
+    const t = tokens(e.name);
+    if (t.length !== 1) return true;
+    return !merged.some((o) => o !== e && tokens(o.name).length > 1 && tokens(o.name).includes(t[0]));
+  });
+
+  return out.sort((a, b) => b.confidence - a.confidence || a.name.localeCompare(b.name));
 }
 
 const rosterNames = (roster) => (roster || []).map((r) => (typeof r === 'string' ? r : r && r.name)).filter(Boolean);
@@ -224,5 +295,5 @@ function rosterIsTrustworthy(roster) {
 
 module.exports = {
   normalizeName, nameKey, personScore, isPersonName, matchToRoster, mergeRoster, rosterNames,
-  rosterIsTrustworthy,
+  rosterIsTrustworthy, editDistance, nearlyEqual,
 };

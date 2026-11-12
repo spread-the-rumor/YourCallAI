@@ -53,6 +53,10 @@ internal static class Agent
         // below (which never returns). It also does no UIA work at all, so it is unaffected by
         // the [STAThread]/CacheRequest constraint that governs the rest of this file.
         if (args.Contains("--audio")) { Environment.Exit(AudioEndpoints.Run(args)); return; }
+        // --capture and --watch are long-running but likewise do no UIA work, and must never fall
+        // into the poll loop. Each is its own process so a fault in one cannot take another down.
+        if (args.Contains("--capture")) { Environment.Exit(AudioCapture.Run(args)); return; }
+        if (args.Contains("--watch")) { Environment.Exit(CallWatch.Run(args)); return; }
         if (args.Contains("--dump")) { Dump(); return; }
         if (args.Contains("--windows")) { DumpWindows(); return; }
         Console.Error.WriteLine($"[agent] started, heuristics={HeuristicsVersion}");
@@ -345,11 +349,19 @@ internal static class NameHeuristics
         "system", "workspaces", "workspace", "profile", "default", "guest", "admin",
         "administrator", "untitled", "new tab", "home", "general", "unknown", "me", "you",
         "everyone", "notifications", "menu", "toolbar", "main", "body", "null",
+        // Slack's huddle window: its message-formatting toolbar and tab labels were emitted as
+        // participants and as active speakers ("Code", "Huddles") in five real huddles.
+        "code", "bold", "italic", "strikethrough", "link", "quote", "code block", "huddle", "huddles",
+        "activity", "later", "directories", "canvases", "lists", "dms", "threads", "files",
     };
+    // Slack names its participant rows "View <name>'s profile".
+    private static readonly Regex ProfileRow = new(@"^\s*View\s+(?<n>.+?)['’]s\s+profile\s*$", RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
     public static string Clean(string raw)
     {
         var s = raw ?? "";
+        var prof = ProfileRow.Match(s);
+        if (prof.Success) s = prof.Groups["n"].Value;
         s = Glyphs.Replace(s, " ");
         s = Parens.Replace(s, " ");
         s = RoleTail.Replace(s, "");
@@ -592,9 +604,15 @@ internal static class Heuristics
         }
 
         var (who, label) = (decorated.First().Key, decorated.First().Value);
-        bool changed = !lastDecorations.TryGetValue(who, out var prev) || prev != label;
+        // FIRST SIGHT IS A BASELINE, NOT A CHANGE. This used to count "never seen before" as a
+        // change, so the very first poll of every meeting emitted an active-speaker event for
+        // whichever tile carried a decoration — measured: 30 of 37 real active-speaker events share
+        // the exact timestamp of the first roster event, usually naming the user's own tile
+        // ("Sagar"). The pipeline then voted that one event onto a whole remote voice. Only a
+        // decoration that CHANGED on a tile we had already seen says anything about speech.
+        bool seenBefore = lastDecorations.TryGetValue(who, out var prev);
         lastDecorations[who] = label;
-        return changed ? new Candidate(who, 0.75, "suffix-delta") : null;
+        return seenBefore && prev != label ? new Candidate(who, 0.75, "suffix-delta") : null;
     }
 
     // Last resort: the old English phrase match, now only a confirmation.

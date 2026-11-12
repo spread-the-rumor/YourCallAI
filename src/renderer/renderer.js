@@ -15,6 +15,9 @@ const state = {
   view: 'summary',
   dest: 'slack',
   search: '',
+  searchIds: null,    // Set of ids matching `search` (computed in main), null = no query
+  liveSummary: {},    // recordingId -> summary text streamed so far
+  chatStream: null,   // { id, el, text } while a chat reply streams in
   range: 'all',       // all | week | month (date filter next to search)
   flags: {},
   status: { state: 'idle', detail: '' },
@@ -42,7 +45,7 @@ function fmtDuration(transcript) {
   if (!transcript?.length) return '';
   const last = transcript[transcript.length - 1];
   const w = last.words?.[last.words.length - 1];
-  const secs = w?.end_timestamp?.relative || 0;
+  const secs = w?.end_timestamp?.relative || last.end || 0;
   const m = Math.round(secs / 60);
   return m >= 1 ? `${m} min` : `${Math.round(secs)}s`;
 }
@@ -85,10 +88,18 @@ function renderStatus() {
 }
 
 // ---------- sidebar list ----------
-function matches(m, q) {
-  if (!q) return true;
-  const hay = `${m.title} ${m.content || ''} ${(m.transcript || []).map(segText).join(' ')}`.toLowerCase();
-  return hay.includes(q);
+// Search runs in main, which holds the transcripts; the list here carries none. state.searchIds
+// is the matching id set for state.search, or null when there is no query.
+function matches(m) {
+  return !state.searchIds || state.searchIds.has(m.id);
+}
+let searchSeq = 0;
+async function refreshSearch() {
+  const q = state.search.trim();
+  if (!q) { state.searchIds = null; return; }
+  const seq = ++searchSeq;
+  const ids = await api.searchMeetings(q);
+  if (seq === searchSeq) state.searchIds = new Set(ids); // drop answers to superseded queries
 }
 
 // Date-range filter: this week = last 7 days, this month = current calendar month.
@@ -118,8 +129,7 @@ function mkMeetingItem(m) {
 function renderList() {
   const list = $('meeting-list');
   list.innerHTML = '';
-  const q = state.search.toLowerCase();
-  const shown = state.meetings.filter((m) => matches(m, q) && inRange(m, state.range));
+  const shown = state.meetings.filter((m) => matches(m) && inRange(m, state.range));
 
   // Group by month; each month is an expandable section, open if it holds the active meeting.
   const groups = new Map();
@@ -161,14 +171,27 @@ function renderList() {
 }
 
 // ---------- editor ----------
-function selectMeeting(id) {
+// List items are "light" (no transcript/chat). The open meeting is fetched in full.
+async function ensureFull(id) {
+  const m = state.meetings.find((x) => x.id === id);
+  if (!m || !m._light) return;
+  const full = await api.getMeeting(id);
+  if (full) patchLocal(full);
+}
+
+async function selectMeeting(id) {
   state.currentId = id;
   state.view = 'summary';
   closeSettings();
   closeChat();
   renderList();
-  renderEditor();
+  renderEditor(); // title + notes show immediately from the light item
+  await ensureFull(id);
+  if (state.currentId === id) renderEditor();
 }
+
+// Placeholder text the pipeline writes before the summary exists (main.js buildPlaceholderMeeting).
+const isPlaceholderSummary = (s) => !s || s.startsWith('Recording saved.');
 
 function renderEditor() {
   const m = current();
@@ -178,10 +201,10 @@ function renderEditor() {
   if (!m) return;
 
   $('note-title').value = m.title;
-  const participants = [...new Set((m.transcript || []).map(segSpeaker))];
+  const participants = m.participants || [...new Set((m.transcript || []).map(segSpeaker))];
   const parts = [
     new Date(m.date).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' }),
-    fmtDuration(m.transcript),
+    m.transcript ? fmtDuration(m.transcript) : fmtSeconds(m.durationSec),
     participants.length ? participants.join(', ') : null,
   ].filter(Boolean);
   $('meta-line').textContent = parts.join('  ·  ');
@@ -192,8 +215,25 @@ function renderEditor() {
   $('view-summary').classList.toggle('hidden', state.view !== 'summary');
   $('view-transcript').classList.toggle('hidden', state.view !== 'transcript');
 
-  if (state.view === 'summary') { $('note-content').value = m.content || ''; renderActionRow(m); renderSendBlock(m); }
-  if (state.view === 'transcript') renderTranscript(m);
+  if (state.view === 'summary') {
+    // While the summary is still being generated, show it as it streams in (read-only, so the
+    // final text can't overwrite something the user typed into a half-finished summary).
+    const live = state.liveSummary[m.id];
+    const showLive = !!live && isPlaceholderSummary(m.content);
+    $('note-content').value = showLive ? live : (m.content || '');
+    $('note-content').readOnly = showLive;
+    renderActionRow(m);
+    renderSendBlock(m);
+  }
+  if (state.view === 'transcript') {
+    if (m._light && m.hasTranscript) $('view-transcript').innerHTML = '<p class="muted">Loading transcript…</p>';
+    else renderTranscript(m);
+  }
+}
+function fmtSeconds(secs) {
+  if (!secs) return '';
+  const m = Math.round(secs / 60);
+  return m >= 1 ? `${m} min` : `${Math.round(secs)}s`;
 }
 
 // The app has always MEASURED truncation (normalize.js compares output length against the
@@ -252,7 +292,7 @@ function renderActionRow(m) {
       reload();
     });
   }
-  if (m.transcript) {
+  if (m.transcript?.length || m.hasTranscript) {
     add('Export .txt', () => api.saveTranscript(m.id, 'txt'));
     add('Export .json', () => api.saveTranscript(m.id, 'json'));
   } else {
@@ -261,7 +301,15 @@ function renderActionRow(m) {
       await api.retryTranscription(m.id);
     }, { primary: true });
   }
-  if (m.transcript && summaryFailed(m)) {
+  if ((m.transcript?.length || m.hasTranscript) && m.recordingId) {
+    add('↻ Re-resolve names', async (b) => {
+      b.disabled = true; b.textContent = 'Resolving names…';
+      const r = await api.reresolveNames(m.id);
+      if (r.ok) { patchLocal(r.meeting); renderEditor(); return; }
+      b.disabled = false; b.textContent = `⚠ ${(r.error || 'Failed').slice(0, 60)}`;
+    });
+  }
+  if ((m.transcript?.length || m.hasTranscript) && summaryFailed(m)) {
     add('↻ Regenerate summary', async (b) => {
       b.disabled = true; b.textContent = 'Regenerating…';
       const r = await api.regenerateSummary(m.id);
@@ -274,6 +322,7 @@ function renderActionRow(m) {
 // How each speaker name was arrived at, for the unverified tooltip (§7).
 const SOURCE_LABELS = {
   'native-agent': 'the meeting window',
+  history: 'who usually leads this recurring meeting',
   'ai-inference': 'the conversation',
   'prior-manual-stale': 'an earlier rename that may no longer match this speaker',
   'signed-in-user': 'your account',
@@ -388,7 +437,10 @@ async function sendChat() {
   thinking.textContent = 'Thinking…';
   $('chat-thread').appendChild(thinking);
   $('chat-thread').scrollTop = $('chat-thread').scrollHeight;
+  // Streamed reply: 'chat-delta' events fill this bubble while the request is in flight.
+  state.chatStream = { id: m.id, el: thinking, text: '' };
   const { answer } = await api.askMeeting(m.id, q);
+  state.chatStream = null;
   m.chat = [...m.chat, { role: 'assistant', content: answer }];
   if (state.currentId === m.id && !$('chat-modal').classList.contains('hidden')) renderChat(m);
 }
@@ -890,8 +942,12 @@ function patchLocal(meeting) {
 }
 
 async function reload({ clearCurrent } = {}) {
-  [state.meetings, state.trash] = await Promise.all([api.listMeetings(), api.listTrash()]);
+  const [list, trash] = await Promise.all([api.listMeetings(), api.listTrash()]);
+  state.meetings = list.map((m) => ({ ...m, _light: true }));
+  state.trash = trash;
   if (clearCurrent || !state.meetings.some((m) => m.id === state.currentId)) state.currentId = null;
+  if (state.currentId) await ensureFull(state.currentId);
+  if (state.search) await refreshSearch();
   renderList();
   renderEditor();
 }
@@ -941,13 +997,35 @@ async function init() {
   api.onSyncStatus(({ state: st }) => { $('sync-dot').className = `sync-dot ${st}`; if (st === 'synced') reload(); });
   renderAccount(); // populate the sidebar user chip on startup
   api.onRecordingComplete((meeting) => {
+    if (!isPlaceholderSummary(meeting.content)) delete state.liveSummary[meeting.id];
     patchLocal(meeting);
     reload().then(() => selectMeeting(meeting.id));
   });
-  api.onTranscribeProgress(({ stage, detail }) => {
+  api.onChatDelta(({ id, delta }) => {
+    const s = state.chatStream;
+    if (!s || s.id !== id) return;
+    s.text += delta;
+    s.el.textContent = s.text;
+    s.el.classList.remove('thinking');
+    $('chat-thread').scrollTop = $('chat-thread').scrollHeight;
+  });
+  api.onTranscribeProgress(({ recordingId, stage, detail }) => {
+    if (stage === 'summary-delta') {
+      // Summary text as it is generated. Not a status change — fills the open note live.
+      state.liveSummary[recordingId] = (state.liveSummary[recordingId] || '') + (detail || '');
+      const m = current();
+      if (m && m.id === recordingId && state.view === 'summary' && isPlaceholderSummary(m.content)) {
+        $('note-content').value = state.liveSummary[recordingId];
+        $('note-content').readOnly = true;
+      }
+      return;
+    }
     if (stage === 'transcribing') state.status = { state: 'transcribing', detail: 'Transcribing…' };
-    if (stage === 'resolving-names') state.status = { state: 'processing', detail: 'Resolving speaker names…' };
-    if (stage === 'summarizing') state.status = { state: 'processing', detail: 'Generating summary…' };
+    if (stage === 'resolving-names') state.status = { state: 'processing', detail: 'Resolving names and summarizing…' };
+    if (stage === 'summarizing') {
+      state.liveSummary[recordingId] = ''; // a fresh run (or retry) starts a fresh preview
+      state.status = { state: 'processing', detail: 'Generating summary…' };
+    }
     // Maps onto the existing 'processing' state rather than introducing a new one: renderStatus's
     // labels map falls through via `labels[st] || st`, so a new state string would render the
     // literal word "normalizing" in the pill.
@@ -985,6 +1063,17 @@ async function init() {
     b.textContent = 'Convert to MP4';
     // Renaming the sources means they are no longer "legacy"; re-read so the count is honest.
     await renderLegacy();
+    await reload();
+  });
+  $('names-reresolve-all').addEventListener('click', async (e) => {
+    const b = e.currentTarget;
+    if (!confirm('Re-identify speakers in every saved meeting? This runs one AI call per meeting in the background. Your own renames are kept.')) return;
+    b.disabled = true; $('names-result').textContent = 'Working… (progress in the status bar)';
+    const r = await api.reresolveAllNames();
+    b.disabled = false;
+    $('names-result').textContent = r.ok
+      ? `Done: ${r.total} meetings, names changed in ${r.changed}${r.failed ? `, ${r.failed} failed` : ''}.`
+      : `⚠ ${r.error}`;
     await reload();
   });
   $('settings-close').addEventListener('click', closeSettings);
@@ -1055,7 +1144,12 @@ async function init() {
     renderStatus();
   });
 
-  $('search').addEventListener('input', (e) => { state.search = e.target.value; renderList(); });
+  let searchTimer = null;
+  $('search').addEventListener('input', (e) => {
+    state.search = e.target.value;
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(async () => { await refreshSearch(); renderList(); }, 150);
+  });
   $('range-filter').addEventListener('change', (e) => { state.range = e.target.value; renderList(); });
   $('note-title').addEventListener('input', queueSave);
   $('note-content').addEventListener('input', queueSave);

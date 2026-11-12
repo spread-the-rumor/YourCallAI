@@ -78,4 +78,49 @@ function startNameAgent(platform, onLine) {
   };
 }
 
-module.exports = { startNameAgent };
+// Long-running agent modes (--capture, --watch). Line-oriented JSON on stdout; restarted on a
+// crash up to `maxRestarts`. stop() asks politely over stdin ("stop", then EOF) so the native side
+// can flush its files, and only kills after `graceMs`. Resolves once the process is gone.
+function startAgentMode(args, onLine, { maxRestarts = 3, graceMs = 3000, onExit } = {}) {
+  const bin = agentBinaryPath();
+  if (!bin) return null;
+  let child = null, stopped = false, restarts = 0;
+  const launch = () => {
+    if (stopped) return;
+    child = spawn(bin, args, { stdio: ['pipe', 'pipe', 'ignore'], windowsHide: true });
+    let buf = '';
+    child.stdout.on('data', (d) => {
+      buf += d.toString('utf8');
+      let i;
+      while ((i = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, i).trim();
+        buf = buf.slice(i + 1);
+        if (line) { try { onLine(JSON.parse(line)); } catch { /* not JSON: ignore */ } }
+      }
+    });
+    child.stdin.on('error', () => {}); // EPIPE once the child has exited
+    child.on('error', (err) => onLine({ type: 'agent-mode-error', args: args[0], error: err.message }));
+    child.on('exit', (code) => {
+      if (onExit) onExit(code);
+      if (stopped || code === 0) return;
+      if (++restarts <= maxRestarts) {
+        onLine({ type: 'agent-mode-restart', args: args[0], code, restarts });
+        setTimeout(launch, 1000);
+      }
+    });
+  };
+  launch();
+  return {
+    isAlive: () => !!child && child.exitCode == null && !child.killed,
+    stop: () => new Promise((resolve) => {
+      stopped = true;
+      const c = child;
+      if (!c || c.exitCode != null || c.killed) return resolve();
+      const timer = setTimeout(() => { try { c.kill(); } catch {} resolve(); }, graceMs);
+      c.once('exit', () => { clearTimeout(timer); resolve(); });
+      try { c.stdin.end('stop\n'); } catch { /* already closed */ }
+    }),
+  };
+}
+
+module.exports = { startNameAgent, startAgentMode, agentBinaryPath };

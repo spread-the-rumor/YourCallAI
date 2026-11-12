@@ -24,7 +24,7 @@ function activeClient() {
 }
 
 function stripLocal(m) {
-  const out = { ...m };
+  const out = store().compactMeeting({ ...m }); // never upload per-word timing (93% of the bytes)
   for (const f of LOCAL_FIELDS) delete out[f];
   return out;
 }
@@ -78,31 +78,45 @@ async function deleteMeeting(id) {
   if (error) { console.warn('[sync] delete queued:', error.message); await enqueue(id); }
 }
 
-// Pull all server rows and reconcile against local by updatedAt (last-write-wins).
+const PULL_BATCH = 20;
+
+// Pull and reconcile against local by updatedAt (last-write-wins).
+//
+// Two phases. Listing first selects only ids and timestamps; the full `data` (which carries the
+// transcript) is fetched just for rows that are actually newer on the server. The old version
+// selected `data` for every row on every launch — the whole library, transcripts included, each
+// time — and then rewrote the local store once per row.
+//
+// Comparison uses the row's `updated_at` column, which toRow() sets from the meeting's updatedAt,
+// so it is the same value the old code read out of `data`.
 async function pullAll() {
   const sb = activeClient();
   if (!sb) return;
-  const { data: rows, error } = await sb.from(TABLE).select('id,data,updated_at,deleted_at');
+  const { data: heads, error } = await sb.from(TABLE).select('id,updated_at');
   if (error) { console.warn('[sync] pull failed:', error.message); return; }
 
   const local = await store().loadAllRaw(); // includes trashed
   const localById = new Map(local.map((m) => [m.id, m]));
-  const seen = new Set();
+  const serverById = new Map((heads || []).map((r) => [r.id, r]));
 
-  for (const row of rows || []) {
-    seen.add(row.id);
-    const remote = row.data;
-    const localM = localById.get(row.id);
-    if (!localM || ts(remote.updatedAt) > ts(localM.updatedAt)) {
-      await store().putRaw(rehydrate(remote)); // server newer (or new) → write locally
-    }
-    // local newer → will be pushed below
+  const { toLocal, toServer } = _reconcilePlan(
+    local.map((m) => ({ id: m.id, updatedAt: m.updatedAt })),
+    (heads || []).map((r) => ({ id: r.id, updatedAt: r.updated_at })),
+  );
+
+  const pulled = [];
+  for (let i = 0; i < toLocal.length; i += PULL_BATCH) {
+    const ids = toLocal.slice(i, i + PULL_BATCH);
+    const { data: rows, error: e2 } = await sb.from(TABLE).select('id,data').in('id', ids);
+    if (e2) { console.warn('[sync] pull batch failed:', e2.message); continue; }
+    for (const row of rows || []) if (row.data) pulled.push(rehydrate(row.data));
   }
+  if (pulled.length) await store().withSyncSuppressed(() => store().putManyRaw(pulled));
 
   // Local meetings the server is missing, or where local is newer → push up.
-  for (const m of local) {
-    const row = (rows || []).find((r) => r.id === m.id);
-    if (!row || ts(m.updatedAt) > ts(row.data.updatedAt)) await pushMeeting(m);
+  for (const id of toServer) {
+    const m = localById.get(id);
+    if (m && (!serverById.has(id) || ts(m.updatedAt) > ts(serverById.get(id).updated_at))) await pushMeeting(m);
   }
 }
 

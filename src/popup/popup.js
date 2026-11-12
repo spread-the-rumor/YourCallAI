@@ -1,6 +1,10 @@
 import logoUrl from '../renderer/logo.png';
 
-const PLATFORM_LABELS = { 'google-meet': 'Google Meet', zoom: 'Zoom', teams: 'Microsoft Teams' };
+const PLATFORM_LABELS = {
+  'google-meet': 'Google Meet', zoom: 'Zoom', teams: 'Microsoft Teams', slack: 'Slack huddle',
+  webex: 'Webex', ringcentral: 'RingCentral', goto: 'GoTo Meeting', discord: 'Discord',
+  skype: 'Skype', whatsapp: 'WhatsApp', telegram: 'Telegram', browser: 'Browser call', other: 'Call',
+};
 
 document.getElementById('popup-logo').src = logoUrl;
 
@@ -22,13 +26,22 @@ window.popup.onShow((info) => {
   // Show only the buttons for this mode.
   btn.start.classList.toggle('hidden', kind !== 'detected');
   btn.dismiss.classList.toggle('hidden', kind !== 'detected');
-  btn.stop.classList.toggle('hidden', kind !== 'silence');
-  btn.keep.classList.toggle('hidden', kind !== 'silence');
+  const ackOnly = ['capture-degraded', 'capture-endpoint-switched', 'recording-ended'].includes(kind);
+  btn.stop.classList.toggle('hidden', kind !== 'silence' && kind !== 'meeting-over');
+  btn.keep.classList.toggle('hidden', kind !== 'silence' && kind !== 'meeting-over');
   btn.keepEnding.classList.toggle('hidden', kind !== 'ending');
-  btn.captureOk.classList.toggle('hidden', kind !== 'capture-degraded' && kind !== 'capture-endpoint-switched');
-  detailEl.classList.toggle('wrap', kind === 'capture-degraded' || kind === 'capture-endpoint-switched');
+  btn.captureOk.classList.toggle('hidden', !ackOnly);
+  detailEl.classList.toggle('wrap', ackOnly || kind === 'meeting-over');
 
-  if (kind === 'detected') {
+  if (kind === 'recording-ended') {
+    // Capture ended without the user pressing Stop. What was captured is kept and transcribed.
+    titleEl.textContent = 'Recording ended early';
+    detailEl.textContent = `${info.detail ? info.detail.charAt(0).toUpperCase() + info.detail.slice(1) + '. ' : ''}What was captured is saved and being transcribed.`;
+  } else if (kind === 'meeting-over') {
+    // Manually started recordings are never stopped automatically — ask instead.
+    titleEl.textContent = 'Meeting seems to be over';
+    detailEl.textContent = `${label ? label + ' is no longer in a call. ' : 'The call app is no longer in a call. '}Stop recording?`;
+  } else if (kind === 'detected') {
     titleEl.textContent = 'Meeting detected';
     detailEl.textContent = `${label}${info.title ? ' · ' + info.title : ''}`;
   } else if (kind === 'silence') {
@@ -37,7 +50,8 @@ window.popup.onShow((info) => {
   } else if (kind === 'capture-degraded') {
     // Warn only — recording continues. A half-captured meeting still transcribes; a stopped
     // one is gone. The Bluetooth hint is added only when it is actually relevant.
-    titleEl.textContent = info.videoDead ? 'Screen video isn’t being recorded'
+    titleEl.textContent = info.videoDead && info.reason === 'display-changed' ? 'Screen video stopped after a display change'
+      : info.videoDead ? 'Screen video isn’t being recorded'
       : info.micDead && info.sysDead ? 'No audio is being captured'
         : info.sysDead ? 'Meeting audio isn’t being captured'
           : 'Your mic isn’t being captured';

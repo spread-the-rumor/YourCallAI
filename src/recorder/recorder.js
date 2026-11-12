@@ -1,7 +1,8 @@
 // Hidden recorder window (§5). getDisplayMedia is answered by main's
 // setDisplayMediaRequestHandler (primary screen + loopback system audio).
 // Two MediaRecorders: A = video + mono mix (playback), B = stereo opus
-// (ch0 mic / ch1 system) for Deepgram multichannel. 15s timeslice chunks → IPC → disk.
+// (ch0 mic / ch1 system) for Deepgram multichannel. 5s timeslice chunks → IPC → disk.
+const TIMESLICE_MS = 5000;
 
 const { computeRms, createHealth, describeMediaError, SILENCE_RMS, ALIVE_RMS } = require('./audioHealth');
 const { snapshotDevices, defaultOutputKey, probeStreamAlive } = require('./devices');
@@ -9,8 +10,9 @@ const { snapshotDevices, defaultOutputKey, probeStreamAlive } = require('./devic
 let state = null; // { recA, recB, streams, ctx, pending, levelTimer }
 
 const LEVEL_MS = 1000;         // how often we sample the level
-const DIAG_LEVEL_EVERY = 15;   // log a level sample every 15 ticks (~matches the 15s timeslice)
+const DIAG_LEVEL_EVERY = 15;   // log a level sample every 15 ticks (15 s windows; systemAudio reads them)
 const DEVICE_DEBOUNCE_MS = 750; // one Bluetooth connect fires ondevicechange several times
+const ACTIVE_SYS_RMS = 0.003;   // same bar src/systemAudio.js uses for "this second had sound"
 
 // Video container/codec preference, best first. Tried in order with a REAL constructor call,
 // not just isTypeSupported — see the loop in startCapture for why that distinction matters.
@@ -43,7 +45,55 @@ function videoBitrateFor(mime) {
   return /avc1|h264/i.test(mime) ? 3_000_000 : 1_500_000;
 }
 
-async function startCapture({ forceVideoMime = '' } = {}) {
+// The screen video reaches the encoder through a GENERATOR track, so its source can be replaced
+// mid-recording. The capture track ends when the display set changes (connecting a monitor, a
+// resolution change, lock/unlock), and the recorder used to answer that by stopping the WHOLE
+// capture — audio included — without main ever being told (0c8r, uvl0: meeting audio gone from
+// that moment). With a generator in between, a fresh screen track is spliced in and the video
+// file carries on. Feature-detected: without MediaStreamTrackGenerator/Processor the raw track is
+// used and a video-track end costs only the video.
+function createVideoPipe(initial) {
+  if (typeof MediaStreamTrackGenerator !== 'function' || typeof MediaStreamTrackProcessor !== 'function') {
+    return { track: initial, swappable: false, setSource: () => false, stop: () => {} };
+  }
+  let gen;
+  try { gen = new MediaStreamTrackGenerator({ kind: 'video' }); }
+  catch { return { track: initial, swappable: false, setSource: () => false, stop: () => {} }; }
+  const writer = gen.writable.getWriter();
+  let token = 0;
+  const pump = async (track) => {
+    const mine = ++token;
+    let reader;
+    try { reader = new MediaStreamTrackProcessor({ track }).readable.getReader(); }
+    catch (err) {
+      window.capture.diag({ type: 'video-pipe-error', stage: 'processor', message: err && err.message });
+      return;
+    }
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (mine !== token) { value.close(); break; } // superseded by a newer source
+        await writer.write(value); // the generator takes ownership of the frame
+      }
+    } catch (err) {
+      if (mine === token) window.capture.diag({ type: 'video-pipe-error', stage: 'pump', message: err && err.message });
+    } finally {
+      try { reader.cancel(); } catch { /* already done */ }
+    }
+  };
+  pump(initial);
+  return {
+    track: gen,
+    swappable: true,
+    setSource: (track) => { pump(track); return true; },
+    stop: () => { token++; try { writer.close(); } catch { /* closed */ } },
+  };
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function startCapture({ forceVideoMime = '', testHooks = false } = {}) {
   let mic;
   let display;
   try {
@@ -86,7 +136,8 @@ async function startCapture({ forceVideoMime = '' } = {}) {
     const monoDest = ctx.createMediaStreamDestination();
     micSrc.connect(monoDest);
     if (sysSrc) sysSrc.connect(monoDest);
-    const videoMix = new MediaStream([display.getVideoTracks()[0], ...monoDest.stream.getAudioTracks()]);
+    let videoPipe = createVideoPipe(display.getVideoTracks()[0]);
+    let videoMix = new MediaStream([videoPipe.track, ...monoDest.stream.getAudioTracks()]);
 
     // Stereo: mic → ch0, system → ch1, for multichannel transcription
     const merger = ctx.createChannelMerger(2);
@@ -110,16 +161,28 @@ async function startCapture({ forceVideoMime = '' } = {}) {
     // a machine where mp4 recording works, and how a user on bad hardware is unblocked without
     // waiting for a release. Passed in from main with 'start-capture'.
     const mimes = forceVideoMime ? [forceVideoMime, ...VIDEO_MIMES] : VIDEO_MIMES;
-    for (const m of mimes) {
-      if (!MediaRecorder.isTypeSupported(m)) continue;
-      try {
-        recA = new MediaRecorder(videoMix, { mimeType: m, videoBitsPerSecond: videoBitrateFor(m) });
-        videoMime = m;
-        break;
-      } catch (err) {
-        window.capture.diag({ type: 'mime-rejected', mime: m, name: err && err.name, message: err && err.message });
+    const tryRecorders = (stream) => {
+      for (const m of mimes) {
+        if (!MediaRecorder.isTypeSupported(m)) continue;
+        try {
+          recA = new MediaRecorder(stream, { mimeType: m, videoBitsPerSecond: videoBitrateFor(m) });
+          videoMime = m;
+          return;
+        } catch (err) {
+          window.capture.diag({ type: 'mime-rejected', mime: m, name: err && err.name, message: err && err.message });
+        }
       }
+    };
+    tryRecorders(videoMix);
+    if (!recA && videoPipe.swappable) {
+      // The generator track is the new part; never let it cost the video outright.
+      window.capture.diag({ type: 'video-pipe-fallback', why: 'no recorder accepted the generator track' });
+      videoPipe.stop();
+      videoPipe = { track: display.getVideoTracks()[0], swappable: false, setSource: () => false, stop: () => {} };
+      videoMix = new MediaStream([videoPipe.track, ...monoDest.stream.getAudioTracks()]);
+      tryRecorders(videoMix);
     }
+    window.capture.diag({ type: 'video-pipe', swappable: videoPipe.swappable });
     if (recA) {
       window.capture.format({ videoMime });
       window.capture.diag({ type: 'video-format', mime: videoMime });
@@ -131,7 +194,10 @@ async function startCapture({ forceVideoMime = '' } = {}) {
     }
 
     // recB stays in the outer try on purpose: no audio really IS fatal (ch0 anchors §7).
-    const recB = new MediaRecorder(stereoDest.stream, { mimeType: 'audio/webm;codecs=opus', audioBitsPerSecond: 96_000 });
+    // 48 kbps stereo (24 per channel) is ample for speech recognition and halves the upload that
+    // sits between "stop" and "transcript ready" — this file is only ever read by Deepgram; the
+    // playback audio lives in the video file.
+    const recB = new MediaRecorder(stereoDest.stream, { mimeType: 'audio/webm;codecs=opus', audioBitsPerSecond: 48_000 });
 
     // Track in-flight chunk writes so stop can flush everything before signalling main.
     const pending = new Set();
@@ -159,11 +225,39 @@ async function startCapture({ forceVideoMime = '' } = {}) {
     pipe(recA, 'video');
     pipe(recB, 'audio');
 
-    // If the user ends screen share from the OS UI, treat it as a stop. Keep this bound to the
-    // ONE video track we started with — an identity check guards against a stray track ending
-    // the user's recording.
-    const videoTrack = display.getVideoTracks()[0];
-    videoTrack.onended = () => { if (videoTrack === display.getVideoTracks()[0]) stopCapture(); };
+    // The screen track ENDING is not a request to stop. This used to call stopCapture(), which
+    // tore down the audio too and told main nothing (main only listened for a stop it had asked
+    // for), so a display change mid-meeting silently ended the recording of the meeting itself.
+    // Now: re-acquire the screen and splice it in; if that cannot be done, lose only the video.
+    const onVideoEnded = async () => {
+      window.capture.diag({ type: 'video-track-ended', swappable: videoPipe.swappable });
+      if (!state) return;
+      if (videoPipe.swappable) {
+        for (let attempt = 1; attempt <= 3 && state; attempt++) {
+          await sleep(1500 * attempt); // let the display set settle before asking again
+          if (!state) return;
+          try {
+            const fresh = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: { max: 15 } }, audio: true });
+            // Audio is the system-track path's job; this request exists for the video only.
+            fresh.getAudioTracks().forEach((t) => t.stop());
+            const vt = fresh.getVideoTracks()[0];
+            if (!vt) { fresh.getTracks().forEach((t) => t.stop()); continue; }
+            vt.onended = onVideoEnded;
+            videoPipe.setSource(vt);
+            state.streams.push(fresh);
+            window.capture.diag({ type: 'video-reacquired', attempt, settings: vt.getSettings && vt.getSettings() });
+            return;
+          } catch (err) {
+            window.capture.diag({ type: 'video-reacquire-failed', attempt, name: err && err.name, message: err && err.message });
+          }
+        }
+      } else if (state.recA && state.recA.state !== 'inactive') {
+        // Raw-track mode: finish the video file cleanly; audio is untouched.
+        try { state.recA.stop(); } catch { /* already stopped */ }
+      }
+      window.capture.degraded({ videoDead: true, reason: 'display-changed' });
+    };
+    display.getVideoTracks()[0].onended = onVideoEnded;
 
     // An audio track dying mid-recording used to be completely silent — the stream just stopped
     // producing samples and nothing said so.
@@ -199,9 +293,14 @@ async function startCapture({ forceVideoMime = '' } = {}) {
         if (which === 'mic') {
           window.capture.degraded({ micDead: true, sysDead: false, reason: 'mic-track-ended' });
         } else if (which === 'system') {
-          // The system track can legitimately be retired by our own recovery swap; only warn
+          // The system track can legitimately be retired by our own recovery swap; only act
           // when we are not mid-swap, or every successful recovery would raise a false alarm.
-          if (!recovering) window.capture.degraded({ micDead: false, sysDead: true, reason: 'system-track-ended' });
+          // An ended track never revives, so recover NOW: this used to only warn, and the health
+          // latch then kept recovery from ever being retried (ge2s lost the last 35 minutes).
+          if (!recovering) {
+            window.capture.degraded({ micDead: false, sysDead: true, reason: 'system-track-ended' });
+            recoverSystemAudio('system-track-ended');
+          }
         }
       };
       track.onmute = () => window.capture.diag({ type: 'trackmuted', which, muted: true });
@@ -266,6 +365,8 @@ async function startCapture({ forceVideoMime = '' } = {}) {
 
     const health = createHealth({ startedAt: Date.now() });
     let ticks = 0;
+    let sysDeadReports = 0;
+    let sysActiveTicks = 0;
 
     // The ENTIRE body is wrapped, because on 2026-09-17 this timer stopped producing output at
     // t=150s and the recording ran 46 more minutes with no levels line, no silence event and
@@ -297,10 +398,17 @@ async function startCapture({ forceVideoMime = '' } = {}) {
       const micRms = rmsOf(micTap);
       const sysRms = rmsOf(sysTap);
       const evt = health.tick(Date.now(), micRms, sysRms);
+      // Real system audio is flowing, so any earlier "dead" verdict was a quiet stretch, not a
+      // fault. Forget it: false alarms used to spend the one-shot endpoint switch, leaving it
+      // unavailable for the rest of the meeting (26–71 minutes in four v2.4.0 recordings).
+      if (sysRms != null && sysRms >= ALIVE_RMS) { softFailures = 0; endpointSwitchTried = false; sysDeadReports = 0; }
 
-      // Heartbeat contract is unchanged — main.js isAudioActive()/pendingStop depend on it.
+      // Heartbeat. `sys` is reported separately because only MEETING audio may keep a meeting
+      // "alive" for the detector — the user's own mic picks up room noise, which kept three
+      // recordings running 6–73 minutes past the end of their meeting.
       const active = Math.max(micRms || 0, sysRms || 0) >= SILENCE_RMS;
-      window.capture.audio(active);
+      const sys = (sysRms || 0) >= SILENCE_RMS;
+      if (active) window.capture.audio({ active, sys });
 
       // Unconditional per-tick pulse. `capture.audio(active)` above only reports WHEN THERE IS
       // SOUND, so main cannot tell "quiet meeting" from "monitor stopped running" — the exact
@@ -308,16 +416,30 @@ async function startCapture({ forceVideoMime = '' } = {}) {
       // nothing more, and main's watchdog alarms when it stops arriving.
       window.capture.alive();
 
+      // sysActive: seconds in this window where the system stream carried sound. Lets the
+      // transcription step see exactly WHERE Chromium's loopback heard nothing, and compare that
+      // against the native capture without decoding the whole recording (src/systemAudio.js).
+      if (sysRms != null && sysRms >= ACTIVE_SYS_RMS) sysActiveTicks++;
       if (++ticks % DIAG_LEVEL_EVERY === 0) {
         const r5 = (v) => (v == null ? null : Number(v.toFixed(5)));
-        window.capture.diag({ type: 'levels', micRms: r5(micRms), sysRms: r5(sysRms) });
+        window.capture.diag({ type: 'levels', micRms: r5(micRms), sysRms: r5(sysRms), sysActive: sysActiveTicks, window: DIAG_LEVEL_EVERY });
+        sysActiveTicks = 0;
       }
 
       if (!evt) return;
       if (evt.type === 'silence') { window.capture.silence(); return; }
-      // Loopback died without a devicechange we saw (driver re-route, endpoint reset). Same
-      // recovery path; probeStreamAlive still gates the swap, so a false alarm costs nothing.
-      if (evt.type === 'system-dead') { recoverSystemAudio('system-dead'); return; }
+      if (evt.type === 'system-dead') {
+        // Digital silence on the system stream. On this hardware an idle-but-working output ALSO
+        // reads exactly 0, so this is usually just a quiet far end (101 such alarms in the v2.4.0
+        // logs). Two cheap, non-disruptive checks instead of an alarm:
+        //  - ask main whether ANOTHER output has sound right now (a meter read, no capture) —
+        //    quiet: it acts only on positive evidence and never pops up "nothing is playing";
+        //  - re-acquire occasionally, in case the loopback died without a devicechange we saw.
+        window.capture.switchEndpoint({ reason: 'system-dead', quiet: true });
+        sysDeadReports++;
+        if (!evt.repeat || sysDeadReports % 4 === 0) recoverSystemAudio('system-dead');
+        return;
+      }
       // Everything is flat. Structurally invisible to system-dead (which requires mic signal),
       // so this is the only path that catches "the whole capture died". Try one recovery — the
       // usual cause is a device swap that took both endpoints — and warn either way, because
@@ -331,9 +453,14 @@ async function startCapture({ forceVideoMime = '' } = {}) {
       // Warm-up verdict. Logged pass OR fail, so a healthy run leaves a baseline in capture.jsonl
       // and "no warmup line" unambiguously means the check never ran.
       window.capture.diag({ type: 'warmup', ...evt });
-      // Don't alarm while a swap is in flight — recovery usually lands within ~3s and clears it.
-      if ((evt.micDead || evt.sysDead) && !recovering) {
-        window.capture.degraded({ micDead: evt.micDead, sysDead: evt.sysDead, reason: 'warmup', bluetooth: btOutput });
+      // A dead MIC at warm-up is a real fault (ch0 is the user, and an idle mic still carries a
+      // noise floor). A "dead" SYSTEM stream at warm-up is usually just nothing playing yet —
+      // every manual start before a call connects warned "meeting audio not captured" — so it
+      // gets the quiet check: act only if another output demonstrably has sound.
+      if (evt.micDead && !recovering) {
+        window.capture.degraded({ micDead: true, sysDead: evt.sysDead, reason: 'warmup', bluetooth: btOutput });
+      } else if (evt.sysDead && !recovering) {
+        window.capture.switchEndpoint({ reason: 'warmup', quiet: true });
       }
     }
 
@@ -345,8 +472,20 @@ async function startCapture({ forceVideoMime = '' } = {}) {
     //
     // MediaRecorder is bound to stereoDest/monoDest, NOT to sysSrc, so swapping the source
     // under the merger keeps both recordings running — no restart, no container break.
+    // A device change or ended track that arrives while a recovery is running, or inside the
+    // cooldown, used to be DROPPED — deviceKey had already moved on, so nothing ever retried it.
+    // Now it is parked and retried once the way is clear. One pending retry at a time.
+    let retryTimer = null;
+    const URGENT = new Set(['devicechange', 'system-track-ended']);
+    const scheduleRetry = (reason, delayMs) => {
+      if (retryTimer || !state) return;
+      window.capture.diag({ type: 'recover-deferred', reason, inMs: delayMs });
+      retryTimer = setTimeout(() => { retryTimer = null; recoverSystemAudio(reason); }, delayMs);
+    };
+
     const recoverSystemAudio = async (reason) => {
-      if (recovering || !state) return;
+      if (!state) return;
+      if (recovering) { if (URGENT.has(reason)) scheduleRetry(reason, 5000); return; }
       // Cooldown. Each attempt costs a 4s probe and the triggers re-arm on their own schedule, so
       // without this the app spends the meeting probing instead of recording.
       //
@@ -357,8 +496,11 @@ async function startCapture({ forceVideoMime = '' } = {}) {
       // switch that lands on another silent device re-triggers it. Simulated over 30 minutes of a
       // permanently dead endpoint, a full exemption ran 1763 probes versus 90 here.
       const now = Date.now();
-      const cooldown = reason === 'devicechange' ? DEVICE_COOLDOWN_MS : RECOVER_COOLDOWN_MS;
-      if (now - lastAttemptTs < cooldown) return;
+      const cooldown = URGENT.has(reason) ? DEVICE_COOLDOWN_MS : RECOVER_COOLDOWN_MS;
+      if (now - lastAttemptTs < cooldown) {
+        if (URGENT.has(reason)) scheduleRetry(reason, cooldown - (now - lastAttemptTs) + 250);
+        return;
+      }
       lastAttemptTs = now;
       recovering = true;
       let candidate = null;
@@ -444,9 +586,26 @@ async function startCapture({ forceVideoMime = '' } = {}) {
       debounce = setTimeout(onDeviceChange, DEVICE_DEBOUNCE_MS);
     };
 
-    recA?.start(15000);
-    recB.start(15000);
-    state = { recA, recB, streams: [display, mic, monoDest.stream, stereoDest.stream], ctx, pending, levelTimer, debounce };
+    // 5 s slices: anything not yet handed to main is lost if the recorder process dies, and the
+    // crash stress test lost 24 of 37 seconds with 15 s slices. Chunk IPC cost is negligible.
+    recA?.start(TIMESLICE_MS);
+    recB.start(TIMESLICE_MS);
+    // The wall-clock instant audio.webm's t=0 corresponds to. The native system-audio track is
+    // aligned against this at transcription time (src/systemAudio.js).
+    window.capture.diag({ type: 'audio-recorder-started', at: Date.now() });
+    state = {
+      recA, recB, streams: [display, mic, monoDest.stream, stereoDest.stream], ctx, pending, levelTimer, debounce,
+      videoPipe, clearRetry: () => clearTimeout(retryTimer),
+    };
+    // Stress-test hooks (dev only: main passes testHooks when YCAI_TEST_HOOKS=1). They fire the
+    // same 'ended' events a display change or an endpoint reset fires, through the real handlers.
+    if (testHooks) {
+      window.__ycaiTest = {
+        endVideo: () => display.getVideoTracks()[0].dispatchEvent(new Event('ended')),
+        endSystem: () => { const t = sysTracks[0]; if (t && t.onended) t.onended(new Event('ended')); },
+        deviceChange: () => navigator.mediaDevices.ondevicechange && navigator.mediaDevices.ondevicechange(),
+      };
+    }
   } catch (err) {
     mic.getTracks().forEach((t) => t.stop());
     display.getTracks().forEach((t) => t.stop());
@@ -456,10 +615,11 @@ async function startCapture({ forceVideoMime = '' } = {}) {
 
 async function stopCapture() {
   if (!state) { window.capture.stopped(); return; }
-  const { recA, recB, streams, ctx, pending, levelTimer, debounce } = state;
+  const { recA, recB, streams, ctx, pending, levelTimer, debounce, videoPipe, clearRetry } = state;
   state = null;
   clearInterval(levelTimer); // stop sampling before the context closes
   clearTimeout(debounce);
+  if (clearRetry) clearRetry();
   navigator.mediaDevices.ondevicechange = null;
   const stopped = (rec) => new Promise((resolve) => {
     if (!rec || rec.state === 'inactive') return resolve(); // recA is null when video never started
@@ -468,6 +628,7 @@ async function stopCapture() {
   });
   await Promise.all([stopped(recA), stopped(recB)]);
   await Promise.all([...pending]); // flush final chunks to main before signalling
+  if (videoPipe) videoPipe.stop();
   streams.forEach((s) => s.getTracks().forEach((t) => t.stop()));
   try { await ctx.close(); } catch { /* already closed */ }
   window.capture.stopped();

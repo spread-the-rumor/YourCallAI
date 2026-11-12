@@ -44,6 +44,10 @@ const SYSTEM_DEATH_MS = 12000;
 // quiet briefly (everyone muted, nothing playing); 45s of literal digital zero cannot happen
 // on a live path, which always carries a noise floor.
 const TOTAL_DEATH_MS = 45000;
+// While the system stream STAYS dead, re-report this often. It used to latch after one report and
+// only clear on a live sample — which an ENDED track can never produce — so a track that died for
+// good was reported once and then never retried for the rest of the meeting (ge2s, 2026-11-10).
+const SYSTEM_DEATH_REPEAT_MS = 30000;
 
 function computeRms(buf) {
   let sum = 0;
@@ -63,7 +67,9 @@ function createHealth(opts = {}) {
     silenceMs = SILENCE_MS,
     deathMs = SYSTEM_DEATH_MS,
     totalDeathMs = TOTAL_DEATH_MS,
+    deathRepeatMs = SYSTEM_DEATH_REPEAT_MS,
   } = opts;
+  let sysDeathReportedAt = 0;
 
   let micMax = 0;
   let sysMax = 0;
@@ -146,9 +152,14 @@ function createHealth(opts = {}) {
       // would re-acquire in a loop through every quiet stretch.
       if (sysRms != null && sysRms < deadRms && micRms != null && micRms >= deadRms) {
         if (!sysDeadSince) sysDeadSince = now;
-        if (!sysDeathReported && now - sysDeadSince >= deathMs) {
+        const due = !sysDeathReported
+          ? now - sysDeadSince >= deathMs
+          : now - sysDeathReportedAt >= deathRepeatMs;
+        if (due) {
+          const repeat = sysDeathReported;
           sysDeathReported = true;
-          return { type: 'system-dead', since: sysDeadSince };
+          sysDeathReportedAt = now;
+          return { type: 'system-dead', since: sysDeadSince, repeat };
         }
       } else if (sysRms != null && sysRms >= deadRms) {
         sysDeadSince = 0;
@@ -208,5 +219,6 @@ module.exports = {
   SILENCE_MS,
   SYSTEM_DEATH_MS,
   TOTAL_DEATH_MS,
+  SYSTEM_DEATH_REPEAT_MS,
   ALIVE_RMS,
 };

@@ -4,8 +4,10 @@ const { proxyPost } = require('../proxy');
 const MODEL = 'google/gemma-4-31b-it';
 
 // Returns the full completion text. With onDelta, streams and calls onDelta(chunkText).
-async function chatCompletion(messages, { onDelta, temperature = 0.3 } = {}) {
-  const res = await proxyPost('/api/ai', { messages, temperature, stream: !!onDelta });
+// `purpose` lets the server pick a purpose-specific model (e.g. 'names'); the client never names
+// a model itself. An older backend ignores the field and uses its default.
+async function chatCompletion(messages, { onDelta, temperature = 0.3, purpose } = {}) {
+  const res = await proxyPost('/api/ai', { messages, temperature, stream: !!onDelta, ...(purpose ? { purpose } : {}) });
   if (!res.ok) {
     const body = await res.text().catch(() => '');
     throw new Error(`AI request failed (${res.status}): ${body.slice(0, 200)}`);

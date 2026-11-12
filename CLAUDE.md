@@ -18,7 +18,146 @@ resolves speaker names, AI summaries (Requesty/LLM), and sends summaries to Slac
 - `src/settingsStore.js` — local prefs + `/api/config` feature flags; `loadEnvFile()`, `applyToEnv()`.
 - `src/integrations/slack.js` — Slack client (OAuth + send). `src/integrations/getoverview.js`.
 - `src/renderer/{index.html,renderer.js,styles.css}` — UI.
-- `src/jsonFile.js` — atomic JSON persistence (used for all local state files).
+- `src/jsonFile.js` — atomic JSON persistence (settings, sync queue). **Not** the meeting store.
+- `src/store.js` — meeting store: in-memory, compact transcripts (see "v2.5 overhaul" below).
+- `src/names.js` + `src/people.js` + `src/ai/inferSpeakerNames.js` — speaker naming.
+- `src/detector.js` — meeting detection (mic-holder based). `src/systemAudio.js` — native capture.
+
+## v2.5 overhaul — read this before the older sections below
+
+Four user-reported problems (2026-11-12): wrong names, audio lost on display/device change,
+inconsistent detection, slowness. Each was diagnosed against the REAL library first; several
+older claims in this file turned out wrong and are corrected inline.
+
+**Speed — the store.** `meetings.json` had reached 243 MB (165 meetings) and the old JsonFile
+store re-parsed it on EVERY read and rewrote it on every write: ~5 s of blocked main thread per
+edit, ~2.3 s frozen renderer per list refresh, growing 1.5 MB/meeting. Now:
+- `store.js` parses once and keeps the data in memory; writes are compact JSON, coalesced
+  (`WRITE_DELAY_MS`), atomic + fsync'd; `flushSync()` on `will-quit`, `flush()` before
+  `app.exit` (restart-app — `app.exit` skips will-quit). Stale `meetings.json.*.tmp` are deleted
+  at load. A corrupt file is moved aside (`meetings.corrupt-*.json`), never overwritten.
+- **Transcripts are stored COMPACT**: `compactSegment` drops per-word `words` (93% of the bytes)
+  and keeps `text` + `start/end` (relative s) + `startAt/endAt` (ISO). One-time migration on first
+  load, after backing the original up to `meetings.backup-pre-compact.json`. Measured on a copy of
+  the real file: 243 MB → 13.8 MB, 165/165 meetings and 54,901/54,901 segments identical
+  text/speaker/timing, load 178 ms, edit ~4 ms, search 11 ms. Read timing through
+  `segStartIso/segEndIso/segEndRel` (transcriptUtils) — they accept both shapes.
+- The full-word transcript lives on disk: `<rec>/transcript.raw.json` (provisional labels, written
+  before naming) and `<rec>/transcript.json` (resolved). Re-resolving names reads these.
+- `list-meetings` returns **light** items (no transcript/chat; `hasTranscript`, `durationSec`,
+  `participants`); the renderer fetches the open meeting with `get-meeting` (`_light` flag in
+  renderer state). Search runs in main (`search-meetings`), debounced 150 ms.
+- Sync pulls `id, updated_at` first and fetches `data` only for changed rows (batches of 20),
+  applied in ONE store write (`putManyRaw`); pushes are compacted (`stripLocal`).
+- Pipeline: summary runs **concurrently** with naming on provisional labels; `relabelSummary`
+  substitutes the resolved names (digit-bounded, longest label first). Summary and chat text
+  stream into the UI. Audio is 48 kbps (was 96). `<rec>/pipeline.jsonl` times every step
+  (upload, deepgram, fetch-result, names-ai, summary, done/sinceEndMs) — before this the
+  stop→ready time could not be broken down at all.
+
+**Audio — what actually lost meetings after v2.4.0** (31 recordings since 2026-09-25): NOT an
+output-device switch — the v2.4.0 endpoint switch never once ran. The real causes:
+1. The recorder **stopped itself** when the screen video track ended (`videoTrack.onended →
+   stopCapture()`), and main ignored a `capture-stopped` it had not asked for, so it kept showing
+   "recording" and saved nothing until Stop (0c8r, uvl0). Now the screen video goes through a
+   `MediaStreamTrackGenerator` (`createVideoPipe`) and a fresh screen track is spliced in; without
+   generator support only the video stops. Main treats an unsolicited stop or a recorder
+   `render-process-gone` as `finalizeUnexpected()` — save, transcribe, tell the user.
+2. False alarms spent the one-shot escalation: `system-dead` was mic-gated on `DEAD_RMS` and this
+   Realtek mic's floor is 3–5e-5, so it fired on every quiet far end (101×). Now a live system
+   sample resets the escalation, and `system-dead` triggers only a QUIET endpoint check
+   (`capture-switch-endpoint {quiet:true}`: acts only if another output has sound, never pops up).
+3. An ENDED system track was never retried (the death latch only cleared on a live sample). Now
+   `onended` recovers at once and `system-dead` re-reports every `SYSTEM_DEATH_REPEAT_MS` (30 s).
+4. A `devicechange` during cooldown/in-flight recovery was dropped; now `scheduleRetry`.
+- **Correction:** "digital silence ≠ a quiet room" is NOT universal. An idle Realtek output
+  delivers exactly 0 while working (measured), which is why warm-up `sysDead` no longer warns.
+
+**Native capture of every output device** (`YourCallAgent.exe --capture <dir>`,
+`agents/windows/AudioCapture.cs`, `src/systemAudio.js`): WASAPI loopback on EVERY active render
+endpoint (re-enumerated every 2 s), mixed onto one wall-clock timeline → `system.pcm` (s16le
+16 kHz mono) + `system.json {startedAtMs}`. Independent of the Windows default, so display
+connects, headsets and apps set to a specific speaker no longer matter. Measured: 40.1 s wall →
+39.6 s audio (250 ms mix latency + startup), silence-by-absence zero-filled.
+- At transcription, `prepareUpload` compares where Chromium's ch1 heard nothing (the recorder's
+  `levels.sysActive` per 15 s window) against native activity. ≥20 s missed → remix
+  `audio.native.webm` (ch0 = mic untouched, ch1 = native aligned via `audio-recorder-started`);
+  otherwise the original file is used untouched (114 ms). Remix uses `join` with an explicit
+  stereo layout — `amerge` yields a layout-less stream libopus refuses. Verified on a real
+  recording: alignment exact (100% per-second agreement vs 88.6% if 2 s off), 4.5 s per 7 min.
+- While native capture covers ≥1 live device (`nativeCovering()`), main does NOT switch the
+  Windows default and suppresses "meeting audio not captured" popups (logged instead).
+- **Unverified live:** behaviour across a real display connect / Bluetooth connect / Teams on a
+  non-default speaker. The design does not depend on the default, but no such meeting was run.
+
+**Detection** (`src/detector.js`, `YourCallAgent.exe --watch`, `CallWatch.cs`): "in a call" = a
+process holds an ACTIVE capture session (`IAudioSessionManager2`, every 2 s, plus all visible
+window titles per process). Works for any app: Teams (incl. its WebView2 media), Zoom, Slack
+huddles, Webex, RingCentral, Firefox/Arc. Unknown mic users need 30 s; known apps 4 s. **Ending**:
+only the call app's mic session, its call window, or MEETING audio (`sys`, never
+the mic) keep it alive — room noise on the mic kept three recordings running 6–73 min late.
+Manual recordings get a "Meeting seems to be over — stop?" popup (never auto-stopped). Every
+decision → `userData/detector.jsonl`. Registry/PowerShell remain the fallback. `get-windows` was
+never packaged; it is no longer imported.
+
+**Names** — measured on 83 meetings / 296 remote voices: 31% left `Speaker N`, the user's own name
+on a remote voice in 10 meetings, UI labels ("Huddles", "Code") as speakers. Root causes and fixes:
+1. ONE first-poll agent event named a whole voice: `Program.cs` reported first sight of a tile
+   decoration as a change (30 of 37 events), and `align.js` gave one 15 s window a 100% share,
+   then **mutated the transcript in place**, so the resolver rejecting it changed nothing. Now
+   first sight is a baseline, `voteSpeakers` is pure and needs ≥3 events over ≥20 s covering ≥10%
+   of that voice, and labels are applied only in `resolveSpeakers`.
+2. ONE AI call (`purpose: 'names'` → server picks `NAMES_MODEL`, default
+   `nvidia/nemotron-3.5-lightning-30b-a3b`, falls back to the default model on 400/404/422)
+   replaces the four serial tiers. Candidates: participant list, **people who attend this
+   meeting** (`people.js`: same typed title / ≥50% roster overlap / recurring time slot, learned
+   from the user's renames), titles; explicit **host** reasoning (the 17 manual renames were all
+   the unaddressed host). Validated in code: candidate match (fuzzy — `nearlyEqual` handles
+   "Ramiro"/"Filipe"), never the user (fuzzy), direct evidence must QUOTE the transcript, caps by
+   basis (host/title/topic/history < 0.85 → unverified), small diarization fragments may share a
+   name at ≤0.6. Only a TRUSTED roster closes the set.
+3. Roster hygiene: Slack `View X's profile` → X, Slack toolbar labels and bots (Fireflies…)
+   rejected, "Brito"+"Carlos Brito" merged. Kept in step in `Program.cs` and `roster.js`.
+4. Deepgram `keyterm` hints from roster + history (`nameHints`, sanitised server-side, ≤50).
+5. `<rec>/names.jsonl`: candidates, votes, raw model answer, final map — AI answers used to be
+   console-only. "↻ Re-resolve names" (per meeting, rewrites the summary if names changed) and
+   Settings → "Re-resolve all meetings" (names only) need no re-transcription.
+6. `test/names-eval.js` scores the resolver BLIND against the user's manual renames (history only
+   from earlier meetings). Without AI: 0 wrong names, 0 user-on-remote, 0 non-person (the old
+   pipeline produced all three). Run `--ai` for the full pipeline.
+- A browser extension (reading Meet/Teams-web/Zoom-web pages) was built and then REMOVED at the
+  user's request (2026-11-12): browser meetings are named by the AI + history only.
+- **Recurring host fallback** (`historyHostFallback`, names.js): when the model leaves the dominant
+  voice unnamed and the series' (same typed title only) dominant speaker was manually confirmed
+  ≥2×, suggest them at 0.6. Over the whole library the agent's speaking-signal votes named ZERO of
+  412 voices under the new rules — on Teams naming is AI + history, by design.
+
+**Stress-tested 2026-11-12** (dev app on an isolated copy via `YCAI_USER_DATA`, driven over CDP;
+`YCAI_TEST_HOOKS=1` exposes `window.__ycaiTest.endVideo/endSystem` in the recorder):
+- store: 1,155 meetings load 1.7 s, list 7 ms, edit <1 ms, warm search 24 ms; 600 concurrent mixed
+  writes lose nothing; 25 hard kills mid-write never corrupt the file.
+- native capture: 5 min with all cores busy → 30/30 click-track beeps, worst drift 30 ms, <1% CPU,
+  34 MB flat; both agent modes exit when the app is killed.
+- detection live (a real process holding the mic): known app detected 4.4 s after the mic session,
+  10 s unknown use ignored, 45 s unknown use detected at ~31 s, both closed ~19 s after release.
+- e2e: screen-track end → re-acquired, video continuous; system-track end → recovered, popup
+  suppressed by native coverage; stop→summary 40 s. Recorder CRASH used to keep 13 of 37 s of
+  audio AND produce an empty video.mp4 while deleting the capture — fixed: 5 s timeslices
+  (`TIMESLICE_MS`), `normalize` treats empty output as failure and keeps the source, and
+  `prepareUpload` uses the native track for the full length when `stopReason === 'unexpected'`.
+- **Real output-device switch, verified** (laptop Realtek ↔ VG27A display audio): part A on the
+  laptop, default → display, 10 s silence, part B on the display, default → laptop, part C.
+  Chromium's loopback went deaf for part B exactly as predicted (`sysActive` 0 0 0 — its recovery
+  probe ran during the silence and correctly refused), `system-dead` → `endpoint-switch-skipped`
+  (native covering, Windows default left alone), the switch back recovered it, and
+  `prepareUpload` chose the native track (`chrome-missed-sound`): all three parts are in the
+  transcript. v2.4.0 would have lost part B. Mic-channel echo of speaker playback is a test-rig
+  artifact (no AEC on the test player): across 56 real recordings it never exceeds 21%.
+  Blind eval (gemma, before the names model is deployed): 6/18 of the manual-rename ground truth
+  correct, 0 user-on-remote, 0 non-person; the 5 "wrong" are 2 nickname matches (Nav=Navroop) and
+  3 ASR spellings in July meetings that had no roster or history.
+- **Correction:** the agent DOES scan Slack (family `slack`); that is how huddle toolbars became
+  "participants".
 
 ### Backend routes (`api/`)
 - `api/_shared.js` — `json`, `readJson`, `env`, `requireAppToken`, `redisClient`.
@@ -804,7 +943,9 @@ retention thought it was gone.
 `APP_PROXY_TOKEN`, Upstash Redis
 (`SLACK_KV_REST_API_URL` / `SLACK_KV_REST_API_TOKEN` — code also accepts `KV_REST_API_*` /
 `UPSTASH_REDIS_REST_*`; the same store holds the `asana:otc:*` keys), plus the transcription/AI
-keys. GitHub Actions secrets (for the installer build): `SLACK_CLIENT_ID`, `ASANA_CLIENT_ID`,
+keys. Optional: `NAMES_MODEL` overrides the speaker-naming model (`api/ai.js` `PURPOSE_MODELS`;
+the client only ever sends `purpose: 'names'`, never a model id, because the proxy token is
+extractable). GitHub Actions secrets (for the installer build): `SLACK_CLIENT_ID`, `ASANA_CLIENT_ID`,
 `APP_PROXY_TOKEN`, `SUPABASE_URL`, `SUPABASE_ANON_KEY`, `VERCEL_*`.
 
 ## Build / release / deploy

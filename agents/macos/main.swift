@@ -110,6 +110,10 @@ enum NameHeuristics {
         "system", "workspaces", "workspace", "profile", "default", "guest", "admin",
         "administrator", "untitled", "new tab", "home", "general", "unknown", "me", "you",
         "everyone", "notifications", "menu", "toolbar", "main", "body", "null",
+        // Slack huddle toolbar/tabs and Meet's tile grid — seen as "participants" in real meetings.
+        "code", "bold", "italic", "strikethrough", "link", "quote", "code block", "huddle", "huddles",
+        "activity", "later", "directories", "canvases", "lists", "dms", "threads", "files",
+        "backgrounds and effects",
     ]
     static let parens = try! NSRegularExpression(pattern: "\\([^()]*\\)|\\[[^\\]]*\\]")
     static let roleTail = try! NSRegularExpression(
@@ -311,9 +315,12 @@ enum Heuristics {
             for (k, v) in decorated { lastDecorations[k] = v }
             return nil
         }
-        let changed = lastDecorations[who] != label
+        // First sight is a BASELINE, not a change — mirrors Program.cs. Counting it as a change
+        // emitted an active-speaker event on the very first poll of every meeting (30 of 37 real
+        // events), usually naming the user's own tile.
+        let prev = lastDecorations[who]
         lastDecorations[who] = label
-        return changed ? Candidate(name: who, confidence: 0.75, strategy: "suffix-delta") : nil
+        return (prev != nil && prev != label) ? Candidate(name: who, confidence: 0.75, strategy: "suffix-delta") : nil
     }
 
     static func findActiveByPhrase(_ nodes: [AXNode], pool: Set<String>) -> Candidate? {

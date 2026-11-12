@@ -2,6 +2,7 @@
 // active-speaker intervals from speakers.jsonl. A name wins a speaker if it covers
 // ≥ 60% of that speaker's overlapped speech time.
 const fs = require('fs');
+const { segStartIso, segEndIso } = require('./transcriptUtils');
 
 const EMPTY_DIAGNOSTICS = {
   agentStatus: 'unknown', activeSpeakerCount: 0, rosterEventCount: 0, heuristics: null, malformedLines: 0,
@@ -67,48 +68,78 @@ function overlapMs(aStart, aEnd, bStart, bEnd) {
   return Math.max(0, Math.min(aEnd, bEnd) - Math.max(aStart, bStart));
 }
 
-// Mutates transcript segments: relabels "Speaker N" → real name where the vote is decisive.
-// Returns { renamed: { "1:3": "Priya Shah" }, roster: [...], rosterSources, diagnostics, votes }
-// `votes` carries the winning share per speaker so the resolver can express it as a confidence.
-function alignSpeakers(transcript, jsonlPath) {
-  const { events, roster, rosterSources, diagnostics } = parseSpeakerEvents(jsonlPath);
-  const renamed = {};
+// What a vote must show before it may name a speaker. Measured on the real library: 30 of 37
+// agent active-speaker events were a single first-poll artifact, and ONE such event, held for its
+// 15 s, used to win a 100% share of the overlapped time and name a voice with thousands of words —
+// usually as the signed-in user. A real speaking signal repeats; a name must be seen several times,
+// over a real stretch of the meeting, covering a real part of what that voice said.
+const VOTE_RULES = {
+  minEvents: 3,          // distinct active-speaker events naming this person over this voice
+  minSpanMs: 20000,      // first → last of those events
+  minShare: 0.6,         // of the time where ANY event overlapped this voice
+  minCoverage: 0.1,      // of this voice's TOTAL speech time
+};
+
+// PURE: never touches the transcript. Labels are applied in exactly one place (resolveSpeakers),
+// so a vote the resolver rejects can no longer leave its name stuck on the segments — which is how
+// the user's own name ended up on remote voices in 10 meetings.
+// Returns { "1:<dz>": { name, share, coverage, events, confidence } }.
+function voteSpeakers(transcript, events, rules = VOTE_RULES) {
   const votes = {};
-  if (!events.length || !transcript?.length) return { renamed, roster, rosterSources, diagnostics, votes };
-  const intervals = toIntervals(events);
+  if (!events?.length || !transcript?.length) return votes;
+  const intervals = toIntervals(events).map((iv, i) => ({ ...iv, ts: events[i].ts }));
 
   const bySpeaker = new Map(); // diarizedSpeaker → [{start,end}] absolute ms
   for (const seg of transcript) {
-    if (seg.channel !== 1 || !seg.words?.length) continue;
-    const start = Date.parse(seg.words[0].start_timestamp.absolute);
-    const end = Date.parse(seg.words[seg.words.length - 1].end_timestamp.absolute);
+    if (seg.channel !== 1) continue;
+    const start = Date.parse(segStartIso(seg));
+    const end = Date.parse(segEndIso(seg));
+    if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) continue;
     if (!bySpeaker.has(seg.diarizedSpeaker)) bySpeaker.set(seg.diarizedSpeaker, []);
     bySpeaker.get(seg.diarizedSpeaker).push({ start, end });
   }
 
   for (const [dz, ranges] of bySpeaker) {
-    const tally = new Map();
+    const speechMs = ranges.reduce((a, r) => a + (r.end - r.start), 0);
+    const tally = new Map(); // name → { ms, events:Set<ts> }
     let total = 0;
     for (const r of ranges) {
       for (const iv of intervals) {
         const ms = overlapMs(r.start, r.end, iv.start, iv.end) * iv.weight;
-        if (ms > 0) { tally.set(iv.name, (tally.get(iv.name) || 0) + ms); total += ms; }
+        if (ms <= 0) continue;
+        const t = tally.get(iv.name) || { ms: 0, events: new Set() };
+        t.ms += ms; t.events.add(iv.ts);
+        tally.set(iv.name, t);
+        total += ms;
       }
     }
     if (!total) continue;
-    const [topName, topMs] = [...tally.entries()].sort((a, b) => b[1] - a[1])[0];
-    const share = topMs / total;
-    if (share >= 0.6) {
-      renamed[`1:${dz}`] = topName;
-      // Map the winning share onto a confidence: a unanimous vote reads as certain, a bare
-      // 60% squeak reads as merely likely, so the UI can mark the latter unverified.
-      votes[`1:${dz}`] = { name: topName, share, confidence: Math.min(0.95, 0.6 + share * 0.35) };
-      for (const seg of transcript) {
-        if (seg.channel === 1 && seg.diarizedSpeaker === dz) seg.speaker = topName;
-      }
-    }
+    const [name, top] = [...tally.entries()].sort((a, b) => b[1].ms - a[1].ms)[0];
+    const r = rules;
+    const ts = [...top.events].sort((a, b) => a - b);
+    const share = top.ms / total;
+    const coverage = speechMs ? top.ms / speechMs : 0;
+    if (ts.length < r.minEvents || ts[ts.length - 1] - ts[0] < r.minSpanMs) continue;
+    if (share < r.minShare || coverage < r.minCoverage) continue;
+    votes[`1:${dz}`] = {
+      name, share, coverage, events: ts.length,
+      // Unanimous and well-covered reads as certain; a bare pass reads as merely likely, so the UI
+      // marks it unverified.
+      confidence: Math.min(0.95, 0.55 + share * 0.25 + Math.min(coverage, 0.5) * 0.3),
+      source: 'native-agent',
+    };
   }
-  return { renamed, roster, rosterSources, diagnostics, votes };
+  return votes;
 }
 
-module.exports = { alignSpeakers, parseSpeakerEvents };
+// Back-compat wrapper (tests, tooling). No longer mutates the transcript.
+// Returns { renamed: { "1:3": "Priya Shah" }, roster, rosterSources, diagnostics, votes }.
+function alignSpeakers(transcript, jsonlPath) {
+  const { events, roster, rosterSources, diagnostics } = parseSpeakerEvents(jsonlPath);
+  const votes = voteSpeakers(transcript, events);
+  const renamed = {};
+  for (const [k, v] of Object.entries(votes)) renamed[k] = v.name;
+  return { renamed, roster, rosterSources, diagnostics, votes, events };
+}
+
+module.exports = { alignSpeakers, parseSpeakerEvents, voteSpeakers, VOTE_RULES };

@@ -15,18 +15,36 @@ const { put, del } = require('@vercel/blob');
 
 const DG_QUERY = 'model=nova-3&multichannel=true&diarize=true&utterances=true&smart_format=true&punctuate=true';
 
+// Participant names as Deepgram keyterm hints, so "Ramir" is not transcribed "Ramiro" and
+// "Navroop" not "Navru" — a misspelled name can never be matched back to the roster. Sanitised
+// hard: names only, bounded count and length, because these come from the client.
+const MAX_KEYTERMS = 50;
+function keytermQuery(list) {
+  if (!Array.isArray(list)) return '';
+  const seen = new Set();
+  const out = [];
+  for (const raw of list) {
+    const t = String(raw || '').normalize('NFC').replace(/[^\p{L}\p{M}' .-]/gu, ' ').replace(/\s+/g, ' ').trim();
+    if (t.length < 2 || t.length > 40 || seen.has(t.toLowerCase())) continue;
+    seen.add(t.toLowerCase());
+    out.push(`&keyterm=${encodeURIComponent(t)}`);
+    if (out.length >= MAX_KEYTERMS) break;
+  }
+  return out.join('');
+}
+
 module.exports = async (req, res) => {
   if (req.method !== 'POST') return json(res, 405, { error: 'POST only' });
   const key = env('DEEPGRAM_API_KEY');
   if (!key) return json(res, 200, { error: 'Deepgram not configured on server.' });
 
-  const { url, id: clientId } = await readJson(req);
+  const { url, id: clientId, keyterms } = await readJson(req);
   if (!url) return json(res, 200, { error: 'Missing audio url.' });
   // Client supplies the id so it can poll /result as a fallback if this response is lost.
   const id = clientId || `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 
   try {
-    const dg = await fetch(`https://api.deepgram.com/v1/listen?${DG_QUERY}`, {
+    const dg = await fetch(`https://api.deepgram.com/v1/listen?${DG_QUERY}${keytermQuery(keyterms)}`, {
       method: 'POST',
       headers: { Authorization: `Token ${key}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({ url }),

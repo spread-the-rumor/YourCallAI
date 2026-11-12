@@ -7,6 +7,10 @@ const fs = require('fs');
 const fsp = fs.promises;
 
 if (require('electron-squirrel-startup')) app.quit();
+// Test hook: run against a separate data folder (a copy of a library), so a dev build can be
+// exercised end to end beside the installed app without touching the real meetings or account.
+// Must run before anything reads userData (the single-instance lock included).
+if (process.env.YCAI_USER_DATA) app.setPath('userData', process.env.YCAI_USER_DATA);
 
 const store = require('./store');
 const settingsStore = require('./settingsStore');
@@ -17,19 +21,19 @@ const detector = require('./detector');
 const { startNameAgent } = require('./agents');
 const audioEndpoints = require('./audioEndpoints');
 const { transcribeRecording } = require('./transcribe');
-const { alignSpeakers } = require('./align');
-const { mergeRoster } = require('./roster');
-const { resolveSpeakers, readSpeakerMap, sampleFor } = require('./speakerResolve');
+const { sampleFor } = require('./speakerResolve');
 const { summarizeTranscript, summaryFailed } = require('./ai/summarize');
 const { askMeeting } = require('./ai/chat');
 const { extractActionItems } = require('./ai/extractActionItems');
-const { inferSpeakerNames } = require('./ai/inferSpeakerNames');
 const slack = require('./integrations/slack');
 const getoverview = require('./integrations/getoverview');
 const asana = require('./integrations/asana');
 const auth = require('./auth');
 const sync = require('./sync');
-const { transcriptToText, segSpeaker, segText, meetingDate } = require('./transcriptUtils');
+const { transcriptToText, segSpeaker, segText, meetingDate, durationSeconds } = require('./transcriptUtils');
+const { resolveNames, loadTranscriptForRerun } = require('./names');
+const { nameHints } = require('./people');
+const systemAudio = require('./systemAudio');
 
 // Webpack magic constants (injected by @electron-forge/plugin-webpack)
 /* global MAIN_WINDOW_WEBPACK_ENTRY, MAIN_WINDOW_PRELOAD_WEBPACK_ENTRY,
@@ -57,6 +61,9 @@ let pendingStop = null; // { timer, watch } while the ending countdown runs
 const AUDIO_ACTIVE_MS = 20000;
 const STOP_COUNTDOWN_MS = 15000;
 const isAudioActive = () => !!rec && (Date.now() - lastFarEndSoundTs < AUDIO_ACTIVE_MS);
+// Meeting audio specifically (not the user's mic). The detector and the ending countdown use this.
+let lastSysSoundTs = 0;
+const isSystemAudioActive = () => !!rec && (Date.now() - lastSysSoundTs < AUDIO_ACTIVE_MS);
 
 // Health-monitor watchdog. lastTickTs is stamped by every 'capture-alive'; if those stop while
 // a recording is live, the renderer's monitor (and therefore every capture detector) is gone.
@@ -70,7 +77,20 @@ let monitorDeadReported = false;
 // user learns to dismiss is worse than no warning. 45s is ~3x the measured worst case and
 // still catches a dead monitor inside the first minute.
 const MONITOR_DEAD_MS = 45000;
-const PLATFORM_LABELS = { 'google-meet': 'Google Meet', zoom: 'Zoom', teams: 'Microsoft Teams' };
+const PLATFORM_LABELS = {
+  'google-meet': 'Google Meet', zoom: 'Zoom', teams: 'Microsoft Teams', slack: 'Slack huddle',
+  webex: 'Webex', ringcentral: 'RingCentral', goto: 'GoTo Meeting', discord: 'Discord',
+  skype: 'Skype', whatsapp: 'WhatsApp', telegram: 'Telegram', browser: 'Browser call', other: 'Call',
+};
+
+// Every detector decision, with the signal that caused it, in userData/detector.jsonl. Detection
+// used to log only to the console, so "why didn't it detect / why did it keep recording" could
+// never be answered after the fact. Rotated at 5 MB.
+function appendDetectorLog(evt) {
+  const file = path.join(app.getPath('userData'), 'detector.jsonl');
+  fsp.stat(file).then((s) => (s.size > 5 * 1024 * 1024 ? fsp.rename(file, `${file}.1`) : null)).catch(() => {})
+    .then(() => fsp.appendFile(file, JSON.stringify({ ts: Date.now(), ...evt }) + '\n')).catch(() => {});
+}
 
 // ---------- helpers ----------
 
@@ -203,6 +223,14 @@ function notify(info) {
       title = 'Meeting audio recovered';
       body = `Switched Windows output to ${info.deviceName} — still recording.`;
     }
+    else if (info.kind === 'recording-ended') {
+      title = 'Recording ended early';
+      body = `${info.detail || 'Capture stopped'} — what was captured is being transcribed.`;
+    }
+    else if (info.kind === 'meeting-over') {
+      title = 'Meeting seems to be over';
+      body = 'The call has ended — open Your Call AI to stop recording.';
+    }
     else { title = 'Meeting detected'; body = `${platform} — open Your Call AI to start recording.`; }
     const n = new Notification({ title, body });
     n.on('click', () => { if (mainWindow && !mainWindow.isDestroyed()) { mainWindow.show(); mainWindow.focus(); } });
@@ -218,10 +246,11 @@ function beginPendingStop() {
     clearInterval(pendingStop.watch);
     pendingStop = null;
     hidePopup();
-    stopRecording().catch((e) => console.error('[detector] auto-stop failed:', e.message));
+    stopRecording({ reason: 'meeting-ended' }).catch((e) => console.error('[detector] auto-stop failed:', e.message));
   }, STOP_COUNTDOWN_MS);
-  // If meeting audio returns mid-countdown, the meeting didn't really end — cancel.
-  const watch = setInterval(() => { if (isAudioActive()) cancelPendingStop('audio resumed'); }, 1000);
+  // If MEETING audio returns mid-countdown, the meeting didn't really end — cancel. Not the mic:
+  // room noise used to cancel every countdown, which is how recordings ran on for an hour.
+  const watch = setInterval(() => { if (isSystemAudioActive()) cancelPendingStop('meeting audio resumed'); }, 1000);
   pendingStop = { timer, watch };
 }
 function cancelPendingStop(reason) {
@@ -291,13 +320,17 @@ async function startRecording(source, platform = '', title = '') {
   // resumes in stopRecording; the source file is untouched so the work is never lost.
   normalize.pauseForRecording();
   lastFarEndSoundTs = Date.now(); // assume the meeting is live at the moment we start
+  lastSysSoundTs = Date.now();
 
   const id = rid();
   const dir = path.join(recordingsDir, id);
   await fsp.mkdir(dir, { recursive: true });
+  const call = detectorHandle && detectorHandle.current();
   const meta = {
     id, startedAt: nowIso(), endedAt: null, status: 'recording',
-    source, platform: platform || null, title: title || null,
+    source, platform: platform || (call && call.platform) || null, title: title || (call && call.title) || null,
+    // How it started and which app was in the call — for diagnosing detection, and for names.
+    startedBy: source, callApp: (call && call.app) || null,
   };
   await fsp.writeFile(path.join(dir, 'meta.json'), JSON.stringify(meta, null, 2));
 
@@ -318,10 +351,32 @@ async function startRecording(source, platform = '', title = '') {
   rec.agent = startNameAgent(platform || 'auto', (line) => {
     if (rec && rec.id === id) rec.speakersStream.write(line + '\n');
   });
+  // Native capture of EVERY output device, independent of the Windows default (systemAudio.js).
+  // Started before the recorder window so it is already running when the recorder's audio begins.
+  // Its events go straight to this recording's capture.jsonl — including the final 'stopped',
+  // which arrives after `rec` has been cleared.
+  const captureStream = rec.captureStream;
+  const recRef = rec;
+  rec.nativeAudio = systemAudio.start(dir, (evt) => {
+    if (evt && evt.type === 'native-capture') {
+      if (evt.state === 'endpoint-added') recRef.nativeEndpointSeen = true;
+      if (evt.state === 'running') recRef.nativeEndpoints = evt.endpoints || [];
+    }
+    try { if (!captureStream.destroyed) captureStream.write(JSON.stringify({ ts: Date.now(), ...evt }) + '\n'); }
+    catch { /* diagnostics only */ }
+  });
 
   const win = createRecorderWindow();
+  // The recorder renderer crashing used to leave main showing "recording" forever while nothing
+  // was written. Finalize what was captured and transcribe it, and say so.
+  win.webContents.on('render-process-gone', (e, details) => {
+    if (!rec || rec.id !== id) return;
+    appendCaptureDiag({ type: 'recorder-crashed', reason: details && details.reason });
+    finalizeUnexpected(`the recorder stopped (${(details && details.reason) || 'crashed'})`);
+  });
   win.webContents.once('did-finish-load', () => win.webContents.send('start-capture', {
     forceVideoMime: process.env.YCAI_FORCE_VIDEO_MIME || '',
+    testHooks: !app.isPackaged && process.env.YCAI_TEST_HOOKS === '1',
   }));
 
   hidePopup();
@@ -412,6 +467,8 @@ async function finalizeRecording(failedMessage = null) {
   const current = rec;
   rec = null;
   current.agent?.stop();
+  // Before the capture stream closes: the native side flushes system.pcm and logs 'stopped'.
+  if (current.nativeAudio) await current.nativeAudio.stop().catch(() => {});
   await Promise.all([
     closeStream(current.videoStream),
     closeStream(current.audioStream),
@@ -441,9 +498,10 @@ async function finalizeRecording(failedMessage = null) {
   return current.id;
 }
 
-async function stopRecording() {
+async function stopRecording(opts = {}) {
   if (!rec) return { ok: false, error: 'Not recording.' };
   cancelPendingStop('recording stopped'); // clear any in-flight ending countdown
+  patchMeta(rec.dir, { stopReason: opts.reason || 'user' }).catch(() => {});
   const stopped = new Promise((resolve) => { rec.stopResolve = resolve; });
   if (recorderWindow && !recorderWindow.isDestroyed()) {
     recorderWindow.webContents.send('stop-capture');
@@ -482,14 +540,50 @@ ipcMain.on('capture-chunk', (e, { rec: which, buf }) => {
   try { stream.write(Buffer.isBuffer(buf) ? buf : Buffer.from(buf)); }
   catch (err) { console.error('[capture] chunk write failed:', err.message); }
 });
-ipcMain.on('capture-stopped', () => { rec?.stopResolve?.(); });
+// A stop the user did not ask for (stopResolve unset) used to be swallowed: the recorder had
+// already torn its capture down, main kept showing "recording", and nothing was saved until the
+// user pressed Stop — 0c8r and uvl0 both lost their audio this way when the screen video track
+// ended. The recorder no longer stops itself on a video-track end, but any unsolicited stop is
+// now finalized and transcribed instead of being lost.
+ipcMain.on('capture-stopped', () => {
+  if (!rec) return;
+  if (rec.stopResolve) { rec.stopResolve(); return; }
+  appendCaptureDiag({ type: 'unexpected-stop' });
+  finalizeUnexpected('capture stopped unexpectedly');
+});
+
+// True when native capture is running AND holding at least one live output device — the
+// evidence that meeting audio is being recorded no matter what Windows' default output is.
+function nativeCovering() {
+  if (!rec || !rec.nativeAudio || !rec.nativeAudio.isAlive() || !rec.nativeEndpointSeen) return false;
+  if (!rec.nativeEndpoints) return true; // no 15 s status line yet; endpoints were added
+  return rec.nativeEndpoints.some((e) => !e.dead);
+}
+
+// Used when capture ends without the user pressing Stop. Saves and transcribes what was captured,
+// and tells the user — a recording that quietly ended is the failure being fixed here.
+async function finalizeUnexpected(reason) {
+  if (!rec) return;
+  const { platform, title } = rec.meta;
+  await patchMeta(rec.dir, { stopReason: 'unexpected', stopDetail: reason }).catch(() => {});
+  const id = await finalizeRecording();
+  normalize.resume();
+  emitStatus('error', `Recording ended early — ${reason}. What was captured is being transcribed.`);
+  showPopup({ kind: 'recording-ended', detail: reason, platform, title });
+  if (id && !quitting) runPipeline(id);
+}
 ipcMain.on('capture-error', async (e, message) => {
   console.error('[capture]', message);
   await finalizeRecording(message);
   emitStatus('error', message);
 });
-// Recorder liveness heartbeat: meeting audio is flowing → keeps the detector's (A) signal alive.
-ipcMain.on('capture-audio', (e, active) => { if (active) lastFarEndSoundTs = Date.now(); });
+// Recorder liveness heartbeat. `sys` = MEETING audio (the system stream) is playing; only that may
+// keep the detector's meeting alive or cancel an ending countdown. Accepts the old boolean form.
+ipcMain.on('capture-audio', (e, v) => {
+  const now = Date.now();
+  if (v === true || (v && v.active)) lastFarEndSoundTs = now;
+  if (v && v.sys) lastSysSoundTs = now;
+});
 
 // Watchdog for the health monitor ITSELF, not for the audio it measures. On 2026-09-17 the
 // renderer's level timer stopped at t=150s and the app recorded 46 more minutes having lost
@@ -516,6 +610,13 @@ ipcMain.on('capture-diag', (e, evt) => appendCaptureDiag(evt));
 // half-captured meeting still transcribes (mic-only lands on ch0), a stopped one is gone.
 ipcMain.on('capture-degraded', (e, info) => {
   if (!rec || pendingStop) return;
+  // Chromium's loopback lost the meeting, but native capture records every output device and is
+  // running — the meeting audio is still being captured, so a "not captured" alarm would be false.
+  if (info.sysDead && !info.micDead && !info.videoDead && nativeCovering()) {
+    appendCaptureDiag({ type: 'degraded-suppressed', reason: info.reason, why: 'native-capture-running' });
+    patchMeta(rec.dir, { captureHealth: { ...info, coveredByNative: true, at: nowIso() } }).catch(() => {});
+    return;
+  }
   const both = info.micDead && info.sysDead;
   // videoDead first: without this branch a dead video recorder rendered "Microphone not
   // captured", which is actively wrong and sends the user to the wrong setting.
@@ -555,6 +656,19 @@ ipcMain.on('capture-recovered', () => {
 ipcMain.on('capture-switch-endpoint', async (e, info) => {
   if (!rec || pendingStop) return;
   const reason = (info && info.reason) || 'unknown';
+  // `quiet`: the renderer only saw digital silence, which on this class of hardware is ALSO what
+  // a working-but-idle output reads (exactly 0). Measured: 101 such alarms in the v2.4.0 logs,
+  // nearly all just a quiet far end. So a quiet check only acts when another device demonstrably
+  // HAS sound, and never shows a "nothing is playing" popup.
+  const quiet = !!(info && info.quiet);
+
+  // Native capture records every output device regardless of the Windows default, so there is
+  // nothing to rescue by changing it — and changing a system-wide setting the user did not touch
+  // is not free. Only fall back to switching when native capture is not running.
+  if (nativeCovering()) {
+    appendCaptureDiag({ type: 'endpoint-switch-skipped', reason, why: 'native-capture-covers-all-outputs' });
+    return;
+  }
 
   if (!audioEndpoints.isAvailable()) {
     appendCaptureDiag({ type: 'endpoint-switch-skipped', reason, why: 'agent-unavailable' });
@@ -578,7 +692,7 @@ ipcMain.on('capture-switch-endpoint', async (e, info) => {
     // but say WHICH device we are listening to, because "Meeting audio not captured" alone tells
     // the user nothing they can act on.
     appendCaptureDiag({ type: 'endpoint-switch-none', reason, currentDefault: current && current.name });
-    if (current) {
+    if (current && !quiet) {
       showPopup({
         kind: 'capture-degraded', micDead: false, sysDead: true, reason: 'no-live-endpoint',
         deviceName: current.name, platform: rec.meta.platform, title: rec.meta.title,
@@ -616,13 +730,45 @@ function buildTitle(dateIso) {
   })}`;
 }
 
-async function runPipeline(recordingId) {
+// Per-recording pipeline timings. Before this nothing was logged, so "why did this meeting take
+// four minutes" could only be guessed at from file mtimes — upload, Deepgram and each AI call
+// were indistinguishable. Append-only JSONL beside capture.jsonl and speakers.jsonl.
+function pipelineLogger(dir) {
+  const file = path.join(dir, 'pipeline.jsonl');
+  return (step, extra = {}) => {
+    fsp.appendFile(file, JSON.stringify({ ts: Date.now(), step, ...extra }) + '\n').catch(() => {});
+  };
+}
+
+// The summary is generated in parallel with name resolution, on the provisional "Speaker N"
+// labels, and the resolved names are substituted in afterwards. `before` maps "<ch>:<dz>" to the
+// label the summarizer saw; `after` is the resolved transcript. Only generic labels are rewritten,
+// longest first and digit-bounded so "Speaker 1" can never eat the front of "Speaker 12".
+function relabelSummary(summary, before, after) {
+  if (!summary || summaryFailed(summary)) return summary;
+  const finalByKey = new Map();
+  for (const s of after || []) finalByKey.set(`${s.channel}:${s.diarizedSpeaker}`, segSpeaker(s));
+  const swaps = [];
+  for (const [key, oldLabel] of before) {
+    const next = finalByKey.get(key);
+    if (next && next !== oldLabel && /^Speaker \d+$/.test(oldLabel)) swaps.push([oldLabel, next]);
+  }
+  swaps.sort((a, b) => b[0].length - a[0].length);
+  let out = summary;
+  for (const [from, to] of swaps) out = out.replace(new RegExp(`\\b${from}(?!\\d)`, 'g'), to);
+  return out;
+}
+
+async function runPipeline(recordingId, opts = {}) {
   if (pipelineRunning.has(recordingId)) return;
   pipelineRunning.add(recordingId);
   const dir = path.join(recordingsDir, recordingId);
+  const plog = pipelineLogger(dir);
+  const tStart = Date.now();
   try {
     const meta = await readMeta(dir);
     if (!meta) return;
+    plog('start', { sinceEndMs: meta.endedAt ? tStart - Date.parse(meta.endedAt) : null, retry: !!opts.retry });
 
     // Ensure a visible card exists before transcription — covers requeued/orphaned recordings
     // (folder on disk but no meetings.json entry) so they surface immediately, not only if the
@@ -646,12 +792,26 @@ async function runPipeline(recordingId) {
     // The channel-0 speaker is whoever is signed in on this machine; the env var is the fallback.
     const userName = auth.getUser()?.name || process.env.USER_DISPLAY_NAME || 'You';
 
+    const prior = await store.getMeeting(recordingId);
+
     let transcript = null;
     let transcribeError = null;
+    let tStep = Date.now();
     try {
-      transcript = await transcribeRecording(dir, meta.startedAt, userName);
+      const audioPath = await systemAudio.prepareUpload(dir, plog).catch((err) => {
+        plog('native-audio-remix-failed', { error: err.message });
+        return null;
+      });
+      if (audioPath) plog('native-audio-remix', { file: path.basename(audioPath) });
+      transcript = await transcribeRecording(dir, meta.startedAt, userName, {
+        audioPath: audioPath || undefined,
+        keyterms: await nameHints({ dir, meta, prior, userName }).catch(() => []),
+        onStep: (name, ms, extra) => plog(name, { ms, ...(extra || {}) }),
+      });
+      plog('transcribe', { ms: Date.now() - tStep, segments: transcript.length });
     } catch (err) {
       transcribeError = err.message;
+      plog('transcribe', { ms: Date.now() - tStep, error: err.message });
       console.error('[pipeline] transcription failed:', err.message);
       await patchMeta(dir, { status: 'failed', error: err.message });
     }
@@ -662,43 +822,37 @@ async function runPipeline(recordingId) {
 
     let summary;
     if (transcript) {
-      // §7 Layer 1: native-agent alignment; Layer 2: roster-constrained AI inference;
-      // then resolveSpeakers merges those with the user's prior manual renames.
-      emitProgress(recordingId, 'resolving-names');
-      const prior = await store.getMeeting(recordingId);
-      const { roster, rosterSources, diagnostics, votes } =
-        alignSpeakers(transcript, path.join(dir, 'speakers.jsonl'));
-      const merged = mergeRoster([
-        ...(rosterSources?.length ? rosterSources : [{ names: roster, source: 'agent-roster', confidence: 0.9 }]),
-        // Prior manual renames are ground truth for who was in the room.
-        { names: Object.values(readSpeakerMap(prior?.speakerMap)).map((e) => e.name), source: 'manual', confidence: 1 },
-      ]);
-      const inferred = await inferSpeakerNames(transcript, merged, {
-        subject: meta.title || null,
-        userName,
-      });
-      const resolved = resolveSpeakers({
-        transcript,
-        roster: merged,
-        priorSpeakerMap: prior?.speakerMap,
-        userName,
-        inferred,
-        alignment: votes && Object.keys(votes).length ? votes : null,
-      });
-      transcript = resolved.transcript;
-      resolvedSpeakerMap = resolved.speakerMap;
-      nameAttribution = {
-        agent: diagnostics || null,
-        roster: merged.map((r) => r.name),
-        unresolved: resolved.unresolved,
-        sources: resolved.sources,
-      };
-      await fsp.writeFile(path.join(dir, 'transcript.json'), JSON.stringify(transcript, null, 2));
+      // The full transcript (every word) goes to disk before anything else touches it: names can
+      // be re-resolved from this file later without re-transcribing.
+      await fsp.writeFile(path.join(dir, 'transcript.raw.json'), JSON.stringify(transcript));
 
-      emitStatus('processing', 'Generating summary…');
+      // Summary and names run CONCURRENTLY. They used to be strictly serial — up to three name
+      // calls, then the summary — and the summary never needed the names: it is written on the
+      // provisional labels and relabelSummary() substitutes the resolved names afterwards.
+      const labelsBefore = new Map();
+      for (const s of transcript) labelsBefore.set(`${s.channel}:${s.diarizedSpeaker}`, segSpeaker(s));
+      const summaryInput = transcript.map((s) => ({
+        speaker: segSpeaker(s), channel: s.channel, diarizedSpeaker: s.diarizedSpeaker, text: segText(s),
+      }));
+      emitStatus('processing', 'Resolving names and generating summary…');
       emitProgress(recordingId, 'summarizing');
-      summary = await summarizeTranscript(transcript, (delta) =>
-        emitProgress(recordingId, 'summarizing', delta));
+      const tSummary = Date.now();
+      const summaryP = summarizeTranscript(summaryInput, (delta) =>
+        emitProgress(recordingId, 'summary-delta', delta)).then((s) => {
+        plog('summary', { ms: Date.now() - tSummary, ok: !summaryFailed(s) });
+        return s;
+      });
+
+      tStep = Date.now();
+      emitProgress(recordingId, 'resolving-names');
+      const names = await resolveNames({ dir, meta, transcript, prior, userName, plog });
+      plog('names', { ms: Date.now() - tStep, unresolved: names.nameAttribution?.unresolved?.length ?? null });
+      transcript = names.transcript;
+      resolvedSpeakerMap = names.speakerMap;
+      nameAttribution = names.nameAttribution;
+      await fsp.writeFile(path.join(dir, 'transcript.json'), JSON.stringify(transcript));
+
+      summary = relabelSummary(await summaryP, labelsBefore, transcript);
       await patchMeta(dir, { status: 'complete' });
     } else {
       summary = `Summary unavailable — transcription failed (${transcribeError}). Use Retry transcription.`;
@@ -733,7 +887,9 @@ async function runPipeline(recordingId) {
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send('recording-complete', saved);
     }
+    plog('done', { totalMs: Date.now() - tStart, sinceEndMs: meta.endedAt ? Date.now() - Date.parse(meta.endedAt) : null });
   } catch (err) {
+    plog('fatal', { error: err.message });
     console.error('[pipeline] fatal:', err);
     await patchMeta(dir, { status: 'failed', error: err.message }).catch(() => {});
     // Never let an IO/store throw silently discard the recording: ensure a card still exists.
@@ -818,19 +974,35 @@ async function retentionSweep() {
 // points in a recording's life (placeholder, pipeline upsert, sync rehydrate) and the file it
 // names can change afterwards when the normalizer swaps capture.* for video.mp4 — so the stored
 // value is treated as a cache nobody reads. This makes a dead ▶ Recording link unrepresentable.
+const withVideoUrl = (m) => (m && m.recordingId
+  ? { ...m, videoUrl: media.mediaUrl(m.recordingId, path.join(recordingsDir, m.recordingId)) }
+  : m);
+
+// The LIST carries no transcripts or chat. It used to ship every meeting in full on every
+// refresh — measured at 115 MB serialized and ~2.3 s of frozen renderer per refresh on a real
+// library. The sidebar needs titles and dates; the open meeting is fetched by 'get-meeting'.
+function listItem(m) {
+  const { transcript, chat, ...rest } = m;
+  return {
+    ...rest,
+    hasTranscript: Array.isArray(transcript) && transcript.length > 0,
+    durationSec: durationSeconds(transcript),
+    participants: [...new Set((transcript || []).map(segSpeaker))],
+  };
+}
 ipcMain.handle('list-meetings', async () => {
   const meetings = await store.loadMeetings();
-  return meetings.map((m) => (m.recordingId
-    ? { ...m, videoUrl: media.mediaUrl(m.recordingId, path.join(recordingsDir, m.recordingId)) }
-    : m));
+  return meetings.map((m) => withVideoUrl(listItem(m)));
 });
+ipcMain.handle('get-meeting', async (e, id) => withVideoUrl(await store.getMeeting(id)));
+ipcMain.handle('search-meetings', (e, query) => store.searchMeetings(query));
 ipcMain.handle('update-meeting', (e, id, patch) => {
   const allowed = {};
   for (const k of ['title', 'content', 'chat']) if (k in (patch || {})) allowed[k] = patch[k];
   return store.updateMeeting(id, allowed);
 });
 ipcMain.handle('delete-meeting', (e, id) => store.softDelete(id));
-ipcMain.handle('list-trash', () => store.loadTrash());
+ipcMain.handle('list-trash', async () => (await store.loadTrash()).map(listItem));
 ipcMain.handle('restore-meeting', (e, id) => store.restore(id));
 ipcMain.handle('delete-meeting-permanent', async (e, id) => {
   await store.deletePermanent(id, recordingsDir);
@@ -840,7 +1012,10 @@ ipcMain.handle('delete-meeting-permanent', async (e, id) => {
 ipcMain.handle('ask-meeting', async (e, id, question) => {
   const meeting = await store.getMeeting(id);
   if (!meeting) return { answer: 'Meeting not found.' };
-  const answer = await askMeeting(meeting.transcript, meeting.chat, question);
+  // Streamed: the reply appears as it is generated instead of after a silent "Thinking…".
+  const answer = await askMeeting(meeting.transcript, meeting.chat, question, (delta) => {
+    if (!e.sender.isDestroyed()) e.sender.send('chat-delta', { id, delta });
+  });
   const chat = [...(meeting.chat || []), { role: 'user', content: question }, { role: 'assistant', content: answer }];
   await store.updateMeeting(id, { chat });
   return { answer };
@@ -859,8 +1034,64 @@ ipcMain.handle('regenerate-summary', async (e, id) => {
 });
 
 ipcMain.handle('retry-transcription', async (e, id) => {
-  runPipeline(id);
+  runPipeline(id, { retry: true });
   return { ok: true };
+});
+
+// Re-run speaker naming on a saved recording — no re-transcription, no Deepgram cost. Manual
+// renames are kept (they are the strongest signal). Returns the updated meeting.
+async function reresolveMeeting(id, { regenerateSummary = false } = {}) {
+  const meeting = await store.getMeeting(id);
+  if (!meeting || !meeting.recordingId) return { ok: false, error: 'Meeting not found.' };
+  if (pipelineRunning.has(meeting.recordingId)) return { ok: false, error: 'This meeting is still processing.' };
+  const dir = path.join(recordingsDir, meeting.recordingId);
+  const userName = auth.getUser()?.name || process.env.USER_DISPLAY_NAME || 'You';
+  const transcript = await loadTranscriptForRerun(dir, meeting, userName);
+  if (!transcript) return { ok: false, error: 'No transcript to resolve.' };
+  const meta = (await readMeta(dir)) || { id: meeting.recordingId, startedAt: meeting.date };
+  const before = JSON.stringify(Object.entries(meeting.speakerMap || {}).map(([k, v]) => [k, v && (v.name || v)]).sort());
+  const names = await resolveNames({ dir, meta, transcript, prior: meeting, userName, plog: pipelineLogger(dir) });
+  const after = JSON.stringify(Object.entries(names.speakerMap).map(([k, v]) => [k, v.name]).sort());
+  const patch = {
+    transcript: names.transcript,
+    speakerMap: names.speakerMap,
+    nameAttribution: names.nameAttribution,
+  };
+  const changed = before !== after;
+  if (changed) patch.actionItems = null; // assignees came from the old names
+  // The summary was written with the old names. Rewrite it when the user asked for this meeting
+  // (one AI call they are waiting for); the batch path leaves summaries alone.
+  if (changed && regenerateSummary) {
+    const summary = await summarizeTranscript(names.transcript, () => {});
+    if (!summaryFailed(summary)) {
+      const userEdited = meeting.content && meeting.content !== meeting.summary;
+      patch.summary = summary;
+      if (!userEdited) patch.content = summary;
+    }
+  }
+  const updated = await store.updateMeeting(id, patch);
+  return { ok: true, changed, meeting: withVideoUrl(updated) };
+}
+ipcMain.handle('reresolve-names', (e, id) => reresolveMeeting(id, { regenerateSummary: true })
+  .catch((err) => ({ ok: false, error: err.message })));
+// Whole library, one meeting at a time (bounded AI load). Progress goes to the status pill.
+let reresolveAllRunning = false;
+ipcMain.handle('reresolve-all-names', async () => {
+  if (reresolveAllRunning) return { ok: false, error: 'Already running.' };
+  reresolveAllRunning = true;
+  try {
+    const meetings = (await store.loadMeetings()).filter((m) => m.recordingId && Array.isArray(m.transcript) && m.transcript.length);
+    let done = 0, changed = 0, failed = 0;
+    for (const m of meetings) {
+      emitStatus('processing', `Re-resolving speaker names ${done + 1}/${meetings.length}…`);
+      const r = await reresolveMeeting(m.id).catch((err) => ({ ok: false, error: err.message }));
+      done++;
+      if (!r.ok) failed++; else if (r.changed) changed++;
+      if (r.ok && mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('meeting-updated', r.meeting);
+    }
+    emitStatus(rec ? 'recording' : 'idle');
+    return { ok: true, total: meetings.length, changed, failed };
+  } finally { reresolveAllRunning = false; }
 });
 
 ipcMain.handle('rename-speaker', async (e, id, channel, diarizedSpeaker, newName) => {
@@ -1051,7 +1282,8 @@ ipcMain.handle('save-settings', async (e, patch) => {
 });
 ipcMain.handle('get-effective-config', () => settingsStore.getConfiguredFlags());
 ipcMain.handle('get-app-version', () => app.getVersion());
-ipcMain.handle('restart-app', () => { app.relaunch(); app.exit(0); });
+// app.exit skips will-quit, so the pending store write would be lost without this flush.
+ipcMain.handle('restart-app', async () => { await store.flush(); app.relaunch(); app.exit(0); });
 
 ipcMain.handle('auth-sign-in', () => auth.signIn());
 ipcMain.handle('auth-sign-out', () => auth.signOut());
@@ -1086,6 +1318,10 @@ if (!gotLock) {
   app.on('open-url', (e, url) => { e.preventDefault(); routeDeepLink(url); });
 
   app.whenReady().then(async () => {
+    // Start parsing meetings.json now, in parallel with the window being created, so the first
+    // list request finds it loaded. A one-time compaction runs here on the first launch after
+    // updating (see store.js); it backs the original up first.
+    store.load().catch((e) => console.error('[store] load failed:', e.message));
     await settingsStore.applyToEnv().catch((e) => console.error('[settings]', e.message));
     // Fire-and-forget: an 8s network call must not gate window creation (offline start still
     // works off the disk cache). But the renderer reads its flags once at boot, so when the
@@ -1155,7 +1391,8 @@ if (!gotLock) {
     createPopupWindow();
 
     detectorHandle = detector.start({
-      isAudioActive, // composite keep-alive signal (A): meeting audio still flowing
+      isSystemAudioActive, // keep-alive: MEETING audio still playing (never the user's mic)
+      log: (evt) => appendDetectorLog(evt),
       onDetected: (info) => {
         if (rec) {
           // Already recording. If a "meeting ended" countdown is running, the meeting came back.
@@ -1163,15 +1400,20 @@ if (!gotLock) {
           return;
         }
         pendingMeeting = info;
-        showPopup({ kind: 'detected', platform: info.platform, title: info.title });
-        emitStatus('meeting-detected', info.title);
+        const label = info.platform === 'other' || info.platform === 'browser'
+          ? `Call (${info.app})` : (PLATFORM_LABELS[info.platform] || info.platform);
+        showPopup({ kind: 'detected', platform: info.platform, title: info.title || label });
+        emitStatus('meeting-detected', info.title || label);
       },
-      onClosed: () => {
+      onClosed: (call) => {
         pendingMeeting = null;
-        // The detector fires this only when window AND mic AND audio have all been gone ~15s.
         if (rec?.meta.source === 'detected') {
           beginPendingStop(); // cancelable countdown, not a silent stop
-        } else if (!rec) {
+        } else if (rec) {
+          // A manually started recording is never stopped automatically — ask instead. It used
+          // to get no signal at all, so a huddle recording simply ran until someone noticed.
+          showPopup({ kind: 'meeting-over', platform: call && call.platform, title: rec.meta.title });
+        } else {
           hidePopup();
           emitStatus('idle');
         }
@@ -1216,7 +1458,13 @@ if (!gotLock) {
   // The before-quit path already kills it, but that handler is skipped entirely when nothing is
   // recording and no pipeline is in flight — and an orphaned ffmpeg would hold 100% CPU and a
   // file handle after the app is gone.
-  app.on('will-quit', () => { normalize.killCurrent('will-quit', { requeue: false }); });
+  app.on('will-quit', () => {
+    normalize.killCurrent('will-quit', { requeue: false });
+    if (detectorHandle) detectorHandle.stop(); // ends the --watch agent
+    // The store writes in the background (coalesced, ~300 ms behind). Nothing async is awaited
+    // here, so the last change is written synchronously.
+    try { store.flushSync(); } catch (err) { console.error('[store] final flush failed:', err.message); }
+  });
   process.on('exit', () => { normalize.killCurrent('process-exit', { requeue: false }); });
 
   app.on('window-all-closed', () => {

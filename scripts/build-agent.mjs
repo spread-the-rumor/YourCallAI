@@ -11,13 +11,17 @@
 // macOS. Missing toolchain is reported as a skip, not a failure: the app runs fine without the
 // agent, it just falls back to AI inference + the rename UI.
 import { spawnSync } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const isWin = process.platform === 'win32';
 const binary = path.join(root, 'agents', 'dist', isWin ? 'YourCallAgent.exe' : 'YourCallAgent');
+// A failed compile leaves the PREVIOUS binary in place, so "the file exists" is not success —
+// it used to print OK over a compile error. Success means the binary is newer than this run.
+const startedAt = Date.now();
+const fresh = () => existsSync(binary) && statSync(binary).mtimeMs >= startedAt - 1000;
 
 // NOTE: shell:false throughout. The repo path contains spaces ("D:\Your Call AI V2") and with
 // shell:true cmd.exe re-splits the arguments, so -File receives only "D:\Your".
@@ -47,7 +51,7 @@ if (isWin) {
   const script = path.join(root, 'agents', 'windows', 'build.ps1');
   // pwsh (PowerShell 7) is not on every machine; powershell.exe ships with Windows.
   let r = run('pwsh', ['-NoProfile', '-File', script]);
-  if (r.error || r.status !== 0 || !existsSync(binary)) {
+  if (r.error || r.status !== 0 || !fresh()) {
     if (r.error) console.log('[build:agent] pwsh unavailable, using powershell.exe…');
     r = run('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', script]);
   }
@@ -64,7 +68,7 @@ if (isWin) {
   process.exit(0);
 }
 
-if (existsSync(binary)) {
+if (fresh()) {
   console.log(`[build:agent] OK — ${path.relative(root, binary)}`);
   console.log('  Restart the app fully (kill all electron processes) to pick it up.');
   console.log(`  Diagnose a platform whose names do not resolve:  "${binary}" --dump`);

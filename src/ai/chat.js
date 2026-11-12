@@ -2,7 +2,8 @@
 const { chatCompletion } = require('./requesty');
 const { transcriptToPrompt } = require('../transcriptUtils');
 
-async function askMeeting(transcript, priorTurns, question) {
+// onDelta(chunk), when given, streams the reply as it is generated.
+async function askMeeting(transcript, priorTurns, question, onDelta) {
   const text = transcriptToPrompt(transcript);
   if (!text.trim()) return 'Chat unavailable — this meeting has no transcript.';
   try {
@@ -14,7 +15,7 @@ async function askMeeting(transcript, priorTurns, question) {
       ...(priorTurns || []).map((t) => ({ role: t.role, content: t.content })),
       { role: 'user', content: question },
     ];
-    const out = await chatCompletion(messages);
+    const out = await chatCompletion(messages, onDelta ? { onDelta } : {});
     return out.trim() || 'Chat unavailable — the AI returned an empty response.';
   } catch (err) {
     return `Chat unavailable — ${err.message}`;

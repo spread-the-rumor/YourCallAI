@@ -1,82 +1,188 @@
-// Layer 2 (§7): AI name inference for speakers still generic after alignment.
-// Returns { "Speaker 2": { name, confidence, evidence, source } } — only entries that survive the
-// guards below. Never throws.
+// AI name inference (§7): ONE call that names every still-generic remote speaker, then strict
+// validation in code. Never throws.
 //
-// Two things this layer must not do, because both produce a confidently wrong name that then
-// propagates into the summary, the action-item assignee and the Slack/Asana send:
-//   1. invent a name that nobody in the meeting has (guarded: roster is a CLOSED set when known);
-//   2. put the local user on a channel-1 speaker (guarded: ch0 is the user by construction).
+// This replaced four sequential tiers (strict → second pass → conversational → elimination). That
+// design cost up to three serial model calls per meeting, and measured on the real library it still
+// left 31% of remote speakers as "Speaker N". Its failures were structural, not a matter of tuning:
+//   - the strict prompt demanded an introduction or being addressed by name, so the HOST — the
+//     one person nobody addresses — was never named. All 17 of the user's manual renames were the
+//     host or dominant speaker (Hernan, 12 times).
+//   - the 2nd/3rd passes passed the roster as bare strings, which failed the trust test, so the
+//     closed set silently disappeared and anything was accepted at 0.55.
+//   - nothing knew who usually attends a recurring meeting, or what the meeting is called.
+// Now the model gets every candidate source at once — the meeting app's participant list, the
+// people who attend this recurring meeting, the meeting title — plus explicit host reasoning, and
+// must quote its evidence. Code then decides how far to trust each answer.
 const { chatCompletion, parseLooseJson } = require('./requesty');
-const { transcriptToNamePrompt, participants } = require('../transcriptUtils');
-const { matchToRoster, rosterNames, nameKey, rosterIsTrustworthy } = require('../roster');
+const { transcriptToNamePrompt, segSpeaker, segText } = require('../transcriptUtils');
+const { matchToRoster, rosterNames, nameKey, isPersonName } = require('../roster');
 
-const DEFAULT_CONFIDENCE = 0.6; // legacy flat-string responses carry no confidence of their own
 const GENERIC_RE = /^Speaker \d+$/;
-// Ceilings for the weaker tiers. Both sit below the 0.85 the renderer uses to draw a name as
-// settled, so anything inferred from conversational flow (rather than a stated introduction)
-// shows the dotted underline + "?" and reads as a suggestion — which is what it is.
-const CONVERSATIONAL_MAX = 0.7;
-const COMPLETION_CONFIDENCE = 0.55;
 
-// Pure: validate a raw model response against the labels we asked about and the roster we allow.
-// Accepts both the object shape {"Speaker 2":{"name":..,"confidence":..}} and the legacy flat
-// {"Speaker 2":"Priya Shah"} — a model that ignores the schema degrades, it doesn't resolve nothing.
-function parseInferenceResponse(raw, generic, roster, userName) {
+// Ceilings by the KIND of evidence, so the confidence the UI shows says how the name was found.
+// Anything below 0.85 renders as unverified (dotted, "?"), i.e. as a suggestion.
+const CAPS = {
+  introduction: 0.92,
+  addressed: 0.9,
+  handoff: 0.88,
+  host: 0.78,
+  title: 0.78,
+  topic: 0.68,
+  history: 0.65,
+  other: 0.6,
+};
+const UNVERIFIED_QUOTE_CAP = 0.6; // claimed direct evidence whose quote is not in the transcript
+const OPEN_CAP = 0.55;            // no candidate list at all: a name the transcript itself uses
+const FRAGMENT_WORDS = 150;       // a diarization fragment this small may share a name (see below)
+
+const norm = (s) => String(s || '').toLowerCase().replace(/[^\p{L}\p{N} ]/gu, ' ').replace(/\s+/g, ' ').trim();
+
+// Per-label statistics the model needs and the transcript text alone hides: how much each voice
+// spoke and when it first appeared. The host usually speaks most and first.
+function labelStats(transcript, labels) {
+  const stats = {};
+  let total = 0;
+  for (const s of transcript || []) {
+    const words = segText(s).split(/\s+/).filter(Boolean).length;
+    total += words;
+    const l = segSpeaker(s);
+    if (!labels.includes(l)) continue;
+    const e = stats[l] || (stats[l] = { words: 0, turns: 0, firstAt: s.start != null ? s.start : null });
+    e.words += words;
+    e.turns += 1;
+  }
+  for (const e of Object.values(stats)) e.share = total ? e.words / total : 0;
+  return stats;
+}
+
+const fmtTime = (sec) => (sec == null ? '?' : `${Math.floor(sec / 60)}:${String(Math.floor(sec % 60)).padStart(2, '0')}`);
+
+function buildPrompt({ labels, stats, candidates, userName, known }) {
+  const lines = [];
+  lines.push('You identify which person each generic speaker label in a meeting transcript is.');
+  lines.push(`"${userName || 'The user'}" recorded this meeting on their own microphone and appears under their own name. They are NEVER one of the labels you are resolving.`);
+  if (candidates.roster.length) {
+    lines.push(`Participants, read from the meeting app${candidates.rosterTrusted ? '' : ' (may be incomplete or contain non-people)'}: ${candidates.roster.join(', ')}.`);
+  }
+  if (candidates.history.length) {
+    lines.push(`People who regularly attend this meeting (from past meetings the user confirmed): ${candidates.history.map((h) => `${h.name} (${h.count}×)`).join(', ')}.`);
+  }
+  if (candidates.titles.length) lines.push(`Meeting title: ${candidates.titles.map((t) => `"${t}"`).join(' / ')}.`);
+  if (Object.keys(known).length) {
+    lines.push(`Already identified by the meeting app: ${Object.entries(known).map(([l, n]) => `${l} = ${n}`).join(', ')}.`);
+  }
+  lines.push('');
+  lines.push('How to decide, strongest evidence first:');
+  lines.push('- introduction: the speaker says who they are ("Hi, I\'m Priya").');
+  lines.push('- addressed: someone says a name and that label answers next ("Tarun, how is the build?" → Tarun speaks).');
+  lines.push('- handoff: the label is named as the next to speak ("over to you, Felipe").');
+  lines.push('- host: the person running the meeting opens it, calls on others by name, asks for updates and decides; they are rarely addressed by name themselves. A title such as "Sync - Hernan" often names the host.');
+  lines.push('- title: the meeting title names this person.');
+  lines.push('- topic: the label reports on work that a candidate owns elsewhere in the conversation.');
+  lines.push('- history: only that this person usually attends.');
+  lines.push('');
+  lines.push('Rules:');
+  lines.push(candidates.closed
+    ? '- Choose names ONLY from the participants above, spelled exactly as listed.'
+    : candidates.any
+      ? '- Prefer the candidates above, spelled exactly as listed. Use another name only if the transcript itself clearly uses it for that speaker.'
+      : '- There is no participant list. Use a name only if the transcript itself uses it for that speaker.');
+  lines.push('- One person per label. If two labels are clearly the same voice split in two, you may give both the same name.');
+  lines.push('- Prefer null to a guess: a wrong name is worse than no name.');
+  lines.push('- "quote" must be words copied exactly from the transcript that support your answer.');
+  lines.push('');
+  lines.push('Labels to resolve:');
+  for (const l of labels) {
+    const s = stats[l] || { words: 0, turns: 0, share: 0 };
+    lines.push(`- ${l}: ${s.words} words in ${s.turns} turns (${Math.round(s.share * 100)}% of all speech), first speaks at ${fmtTime(s.firstAt)}`);
+  }
+  lines.push('');
+  lines.push('Reply with ONLY a JSON object mapping each label to null or');
+  lines.push('{"name": "<name>", "confidence": <0-1>, "basis": "introduction|addressed|handoff|host|title|topic|history|other", "quote": "<exact words>"}');
+  return lines.join('\n');
+}
+
+// PURE. Validate the model's answer. Everything that can make a name wrong is checked here, not
+// trusted from the model:
+//   - the name must be a candidate (fuzzy-matched, canonical spelling) when candidates exist,
+//     or a person-shaped name the transcript itself uses when they do not;
+//   - never the user (ch0 by construction), compared fuzzily so "Sagar" ≠ "Sagar Bansal" can't slip;
+//   - claimed direct evidence must quote the transcript, or it is capped as unverified;
+//   - confidence is capped by the kind of evidence;
+//   - one person, one label — except a small diarization fragment of a voice already named.
+function parseInferenceResponse(raw, labels, candidates, opts = {}) {
   let map;
   try { map = parseLooseJson(raw, '{'); } catch { return {}; }
   if (!map || typeof map !== 'object' || Array.isArray(map)) return {};
-
-  // A roster that fails the trustworthiness test is treated as ABSENT rather than as a closed
-  // set, so junk scraped from browser chrome can never exclude a real participant.
-  const allowed = rosterIsTrustworthy(roster) ? rosterNames(roster) : [];
-  const userKey = userName ? nameKey(userName) : '';
+  const { userName, transcriptText = '', stats = {} } = opts;
+  const pool = candidates.pool || [];
+  const haystack = norm(transcriptText);
+  const isUser = (n) => {
+    if (!userName) return false;
+    if (nameKey(n) === nameKey(userName)) return true;
+    const hit = matchToRoster(n, [userName]);
+    return !!hit && hit.score >= 0.7;
+  };
   const out = {};
 
   for (const [label, value] of Object.entries(map)) {
-    if (!generic.includes(label)) continue;               // not a label we asked about
-    const obj = (value && typeof value === 'object' && !Array.isArray(value)) ? value : { name: value };
+    if (!labels.includes(label)) continue;
+    const obj = value && typeof value === 'object' && !Array.isArray(value) ? value : { name: value };
     let name = typeof obj.name === 'string' ? obj.name.trim() : '';
-    if (!name || GENERIC_RE.test(name)) continue;         // null / "unknown" / echoed label
-    if (/^(unknown|unclear|n\/?a|none|null)$/i.test(name)) continue;
+    if (!name || GENERIC_RE.test(name) || /^(unknown|unclear|n\/?a|none|null)$/i.test(name)) continue;
 
-    let confidence = typeof obj.confidence === 'number' ? obj.confidence : DEFAULT_CONFIDENCE;
+    const basis = CAPS[obj.basis] ? obj.basis : 'other';
+    let confidence = typeof obj.confidence === 'number' ? obj.confidence : 0.6;
+    confidence = Math.min(confidence, CAPS[basis]);
 
-    // Closed-set enforcement. With no roster we have nothing to check against, so the name is
-    // taken as-is at reduced confidence — that is exactly today's behaviour, kept as the floor.
-    //
-    // `allowed` is empty when the roster was rejected as untrustworthy (see rosterIsTrustworthy).
-    // That matters: a live Google Meet produced a roster of Chrome toolbar labels
-    // ("Back", "Forward", "Work"), and because the real participant was NOT in it, this guard
-    // rejected her correctly-inferred name and she stayed "Speaker 1". A junk roster must never
-    // be able to exclude a real person — better an unconstrained guess than a guaranteed miss.
-    if (allowed.length) {
-      const hit = matchToRoster(name, allowed);
-      if (!hit) continue;
-      name = hit.name;                                    // canonical spelling from the roster
-      confidence = Math.min(confidence, hit.score);
+    const hit = pool.length ? matchToRoster(name, pool) : null;
+    if (hit) {
+      name = hit.name;
+      if (hit.score < 1) confidence = Math.min(confidence, Math.max(hit.score, 0.6));
+      // A name only known from history (not on this meeting's own list) is a weaker claim.
+      if (!candidates.inMeeting.has(nameKey(name))) confidence = Math.min(confidence, CAPS.host);
+    } else if (candidates.closed) {
+      continue; // a trusted participant list is a closed set
     } else {
-      confidence = Math.min(confidence, 0.55);
+      // Open inference: the name must be person-shaped and actually appear in the transcript.
+      // Allowed alongside a soft candidate list, so a junk or partial roster can never exclude a
+      // real person (a polluted Meet roster once kept a correctly-named guest as "Speaker 1").
+      // Without any candidate, only DIRECT, QUOTED evidence counts — measured on the real library,
+      // weaker open guesses were mostly speech-to-text noise ("Darn", "Nava", "Neve").
+      if (!isPersonName(name)) continue;
+      const first = norm(name).split(' ')[0];
+      if (!first || !haystack.includes(first)) continue;
+      const q = norm(typeof obj.quote === 'string' ? obj.quote : '');
+      const directBasis = basis === 'introduction' || basis === 'addressed' || basis === 'handoff';
+      if (!directBasis || !q || !haystack.includes(q) || !q.includes(first)) continue;
+      confidence = Math.min(confidence, OPEN_CAP);
     }
+    if (isUser(name)) continue;
 
-    // The local user is on channel 0 by construction, so they cannot be a ch1 speaker.
-    if (userKey && nameKey(name) === userKey) continue;
+    const quote = typeof obj.quote === 'string' ? obj.quote : (typeof obj.evidence === 'string' ? obj.evidence : '');
+    const direct = basis === 'introduction' || basis === 'addressed' || basis === 'handoff';
+    const quoteFound = !!quote && norm(quote).length >= 3 && haystack.includes(norm(quote));
+    if (direct && !quoteFound) confidence = Math.min(confidence, UNVERIFIED_QUOTE_CAP);
 
     out[label] = {
       name,
       confidence: Math.max(0, Math.min(1, confidence)),
-      evidence: typeof obj.evidence === 'string' ? obj.evidence.slice(0, 200) : '',
+      basis: direct && !quoteFound ? `${basis}-unverified` : basis,
+      evidence: quote.slice(0, 200),
       source: 'ai-inference',
     };
   }
 
-  // One person cannot be two speakers: keep the most confident label, drop the rest.
+  // One person per label. Diarization does split one voice into several labels (seen: Hernan
+  // three times in one meeting), so a SMALL fragment may keep the same name, demoted; otherwise
+  // only the most confident label keeps it.
   const byName = new Map();
-  for (const [label, e] of Object.entries(out)) {
+  for (const [label, e] of Object.entries(out).sort((a, b) => b[1].confidence - a[1].confidence)) {
     const k = nameKey(e.name);
-    const prev = byName.get(k);
-    if (!prev || e.confidence > out[prev].confidence) {
-      if (prev) delete out[prev];
-      byName.set(k, label);
+    if (!byName.has(k)) { byName.set(k, label); continue; }
+    if ((stats[label]?.words ?? Infinity) <= FRAGMENT_WORDS) {
+      e.confidence = Math.min(e.confidence, 0.6);
+      e.basis = `${e.basis}+fragment`;
     } else {
       delete out[label];
     }
@@ -84,160 +190,45 @@ function parseInferenceResponse(raw, generic, roster, userName) {
   return out;
 }
 
-function buildPrompt(generic, roster, subject) {
-  // A roster that fails the trustworthiness test is treated as ABSENT rather than as a closed
-  // set, so junk scraped from browser chrome can never exclude a real participant.
-  const allowed = rosterIsTrustworthy(roster) ? rosterNames(roster) : [];
-  const closed = allowed.length
-    ? `The people in this meeting are EXACTLY: ${allowed.join(', ')}. `
-      + `You MUST choose each name from that list verbatim. If a label cannot be matched to someone `
-      + `on the list with high confidence, map it to null. Never output a name that is not on the list.`
-    : `No participant list is available, so only use names the transcript itself states.`;
-  return 'You are resolving generic speaker labels in a meeting transcript to real people.\n'
-    + `${closed}\n`
-    + (subject ? `Meeting subject: ${subject}\n` : '')
-    + 'Rely on direct evidence: self-introductions ("Hi, I\'m Priya"), someone being addressed '
-    + '("thanks, Priya"), roll calls, hand-offs. Do NOT guess from topic, role or speaking order.\n'
-    + 'Respond with ONLY a JSON object mapping each label to either null or '
-    + '{"name": <name>, "confidence": <0-1>, "evidence": "<short quote>"}. Example:\n'
-    + '{"Speaker 2": {"name": "Priya Shah", "confidence": 0.9, "evidence": "\\"Hi, I\'m Priya\\""}, '
-    + '"Speaker 3": null}';
-}
-
-// The strict pass demands a stated introduction or someone being addressed by name. Recurring
-// internal meetings contain neither — nobody says "Hi, I'm Tarun" in the daily standup — so it
-// correctly resolves nothing and every voice stays "Speaker N". This tier is allowed to reason
-// from conversational structure instead, against the SAME closed roster, and its answers are
-// capped below the "verified" threshold so they render as suggestions.
-function buildConversationalPrompt(labels, allowed, subject) {
-  return 'You are matching generic speaker labels in a meeting transcript to a known list of '
-    + 'attendees. The attendee list is COMPLETE and correct.\n'
-    + `The people in this meeting are EXACTLY: ${allowed.join(', ')}. `
-    + 'You MUST choose each name from that list verbatim, or null. Never output a name not on it.\n'
-    + (subject ? `Meeting subject: ${subject}\n` : '')
-    + 'There are no self-introductions here, so use conversational evidence: who is addressed by '
-    + 'name and who answers next; who hands off work to whom; who reports on which area across the '
-    + 'meeting; who asks versus who decides; references like "as I mentioned" tied to an earlier turn.\n'
-    + 'Be decisive where the structure is clear, but output null rather than a coin-flip — a wrong '
-    + 'name is worse than no name. Do not assign the same person to two labels.\n'
-    + 'Respond with ONLY a JSON object mapping each label to null or '
-    + '{"name": <name>, "confidence": <0-1>, "evidence": "<short quote>"}.';
-}
-
-// Pure. Last resort for the one case that is deduction rather than guessing: a single unnamed
-// voice and a single roster member nobody has been matched to. Anything less clear-cut is left
-// alone. Never assigns the ch0 user (they are on channel 0 by construction).
-function completeByElimination(unresolvedLabels, unusedNames, userName) {
-  if (unresolvedLabels.length !== 1 || unusedNames.length !== 1) return {};
-  const name = unusedNames[0];
-  if (userName && nameKey(name) === nameKey(userName)) return {};
-  return {
-    [unresolvedLabels[0]]: {
-      name,
-      confidence: COMPLETION_CONFIDENCE,
-      evidence: 'only remaining participant',
-      source: 'ai-inference',
-    },
-  };
-}
-
-// roster: string[] | [{name, confidence}] — the closed set. opts.subject: meeting title context.
-// opts.userName: the channel-0 speaker, excluded from ch1 results.
-async function inferSpeakerNames(transcript, roster, opts = {}) {
-  // Labels come from the FULL transcript — a speaker who only talks early would otherwise be
-  // dropped by the prompt budget and never get resolved.
-  const generic = participants(transcript).filter((p) => GENERIC_RE.test(p));
-  if (!generic.length) return {};
+// transcript: segments with ch1 labels still generic where unresolved.
+// candidates: { roster: [{name}], rosterTrusted, history: [{name, count}], titles: [string] }
+// opts: { userName, known: { "Speaker 2": "Name" } (labels already settled; excluded), onRaw }
+// Returns { map: { "Speaker 2": {...} }, raw, labels, prompt: { bytes } }.
+async function inferSpeakerNames(transcript, cand = {}, opts = {}) {
+  const known = opts.known || {};
+  const labels = [...new Set((transcript || []).filter((s) => s.channel !== 0).map(segSpeaker))]
+    .filter((l) => GENERIC_RE.test(l) && !known[l]);
+  if (!labels.length) return { map: {}, labels };
   const text = transcriptToNamePrompt(transcript);
-  if (!text) return {};
+  if (!text) return { map: {}, labels };
 
-  const ask = async (labels) => {
-    const raw = await chatCompletion([
-      { role: 'system', content: buildPrompt(labels, roster, opts.subject) },
-      { role: 'user', content: `Labels to resolve: ${labels.join(', ')}\n\nTRANSCRIPT:\n${text}` },
-    ], { temperature: 0 });
-    return parseInferenceResponse(raw, labels, roster, opts.userName);
+  const roster = rosterNames(cand.roster).filter((n) => !opts.userName || nameKey(n) !== nameKey(opts.userName));
+  const history = (cand.history || []).filter((h) => h && h.name);
+  const titles = (cand.titles || []).filter(Boolean);
+  // Candidate pool for validation. Only a TRUSTED participant list closes the set; an untrusted one
+  // is still offered to the model (it often holds the real people among the junk) and still
+  // canonicalises spellings, but never excludes anyone.
+  const pool = [...new Set([...roster, ...history.map((h) => h.name)])];
+  const inMeeting = new Set(roster.map(nameKey));
+  const candidates = {
+    roster, rosterTrusted: !!cand.rosterTrusted, history, titles,
+    any: pool.length > 0, closed: !!cand.rosterTrusted && roster.length > 0, pool, inMeeting,
   };
+  const stats = labelStats(transcript, labels);
+  const system = buildPrompt({ labels, stats, candidates, userName: opts.userName, known });
 
+  let raw = '';
   try {
-    const first = await ask(generic);
-
-    // Second pass only when it can actually help: a label is still unresolved AND a roster name is
-    // still unused. Bounded to one extra call.
-    const unresolved = generic.filter((l) => !first[l]);
-    const used = new Set(Object.values(first).map((e) => nameKey(e.name)));
-    // Only a trustworthy roster can supply candidate names for the second pass; otherwise the
-    // "unused participants" list would just be more browser chrome.
-    const trusted = rosterIsTrustworthy(roster) ? rosterNames(roster) : [];
-    const unused = trusted.filter((n) => !used.has(nameKey(n)));
-    if (unresolved.length && unused.length) {
-      try {
-        const second = await inferSecondPass(unresolved, unused, text, opts);
-        for (const [k, v] of Object.entries(second)) if (!first[k]) first[k] = v;
-      } catch (err) {
-        console.warn('[inferSpeakerNames] second pass:', err.message);
-      }
-    }
-
-    // Tier 3: conversational inference over the closed roster, for what evidence-only could not
-    // reach. Only worth running when a trustworthy roster still has unmatched people in it.
-    const stillUnresolved = generic.filter((l) => !first[l]);
-    const usedNow = new Set(Object.values(first).map((e) => nameKey(e.name)));
-    const stillUnused = trusted.filter((n) => !usedNow.has(nameKey(n)));
-    if (stillUnresolved.length && stillUnused.length) {
-      try {
-        const third = await inferConversational(stillUnresolved, stillUnused, text, opts);
-        for (const [k, v] of Object.entries(third)) if (!first[k]) first[k] = v;
-      } catch (err) {
-        console.warn('[inferSpeakerNames] conversational pass:', err.message);
-      }
-    }
-
-    // Tier 4: pure elimination, no model call.
-    const finalUnresolved = generic.filter((l) => !first[l]);
-    const finalUsed = new Set(Object.values(first).map((e) => nameKey(e.name)));
-    const finalUnused = trusted.filter((n) => !finalUsed.has(nameKey(n)));
-    Object.assign(first, completeByElimination(finalUnresolved, finalUnused, opts.userName));
-
-    return first;
+    raw = await chatCompletion([
+      { role: 'system', content: system },
+      { role: 'user', content: `TRANSCRIPT:\n${text}` },
+    ], { temperature: 0, purpose: 'names' });
   } catch (err) {
-    console.warn('[inferSpeakerNames]', err.message);
-    return {};
+    return { map: {}, labels, error: err.message, prompt: { bytes: system.length + text.length } };
   }
+  const transcriptText = (transcript || []).map(segText).join('\n');
+  const map = parseInferenceResponse(raw, labels, candidates, { userName: opts.userName, transcriptText, stats });
+  return { map, raw, labels, prompt: { bytes: system.length + text.length } };
 }
 
-async function inferSecondPass(labels, unusedNames, text, opts) {
-  const raw = await chatCompletion([
-    { role: 'system', content: buildPrompt(labels, unusedNames, opts.subject) },
-    {
-      role: 'user',
-      content: `These labels are still unidentified: ${labels.join(', ')}\n`
-        + `These participants have not been matched to any label yet: ${unusedNames.join(', ')}\n`
-        + 'Match them only where the transcript gives direct evidence.\n\n'
-        + `TRANSCRIPT:\n${text}`,
-    },
-  ], { temperature: 0 });
-  return parseInferenceResponse(raw, labels, unusedNames, opts.userName);
-}
-
-// Same guard pipeline as every other tier (closed set, ch0-user exclusion, one-person-one-label),
-// then clamped: conversational reasoning can be right often, but it is never *evidence*, so it
-// must not be able to present itself as settled.
-async function inferConversational(labels, unusedNames, text, opts) {
-  const raw = await chatCompletion([
-    { role: 'system', content: buildConversationalPrompt(labels, unusedNames, opts.subject) },
-    {
-      role: 'user',
-      content: `Labels still unidentified: ${labels.join(', ')}\n`
-        + `Attendees not yet matched to any label: ${unusedNames.join(', ')}\n\n`
-        + `TRANSCRIPT:\n${text}`,
-    },
-  ], { temperature: 0 });
-  const parsed = parseInferenceResponse(raw, labels, unusedNames, opts.userName);
-  for (const entry of Object.values(parsed)) {
-    entry.confidence = Math.min(entry.confidence, CONVERSATIONAL_MAX);
-  }
-  return parsed;
-}
-
-module.exports = { inferSpeakerNames, parseInferenceResponse, completeByElimination, CONVERSATIONAL_MAX };
+module.exports = { inferSpeakerNames, parseInferenceResponse, buildPrompt, labelStats, CAPS, OPEN_CAP };

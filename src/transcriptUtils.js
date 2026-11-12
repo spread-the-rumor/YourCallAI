@@ -9,9 +9,26 @@ function segText(seg) {
   return Array.isArray(seg.words) ? seg.words.map((w) => w.text).join(' ') : (seg.text || '');
 }
 
+// Segment timing, from either shape: the full pipeline segment (per-word `words`) or the compact
+// stored one (`start`/`end` relative seconds + `startAt`/`endAt` ISO; see store.compactSegment).
+function segStartIso(seg) {
+  if (!seg) return null;
+  const w = Array.isArray(seg.words) && seg.words[0];
+  return (w && w.start_timestamp && w.start_timestamp.absolute) || seg.startAt || null;
+}
+function segEndIso(seg) {
+  if (!seg) return null;
+  const w = Array.isArray(seg.words) && seg.words[seg.words.length - 1];
+  return (w && w.end_timestamp && w.end_timestamp.absolute) || seg.endAt || null;
+}
+function segEndRel(seg) {
+  if (!seg) return 0;
+  const w = Array.isArray(seg.words) && seg.words[seg.words.length - 1];
+  return (w && w.end_timestamp && w.end_timestamp.relative) || seg.end || 0;
+}
+
 function meetingDate(transcript) {
-  return (transcript && transcript[0] && transcript[0].words && transcript[0].words[0] &&
-    transcript[0].words[0].start_timestamp && transcript[0].words[0].start_timestamp.absolute) || null;
+  return segStartIso(transcript && transcript[0]);
 }
 
 function transcriptToText(transcript) {
@@ -129,12 +146,11 @@ function transcriptToNamePrompt(transcript, maxBytes = MAX_PROMPT_BYTES) {
 
 function durationSeconds(transcript) {
   if (!transcript || !transcript.length) return 0;
-  const last = transcript[transcript.length - 1];
-  const w = last.words && last.words[last.words.length - 1];
-  return (w && w.end_timestamp && w.end_timestamp.relative) || 0;
+  return segEndRel(transcript[transcript.length - 1]);
 }
 
 module.exports = {
+  segStartIso, segEndIso, segEndRel,
   segSpeaker, segText, meetingDate, transcriptToText, transcriptToPrompt,
   transcriptToNamePrompt, participants, durationSeconds, MAX_PROMPT_BYTES,
 };

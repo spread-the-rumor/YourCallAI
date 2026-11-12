@@ -44,12 +44,18 @@ async function uploadAudio(audioBuf) {
 // stores the transcript to Blob, and returns its URL. We fetch that URL DIRECTLY from Blob storage
 // (never back through a function) so neither the ~4.5 MB request nor response limit is hit — this
 // is what lets long meetings transcribe. The proxy call can take minutes; that's expected.
-async function transcribeViaProxy(audioBuf) {
+async function transcribeViaProxy(audioBuf, { onStep, keyterms } = {}) {
+  const step = (name, t0, extra) => { try { onStep && onStep(name, Date.now() - t0, extra); } catch { /* logging only */ } };
+  let t0 = Date.now();
   const url = await uploadAudio(audioBuf);
+  step('upload', t0, { bytes: audioBuf.length });
   // Client-generated id so a lost /api/transcribe response is still recoverable via /result polling.
   const id = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 
-  const submit = await (await proxyPost('/api/transcribe', { url, id })).json();
+  t0 = Date.now();
+  const body = { url, id };
+  if (Array.isArray(keyterms) && keyterms.length) body.keyterms = keyterms;
+  const submit = await (await proxyPost('/api/transcribe', body)).json();
   if (submit.error) throw new Error(submit.error);
 
   // Prefer the URL from the submit response; fall back to polling /result if it was lost.
@@ -64,8 +70,11 @@ async function transcribeViaProxy(audioBuf) {
     }
     if (!resultUrl) throw new Error('Transcription timed out');
   }
+  step('deepgram', t0);
 
+  t0 = Date.now();
   const result = await fetch(resultUrl).then((r) => r.json());
+  step('fetch-result', t0);
   // Best-effort: drop the stored transcript now that we have it.
   fetch(`${PROXY_URL}/api/transcribe/result?id=${encodeURIComponent(id)}&ack=1`).catch(() => {});
   return result;
@@ -73,11 +82,13 @@ async function transcribeViaProxy(audioBuf) {
 
 // displayName: the channel-0 speaker (the local user). Callers pass the signed-in account name;
 // the env var stays as the fallback so this works before sign-in and in the recovery script.
-async function transcribeRecording(recordingDir, startedAt, displayName) {
-  const audioPath = path.join(recordingDir, 'audio.webm');
+// opts.audioPath overrides the input file (the native-capture remix, when one exists);
+// opts.onStep(name, ms, extra) receives per-step timings; opts.keyterms are Deepgram hints.
+async function transcribeRecording(recordingDir, startedAt, displayName, opts = {}) {
+  const audioPath = opts.audioPath || path.join(recordingDir, 'audio.webm');
   const audioBuf = await fsp.readFile(audioPath);
-  if (!audioBuf.length) throw new Error('audio.webm is empty');
-  const result = await transcribeViaProxy(audioBuf);
+  if (!audioBuf.length) throw new Error(`${path.basename(audioPath)} is empty`);
+  const result = await transcribeViaProxy(audioBuf, opts);
   const utterances = result?.results?.utterances || [];
   const userName = (displayName && displayName.trim()) || process.env.USER_DISPLAY_NAME || 'You';
   return utterancesToSegments(utterances, Date.parse(startedAt), userName);

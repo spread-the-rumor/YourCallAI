@@ -26,7 +26,9 @@ assert.strictEqual(segText(segs[1]), 'Hi all');
 assert.strictEqual(meetingDate(segs), '2026-07-09T10:00:01.000Z');
 assert.strictEqual(transcriptToText(segs), 'Sagar: Hello there\nSpeaker 1: Hi all');
 
-// --- Layer 1 alignment: ≥60% overlap vote wins, otherwise untouched
+// --- Layer 1 alignment. ONE event must never name a voice: measured on the real library, 30 of
+// 37 agent active-speaker events were a single first-poll artifact, and that one event used to
+// win a 100% share and put (usually) the user's own name on a remote voice.
 const base = Date.parse(startedAt);
 const jsonl = path.join(os.tmpdir(), `yc-selfcheck-${process.pid}.jsonl`);
 fs.writeFileSync(jsonl, [
@@ -37,8 +39,8 @@ fs.writeFileSync(jsonl, [
 ].join('\n'));
 const { renamed, roster } = alignSpeakers(segs, jsonl);
 fs.unlinkSync(jsonl);
-assert.strictEqual(renamed['1:0'], 'Priya Shah', 'Speaker 1 (5s–6s) falls inside Priya interval');
-assert.strictEqual(segs[1].speaker, 'Priya Shah', 'segment relabeled in place');
+assert.ok(!renamed['1:0'], 'a single event cannot name a voice — the first-poll artifact');
+assert.strictEqual(segs[1].speaker, 'Speaker 1', 'alignment NEVER relabels segments in place');
 assert.ok(roster.includes('Sam Ortiz'), 'roster parsed');
 
 // --- Detection matchers (§8)
@@ -70,6 +72,16 @@ assert.deepStrictEqual(parseLooseJson('Sure! {"Speaker 2":"Priya"} hope that hel
 const { transcriptToNamePrompt, transcriptToPrompt } = require('../src/transcriptUtils');
 const { normalizeName, personScore, matchToRoster, mergeRoster, rosterIsTrustworthy } = require('../src/roster');
 const { parseInferenceResponse } = require('../src/ai/inferSpeakerNames');
+// parseInferenceResponse takes a candidates object; build it the way inferSpeakerNames does, with
+// the roster closing the set only when it is trustworthy.
+const { nameKey: nk } = require('../src/roster');
+const pir = (raw, labels, rosterList, userName, transcriptText = '', history = [], stats = {}) => {
+  const trusted = require('../src/roster').rosterIsTrustworthy(rosterList);
+  return parseInferenceResponse(raw, labels, {
+    pool: [...rosterList, ...history], closed: trusted && rosterList.length > 0,
+    inMeeting: new Set(rosterList.map(nk)),
+  }, { userName, transcriptText, stats });
+};
 const { resolveSpeakers, readSpeakerMap, sampleMatches } = require('../src/speakerResolve');
 
 // --- Name prompt keeps the START (intros live there). This is THE regression that made
@@ -134,9 +146,11 @@ const liveTeamsRows = ['System',
   'SBPM Dev, Has control of production tools, muted, Context menu is available',
   'Fireflies.ai Notetaker Hernan, video is on, Has control of production tools, muted, Context menu is available'];
 const liveRoster = mergeRoster([{ names: liveTeamsRows, source: 'participants-panel', confidence: 0.9 }]);
+// The Fireflies recording bot is a participant row but never a speaker anyone wants named, so it
+// is excluded too (it used to be a roster candidate, i.e. a name the AI could hand to a voice).
 assert.deepStrictEqual(liveRoster.map((r) => r.name).sort(),
-  ['Carlos Brito', 'Fireflies.ai Notetaker Hernan', 'Hernan Zapata', 'SBPM Dev', 'Sagar'],
-  'the real Teams roster resolves to exactly its 5 participants, with "System" excluded');
+  ['Carlos Brito', 'Hernan Zapata', 'SBPM Dev', 'Sagar'],
+  'the real Teams roster resolves to its 4 human participants, with "System" and the notetaker bot excluded');
 
 // --- The in-call gate (mirrored in Program.cs LooksInCall / main.swift looksInCall). Kept here as
 // executable documentation of the real label sets it must separate; the agents own the C#/Swift
@@ -184,10 +198,10 @@ assert.strictEqual(rosterIsTrustworthy(Array.from({ length: 12 }, (_, i) => `Fir
 assert.strictEqual(rosterIsTrustworthy(['Back', 'Forward', 'Reload']), false, 'a browser toolbar is rejected');
 assert.strictEqual(rosterIsTrustworthy([]), false);
 // The consequence: with a polluted roster the real name is accepted (unconstrained, low confidence)…
-assert.strictEqual(parseInferenceResponse('{"Speaker 1":"Vicky Rana"}', ['Speaker 1'], pollutedMeetRoster, 'Sagar Bansal')['Speaker 1'].name,
+assert.strictEqual(pir('{"Speaker 1":{"name":"Vicky Rana","basis":"addressed","quote":"thanks Vicky, over to you"}}', ['Speaker 1'], pollutedMeetRoster, 'Sagar Bansal', 'thanks Vicky, over to you')['Speaker 1'].name,
   'Vicky Rana', 'a junk roster must NOT be able to exclude a real participant');
 // …while a trustworthy roster still rejects a name nobody in the meeting has.
-assert.deepStrictEqual(parseInferenceResponse('{"Speaker 1":"Work"}', ['Speaker 1'], ['Sagar Bansal', 'Vicky Rana'], 'Sagar Bansal'), {},
+assert.deepStrictEqual(pir('{"Speaker 1":"Work"}', ['Speaker 1'], ['Sagar Bansal', 'Vicky Rana'], 'Sagar Bansal'), {},
   'a trustworthy roster still enforces the closed set');
 
 // --- Roster matching tiers
@@ -212,26 +226,56 @@ assert.ok(!mergeRoster([{ names: ['Colleague X'], source: 'slack', confidence: 0
 
 // --- Inference response parsing: closed set + anti-hallucination guards
 const gen = ['Speaker 1', 'Speaker 2'];
-const objShape = parseInferenceResponse('{"Speaker 1":{"name":"Priya Shah","confidence":0.9,"evidence":"\\"I am Priya\\""}}', gen, ros);
+const said = 'Hi everyone, I am Priya and I run the data team';
+const objShape = pir('{"Speaker 1":{"name":"Priya Shah","confidence":0.9,"basis":"introduction","quote":"I am Priya"}}', gen, ros, '', said);
 assert.strictEqual(objShape['Speaker 1'].name, 'Priya Shah', 'object shape parsed');
-assert.strictEqual(objShape['Speaker 1'].confidence, 0.9, 'confidence carried through');
+assert.strictEqual(objShape['Speaker 1'].confidence, 0.9, 'confidence carried through for verified direct evidence');
 assert.ok(objShape['Speaker 1'].evidence.includes('Priya'), 'evidence carried through');
-assert.strictEqual(parseInferenceResponse('{"Speaker 1":"Priya Shah"}', gen, ros)['Speaker 1'].name,
+assert.strictEqual(pir('{"Speaker 1":"Priya Shah"}', gen, ros)['Speaker 1'].name,
   'Priya Shah', 'legacy flat-string shape still accepted');
-assert.deepStrictEqual(parseInferenceResponse('{"Speaker 1":"Dave Hallucination"}', gen, ros), {},
+assert.deepStrictEqual(pir('{"Speaker 1":"Dave Hallucination"}', gen, ros), {},
   'name outside the roster is REJECTED');
-assert.deepStrictEqual(parseInferenceResponse('{"Speaker 1":null,"Speaker 2":"unknown"}', gen, ros), {},
+assert.deepStrictEqual(pir('{"Speaker 1":null,"Speaker 2":"unknown"}', gen, ros), {},
   'null / "unknown" ignored');
-assert.deepStrictEqual(parseInferenceResponse('{"Speaker 9":"Priya Shah"}', gen, ros), {},
+assert.deepStrictEqual(pir('{"Speaker 9":"Priya Shah"}', gen, ros), {},
   'label we did not ask about is ignored');
-assert.deepStrictEqual(parseInferenceResponse('{"Speaker 1":"Sagar"}', gen, ['Sagar'], 'Sagar'), {},
+assert.deepStrictEqual(pir('{"Speaker 1":"Sagar"}', gen, ['Sagar', 'Priya Shah'], 'Sagar'), {},
   'the ch0 user cannot also be a ch1 speaker');
-const dup = parseInferenceResponse(
+assert.deepStrictEqual(pir('{"Speaker 1":"Sagar"}', gen, ['Sagar', 'Priya Shah'], 'Sagar Bansal'), {},
+  'nor under a mononym of their account name');
+const dup = pir(
   '{"Speaker 1":{"name":"Priya Shah","confidence":0.9},"Speaker 2":{"name":"Priya Shah","confidence":0.5}}', gen, ros);
 assert.deepStrictEqual(Object.keys(dup), ['Speaker 1'], 'one person cannot be two speakers; most confident wins');
-assert.deepStrictEqual(parseInferenceResponse('not json at all', gen, ros), {}, 'garbage → {}, never throws');
-assert.strictEqual(parseInferenceResponse('{"Speaker 1":"Dave"}', gen, [])['Speaker 1'].name, 'Dave',
-  'with no roster, fall back to open-ended (today\'s behaviour)');
+assert.deepStrictEqual(pir('not json at all', gen, ros), {}, 'garbage → {}, never throws');
+assert.strictEqual(pir('{"Speaker 1":{"name":"Dave","basis":"addressed","quote":"okay Dave, go ahead"}}', gen, [], '', 'okay Dave, go ahead')['Speaker 1'].name, 'Dave',
+  'with no roster, a name the transcript itself uses is accepted with quoted direct evidence');
+assert.deepStrictEqual(pir('{"Speaker 1":{"name":"Darn","basis":"topic"}}', gen, [], '', 'oh darn, the build broke'), {},
+  'with no roster, a guess without quoted direct evidence is rejected (real ASR noise: "Darn", "Nava")');
+assert.strictEqual(require('../src/roster').matchToRoster('Nav', ['Navroop Singh', 'Hernan Zapata']).name, 'Navroop Singh',
+  'a short form of a first name matches ("Nav" for Navroop)');
+assert.deepStrictEqual(pir('{"Speaker 1":"Dave"}', gen, [], '', 'nobody says that name here'), {},
+  'but never a name the transcript does not contain');
+
+// Claimed direct evidence must be QUOTED from the transcript, or it is capped as unverified.
+const fakeQuote = pir('{"Speaker 1":{"name":"Priya Shah","confidence":0.95,"basis":"introduction","quote":"Hello I am Priya Shah from finance"}}', gen, ros, '', said);
+assert.ok(fakeQuote['Speaker 1'].confidence <= 0.6 && /unverified/.test(fakeQuote['Speaker 1'].basis),
+  'an invented quote cannot buy a verified name');
+// Host reasoning is allowed but can never read as settled (< 0.85 → dotted "?").
+const host = pir('{"Speaker 1":{"name":"Priya Shah","confidence":0.99,"basis":"host","quote":"run the data team"}}', gen, ros, '', said);
+assert.ok(host['Speaker 1'].confidence < 0.85, 'host inference renders as a suggestion');
+// Speech-to-text spellings resolve to the roster spelling: "Ramiro" for Ramir.
+assert.strictEqual(pir('{"Speaker 1":"Ramiro"}', gen, ['Ramir Mesquita', 'Hernan Zapata'])['Speaker 1'].name, 'Ramir Mesquita',
+  'an ASR misspelling still matches the participant');
+// A small diarization fragment of an already-named voice may keep the name, demoted.
+const frag = pir('{"Speaker 1":{"name":"Priya Shah","confidence":0.8},"Speaker 2":{"name":"Priya Shah","confidence":0.7}}',
+  gen, ros, '', '', [], { 'Speaker 1': { words: 2000 }, 'Speaker 2': { words: 40 } });
+assert.strictEqual(frag['Speaker 2'].name, 'Priya Shah', 'a 40-word fragment of the same voice keeps the name');
+assert.ok(frag['Speaker 2'].confidence <= 0.6, '…as a suggestion');
+// History: a recurring attendee is a valid candidate even when the meeting app's list omits them
+// (live Teams rosters routinely missed Felipe), but only as a suggestion.
+const hist = pir('{"Speaker 1":{"name":"Felipe Frias","confidence":0.9,"basis":"topic"}}', gen, ['Carlos Brito', 'Hernan Zapata'], '', '', ['Felipe Frias']);
+assert.strictEqual(hist['Speaker 1'].name, 'Felipe Frias', 'a history candidate is accepted with a trusted roster');
+assert.ok(hist['Speaker 1'].confidence < 0.85, 'not on this meeting\'s own list → suggestion');
 
 // --- speakerMap back-compat: bare strings were the old on-disk shape
 assert.deepStrictEqual(readSpeakerMap({ '1:3': 'Priya' })['1:3'],
@@ -305,12 +349,11 @@ const segs2 = utterancesToSegments([
 ], base, 'Sagar');
 const a2 = alignSpeakers(segs2, jsonl2);
 fs.unlinkSync(jsonl2);
-assert.strictEqual(a2.renamed['1:0'], 'Priya Shah', 'weighted vote still resolves');
+assert.ok(!a2.renamed['1:0'], 'one event — even a high-confidence one — is not enough');
 assert.strictEqual(a2.diagnostics.agentStatus, 'started', 'agent lifecycle recorded');
 assert.strictEqual(a2.diagnostics.heuristics, 'test1');
 assert.strictEqual(a2.diagnostics.malformedLines, 1, 'truncated line counted, not fatal');
 assert.strictEqual(a2.rosterSources[0].source, 'participants-panel', 'roster source preserved for ranking');
-assert.ok(a2.votes['1:0'].confidence > 0.6, 'winning share expressed as a confidence');
 
 // --- audioHealth.js: "dead capture" must be distinguishable from "quiet meeting" (the
 // earphones bug). The whole fix rests on the gap between a live noise floor and digital zero.
@@ -646,40 +689,138 @@ fs.unlinkSync(sparseJsonl);
 assert.ok(!lateAlign.renamed['1:0'],
   'a stale event must not claim a voice 10 minutes later — silence beats a confident wrong name');
 
-// The cap must be a no-op when the signal is dense: events 3s apart still attribute normally.
+// A real speaking signal repeats: events every 5 s across a 40 s turn still attribute normally.
 const denseJsonl = path.join(os.tmpdir(), `yc-selfcheck4-${process.pid}.jsonl`);
 fs.writeFileSync(denseJsonl, [
   JSON.stringify({ ts: base, type: 'roster', names: ['Hernan Zapata', 'Tarun Jain'], source: 'participants-panel', confidence: 0.9 }),
-  ...[0, 3000, 6000, 9000].map((off) => JSON.stringify({
+  ...[0, 5000, 10000, 15000, 20000, 25000, 30000, 35000].map((off) => JSON.stringify({
     ts: base + off, type: 'active-speaker', name: 'Hernan Zapata', confidence: 0.75, strategy: 'suffix-delta',
   })),
 ].join('\n'));
 const denseSegs = utterancesToSegments([
-  { channel: 1, speaker: 0, start: 1, end: 9, transcript: 'talking throughout', words: [{ word: 'talking', start: 1, end: 2 }] },
+  { channel: 1, speaker: 0, start: 1, end: 40, transcript: 'talking throughout', words: [{ word: 'talking', start: 1, end: 2 }, { word: 'throughout', start: 39, end: 40 }] },
 ], base, 'Sagar');
 const denseAlign = alignSpeakers(denseSegs, denseJsonl);
 fs.unlinkSync(denseJsonl);
 assert.strictEqual(denseAlign.renamed['1:0'], 'Hernan Zapata',
-  'dense events still attribute — the cap must not break the working case');
+  'dense, sustained events still attribute — the rules must not break the working case');
+assert.strictEqual(denseSegs[0].speaker, 'Speaker 1', '…and still without touching the transcript');
 
-// --- inferSpeakerNames: elimination fallback is deduction, not guessing.
-const { completeByElimination, CONVERSATIONAL_MAX, parseInferenceResponse: parseInf } =
-  require('../src/ai/inferSpeakerNames');
-const elim = completeByElimination(['Speaker 2'], ['Tarun Jain'], 'Sagar Bansal');
-assert.strictEqual(elim['Speaker 2'].name, 'Tarun Jain', '1 label + 1 unused name → assign');
-assert.ok(elim['Speaker 2'].confidence < 0.85, 'elimination renders as unverified, never as fact');
-assert.deepStrictEqual(completeByElimination(['Speaker 2', 'Speaker 3'], ['Tarun Jain'], ''), {},
-  'ambiguous (2 labels, 1 name) → assign nothing');
-assert.deepStrictEqual(completeByElimination(['Speaker 2'], ['Sagar Bansal'], 'Sagar Bansal'), {},
-  'the channel-0 user is never assigned to a channel-1 voice');
-assert.ok(CONVERSATIONAL_MAX < 0.85,
-  'conversational tier stays below the verified threshold so it shows the dotted underline');
+// The upzu regression (2026-11-11): one first-poll "Sagar" event at +14 s overlapped a remote
+// voice with 1,797 words and named it "Sagar" at share 1.0. Not any more — and not at all for a
+// voice whose speech it barely covers.
+const upzuJsonl = path.join(os.tmpdir(), `yc-selfcheck5-${process.pid}.jsonl`);
+fs.writeFileSync(upzuJsonl, [
+  JSON.stringify({ ts: base + 14000, type: 'roster', names: ['Sagar', 'Hernan Zapata', 'Ramir Mesquita'], source: 'participants-panel', confidence: 0.9 }),
+  JSON.stringify({ ts: base + 14000, type: 'active-speaker', name: 'Sagar', confidence: 0.75, strategy: 'suffix-delta' }),
+].join('\n'));
+const upzuSegs = utterancesToSegments(Array.from({ length: 60 }, (_, i) => ({
+  channel: 1, speaker: 0, start: 10 + i * 30, end: 35 + i * 30, transcript: 'Hey Carlos I was asking Ramir',
+  words: [{ word: 'Hey', start: 10 + i * 30, end: 11 + i * 30 }, { word: 'Ramir', start: 34 + i * 30, end: 35 + i * 30 }],
+})), base, 'Sagar Bansal');
+const upzu = alignSpeakers(upzuSegs, upzuJsonl);
+fs.unlinkSync(upzuJsonl);
+assert.deepStrictEqual(upzu.renamed, {}, 'upzu: a single first-poll event names nobody');
 
-// The closed-set guard must still reject anything off-roster (unchanged behaviour, re-asserted
-// because the new tiers route through this same function).
-const offRoster = parseInf('{"Speaker 2":{"name":"Someone Else","confidence":0.9}}',
+// --- inferSpeakerNames: every non-direct kind of evidence stays below "verified".
+const { CAPS, OPEN_CAP } = require('../src/ai/inferSpeakerNames');
+for (const basis of ['host', 'title', 'topic', 'history', 'other']) {
+  assert.ok(CAPS[basis] < 0.85, `${basis} evidence renders as a suggestion`);
+}
+assert.ok(OPEN_CAP < 0.85, 'open inference (no candidate list) renders as a suggestion');
+
+// The closed-set guard must still reject anything off-roster.
+const offRoster = pir('{"Speaker 2":{"name":"Someone Else","confidence":0.9}}',
   ['Speaker 2'], ['Carlos Brito', 'Hernan Zapata'], 'Sagar Bansal');
 assert.deepStrictEqual(offRoster, {}, 'a name not on the roster is still rejected outright');
+
+// --- Roster hygiene from the real Slack huddles: the formatting toolbar and profile rows.
+const { normalizeName: nn, isPersonName: isP, mergeRoster: mr } = require('../src/roster');
+assert.strictEqual(nn("View Felipe Frias's profile"), 'Felipe Frias', 'Slack profile rows yield the name');
+for (const junk of ['Code', 'Huddles', 'Bold', 'Backgrounds and effects', 'Fireflies.ai Notetaker Hernan']) {
+  assert.ok(!isP(junk), `"${junk}" is not a person`);
+}
+assert.deepStrictEqual(mr([{ names: ['Brito', 'Carlos Brito', 'Hernan Zapata'], source: 'participants-panel', confidence: 0.9 }]).map((r) => r.name).sort(),
+  ['Carlos Brito', 'Hernan Zapata'], '"Brito" and "Carlos Brito" are one person, kept under the fuller name');
+
+// --- resolveSpeakers: the user can never be put on a remote voice by ANY source, and a voted
+// UI label never becomes a speaker.
+const aiSelf = resolveSpeakers({ transcript: mk('hello'), userName: 'Sagar Bansal', inferred: { 'Speaker 1': { name: 'Sagar', confidence: 0.9 } } });
+assert.strictEqual(aiSelf.transcript[1].speaker, 'Speaker 1', 'AI cannot name a remote voice as the user');
+const uiVote = resolveSpeakers({ transcript: mk('hello'), userName: 'Sagar', alignment: { '1:0': { name: 'Huddles', confidence: 0.95 } } });
+assert.strictEqual(uiVote.transcript[1].speaker, 'Speaker 1', 'a voted UI label is not a person');
+
+// --- detector: classification by WHO HOLDS THE MIC, not by window title.
+const { classifySnapshot, createTracker, parseMicRegistry, stillLive } = require('../src/detector');
+assert.strictEqual(classifySnapshot({ mic: [{ proc: 'ms-teams' }], windows: [{ proc: 'ms-teams', title: 'Chat | Microsoft Teams' }] }).platform, 'teams',
+  'Teams holding the mic is a call even though no title says "Meeting"');
+assert.strictEqual(classifySnapshot({ mic: [{ proc: 'slack' }] }).platform, 'slack', 'Slack huddles are detected');
+assert.strictEqual(classifySnapshot({ mic: [{ proc: 'firefox' }], windows: [{ proc: 'firefox', title: 'Meet - abc-defg-hij' }] }).platform, 'google-meet',
+  'Firefox Meet is detected (the old matcher was Chromium-only)');
+const unknownBrowser = classifySnapshot({ mic: [{ proc: 'chrome' }], windows: [{ proc: 'chrome', title: 'Some page' }] });
+assert.ok(unknownBrowser && !unknownBrowser.known, 'an unrecognised browser mic user is a slow-start candidate, not ignored');
+assert.strictEqual(classifySnapshot({ mic: [{ proc: 'your call ai' }, { proc: 'obs64' }] }), null, 'our own recorder and OBS are not calls');
+assert.strictEqual(classifySnapshot({ mic: [{ proc: 'msedgewebview2' }], windows: [{ proc: 'ms-teams', title: 'Microsoft Teams' }] }).platform, 'teams',
+  'new Teams media in WebView2 is attributed to Teams');
+
+const tr = createTracker({ knownStartMs: 4000, unknownStartMs: 30000, endGraceMs: 20000 });
+const teamsCall = { mic: [{ proc: 'ms-teams' }], windows: [] };
+assert.strictEqual(tr.step(0, teamsCall), null, 'not announced on the first poll');
+assert.strictEqual(tr.step(4000, teamsCall).type, 'detected', 'announced once held for the debounce');
+// The over-run recordings: after the call the user's ROOM NOISE must not keep it alive — only the
+// call app, its call window, or MEETING audio may.
+assert.strictEqual(tr.step(10000, { mic: [], windows: [] }), null, 'grace period');
+assert.strictEqual(tr.step(31000, { mic: [], windows: [] }).type, 'closed', 'closes after the grace period');
+assert.ok(stillLive({ platform: 'zoom', app: 'zoom' }, { mic: [], windows: [] }, { systemAudio: true }), 'meeting audio keeps it alive');
+assert.ok(!stillLive({ platform: 'teams', app: 'ms-teams' }, { mic: [], windows: [{ proc: 'ms-teams', title: 'Calls | Microsoft Teams' }] }),
+  'the Teams "Calls" TAB is not a call window');
+
+assert.deepStrictEqual(parseMicRegistry([
+  'HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\CapabilityAccessManager\\ConsentStore\\microphone\\NonPackaged\\C:#Program Files#Google#Chrome#Application#chrome.exe',
+  '    LastUsedTimeStop    REG_QWORD    0x0',
+  'HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\CapabilityAccessManager\\ConsentStore\\microphone\\MSTeams_8wekyb3d8bbwe',
+  '    LastUsedTimeStop    REG_QWORD    0x1db3',
+].join('\n')), [{ proc: 'chrome' }], 'registry fallback yields process names');
+
+// --- people.js: recurring meetings and their regulars, learned from the user's own renames.
+const people = require('../src/people');
+assert.strictEqual(people.seriesKeyFor('Daily Sync - Hernan (Nov 9)'), people.seriesKeyFor('Daily Sync – Hernan'), 'same series despite dates/punctuation');
+assert.strictEqual(people.seriesKeyFor('Meeting · Nov 9, 2026, 10:00 AM'), null, 'the default title names no series');
+const lib = [2, 3, 4].map((i) => ({ // Mon–Wed
+  id: `m${i}`, title: 'Daily Sync - Hernan', date: `2026-11-0${i}T05:00:00Z`,
+  speakerMap: { '0:0': { name: 'Sagar Bansal', source: 'signed-in-user', confidence: 0.95, lockedByUser: false },
+    '1:0': { name: 'Hernan Zapata', source: 'manual', confidence: 1, lockedByUser: true },
+    '1:1': { name: 'Tarun Jain', source: 'ai-inference', confidence: 0.9, lockedByUser: false } },
+}));
+const h = people.historyFor(lib, { id: 'new', title: 'Daily Sync - Hernan', date: '2026-11-10T05:00:00Z' }, { userName: 'Sagar Bansal' });
+assert.strictEqual(h.basis, 'title');
+assert.strictEqual(h.people[0].name, 'Hernan Zapata', 'the host the user kept fixing is the top candidate');
+assert.ok(!h.people.some((p) => p.name === 'Sagar Bansal'), 'the user is never a candidate');
+const slot = people.historyFor(lib, { id: 'new', title: 'Meeting · Nov 10', date: '2026-11-10T05:05:00Z' }, { userName: 'Sagar Bansal' });
+assert.strictEqual(slot.basis, 'time-slot', 'an untitled meeting in a recurring slot still finds its regulars');
+
+// --- systemAudio.js: the native-track decision (pure parts).
+const sa = require('../src/systemAudio');
+const pcm = Buffer.alloc(16000 * 2 * 4);
+for (let i = 16000 * 2; i < 16000 * 3; i++) pcm.writeInt16LE(Math.round(Math.sin(i / 5) * 8000), i * 2);
+assert.deepStrictEqual(sa.activityFromPcm(pcm), [false, false, true, false], 'per-second activity of s16le PCM');
+assert.strictEqual(sa.alignmentOffset(1000, 3500), 2.5, 'recorder started 2.5 s into the native track');
+assert.ok(/atrim=start=2\.500/.test(sa.remixFilter(2.5)) && /adelay=1500/.test(sa.remixFilter(-1.5)), 'both alignment directions');
+const t0n = 1_000_000;
+const act = Array.from({ length: 120 }, (_, s) => s >= 30 && s < 90);
+assert.strictEqual(sa.secondsMissedByChrome([{ ts: t0n + 60000, sysActive: 15, window: 15 }], act, t0n), 0,
+  'Chromium heard the window → nothing missed');
+assert.strictEqual(sa.secondsMissedByChrome([{ ts: t0n + 60000, sysActive: 0, window: 15 }], act, t0n), 15,
+  'Chromium deaf while native heard sound → those seconds count as missed');
+assert.strictEqual(sa.chooseSystemTrack([false, false], [true]).use, 'chrome', 'a silent native track is never preferred');
+
+// --- audioHealth: a dead system stream is re-reported while it stays dead (the latch used to
+// make an ENDED track unrecoverable for the rest of the meeting).
+const { createHealth: ch } = require('../src/recorder/audioHealth');
+const rep = ch({ startedAt: 0, warmupMs: 1000, graceMs: 0, deathMs: 12000, deathRepeatMs: 30000 });
+let reports = 0;
+for (let t = 0; t <= 100000; t += 1000) { const e = rep.tick(t, 4e-4, 0); if (e && e.type === 'system-dead') reports++; }
+assert.ok(reports >= 3, `sustained death is re-reported (got ${reports})`);
 
 // --- media.js: the recording-media resolver (§5). The whole normalize state machine is read
 // off the filesystem rather than from meta.status, because runPipeline writes status:'complete'

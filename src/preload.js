@@ -11,6 +11,11 @@ contextBridge.exposeInMainWorld('api', {
   onTranscribeProgress: on('transcribe-progress'),
 
   listMeetings: invoke('list-meetings'),
+  getMeeting: invoke('get-meeting'),
+  searchMeetings: invoke('search-meetings'),
+  reresolveNames: invoke('reresolve-names'),
+  reresolveAllNames: invoke('reresolve-all-names'),
+  onChatDelta: on('chat-delta'),
   updateMeeting: invoke('update-meeting'),
   deleteMeeting: invoke('delete-meeting'),
   listTrash: invoke('list-trash'),

@@ -9,7 +9,7 @@
 //   4. AI inference         -> roster-constrained guess (src/ai/inferSpeakerNames.js)
 //   5. leftovers            -> keep "Speaker N" and report as unresolved
 const { segText } = require('./transcriptUtils');
-const { nameKey, matchToRoster, rosterNames } = require('./roster');
+const { nameKey, matchToRoster, rosterNames, isPersonName } = require('./roster');
 
 const USER_CONFIDENCE = 0.95;
 const MANUAL_CONFIDENCE = 1;
@@ -157,9 +157,12 @@ function resolveSpeakers({
     // the mononym "Sagar" while the account is "Sagar Bansal". nameKey demands an exact match and
     // would let that straight through.
     if (channel !== 0 && user && isSamePerson(canonical(name), user)) continue;
+    // A vote can only name a person. UI labels voted in as speakers ("Code", "Huddles",
+    // "View Sagar Bansal's profile" — all at 0.9+ in real Slack huddles) stop here.
+    if (!isPersonName(name)) continue;
     put(channel, dz, {
       name: canonical(name),
-      source: 'native-agent',
+      source: (value && value.source) || 'native-agent',
       confidence: conf,
       lockedByUser: false,
       sampleText: sampleFor(segs, channel, dz),
@@ -181,22 +184,28 @@ function resolveSpeakers({
       if (!e.name) continue;
       for (const key of byLabel.get(label) || []) {
         const [channel, dz] = key.split(':').map(Number);
+        if (channel !== 0 && user && isSamePerson(canonical(e.name), user)) continue;
         put(channel, dz, {
           name: canonical(e.name),
           source: e.source || 'ai-inference',
           confidence: typeof e.confidence === 'number' ? e.confidence : 0.6,
           lockedByUser: false,
           sampleText: sampleFor(segs, channel, dz),
+          ...(e.basis ? { basis: e.basis } : {}),
+          ...(e.evidence ? { evidence: e.evidence } : {}),
         });
       }
     }
   }
 
   // --- Guard: one person must not end up on two speakers. Keep the most confident.
+  // Exception: an AI answer the model marked as a diarization fragment of an already-named voice
+  // (basis "...+fragment", already capped at 0.6 in parseInferenceResponse).
   const seen = new Map();
   for (const [key, entry] of Object.entries(speakerMap)) {
     const k = nameKey(entry.name);
     if (!k) continue;
+    if (typeof entry.basis === 'string' && entry.basis.endsWith('+fragment')) continue;
     const prevKey = seen.get(k);
     if (prevKey === undefined) { seen.set(k, key); continue; }
     const prevEntry = speakerMap[prevKey];

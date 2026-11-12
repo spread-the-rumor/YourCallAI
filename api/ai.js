@@ -4,13 +4,21 @@ export const config = { runtime: 'edge' };
 
 const MODEL = 'google/gemma-4-31b-it';
 
+// Per-purpose model, chosen SERVER-side. The client may name a purpose, never a model: the proxy
+// token is baked into the installer, so accepting a model string would let anyone who extracts it
+// run arbitrarily expensive models on this account. Override per purpose with an env var.
+const PURPOSE_MODELS = {
+  names: () => process.env.NAMES_MODEL || 'nvidia/nemotron-3.5-lightning-30b-a3b',
+};
+
 export default async function handler(req) {
   if (req.method !== 'POST') return new Response('POST only', { status: 405 });
   const key = process.env.REQUESTY_API_KEY;
   if (!key) return new Response(JSON.stringify({ error: 'AI not configured on server.' }), { status: 200, headers: { 'Content-Type': 'application/json' } });
 
   const base = process.env.REQUESTY_BASE_URL || 'https://router.requesty.ai/v1';
-  const { messages, temperature = 0.3, stream = false } = await req.json();
+  const { messages, temperature = 0.3, stream = false, purpose } = await req.json();
+  const wanted = PURPOSE_MODELS[purpose] ? PURPOSE_MODELS[purpose]() : MODEL;
 
   // Always ask upstream to stream, even when the client wants a single JSON body.
   // The Edge runtime kills an invocation that produces no bytes for ~25s, and that timer is on
@@ -18,11 +26,17 @@ export default async function handler(req) {
   // (FUNCTION_INVOCATION_TIMEOUT) while the identical streamed one survives well past it.
   // maxDuration is not an option — it doesn't apply to Edge functions. So we stream from upstream
   // unconditionally and, for non-streaming callers, reassemble the frames below.
-  const upstream = await fetch(`${base}/chat/completions`, {
+  const call = (model) => fetch(`${base}/chat/completions`, {
     method: 'POST',
     headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ model: MODEL, messages, temperature, stream: true }),
+    body: JSON.stringify({ model, messages, temperature, stream: true }),
   });
+  let upstream = await call(wanted);
+  // A purpose model the router does not know (renamed, retired, typo in the env var) must not
+  // break the feature: fall back to the default model rather than failing the request.
+  if (!upstream.ok && wanted !== MODEL && [400, 404, 422].includes(upstream.status)) {
+    upstream = await call(MODEL);
+  }
 
   if (!upstream.ok) {
     const body = await upstream.text().catch(() => '');

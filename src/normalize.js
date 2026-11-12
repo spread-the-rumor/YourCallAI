@@ -434,7 +434,18 @@ async function runJob(job) {
   // Short output means we mangled something (a truncated capture, a mid-file decode error that
   // -err_detect ignore_err swallowed). Take the mp4 — it is seekable and holds almost everything —
   // but KEEP the source. The 2x disk cost is the right trade for a recording we know is suspect.
-  const partial = !!(wallMs && result.outMs && result.outMs < wallMs * ACCEPT_RATIO);
+  //
+  // An EMPTY output is a failure, not a success. `result.outMs && …` treated 0 ms as "complete"
+  // (0 is falsy), so a recorder crash left a 261-byte video.mp4 holding no video and DELETED the
+  // capture it came from (found by the crash stress test). Unknown length also keeps the source.
+  const outSize = (await fsp.stat(part).catch(() => ({ size: 0 }))).size;
+  if (!(result.outMs > 0) && outSize < 16 * 1024) {
+    await fsp.rm(part, { force: true }).catch(() => {});
+    log(id, `empty output (${outSize} bytes) — keeping ${path.basename(src)}`);
+    await writeState(dir, { attempts, encoder, lastError: 'empty output', at: new Date().toISOString() });
+    return;
+  }
+  const partial = !!(wallMs && (!(result.outMs > 0) || result.outMs < wallMs * ACCEPT_RATIO));
 
   try {
     // fsync before the rename: the concern is the page cache, not the rename itself.
