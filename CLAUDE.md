@@ -35,8 +35,8 @@ app (Edge and Node alike; direct streams to Requesty from the same PC ran 365 s 
 - **AI jobs** (the real fix): each attempt sends a `jobId`; `api/ai.js` saves progress and the final
   answer to Redis (`ai:job:<id>`, 15 min, re-saved every 15 s while running). When a stream dies the
   client polls `GET /api/ai?job=<id>` (short requests) and gets the finished answer instead of
-  regenerating it; a running job's `ts` unchanged for 60 s = dead → retry. Without Redis (not
-  configured — creds exist for Production only) jobs are off and plain retries remain. Verified with
+  regenerating it; a running job's `ts` unchanged for 60 s = dead → retry. Without Redis jobs are
+  off and plain retries remain. Verified with
   a relay that cuts every stream at 6 s: complete answers in ~40 s, one model run each.
   `api/ai.js` `trace` lines (`{"ai":"alive"|"end"|"client-closed"}`) are what proved this — keep them.
 Fixes, both sides:
@@ -1069,6 +1069,15 @@ Slack per-user OAuth was landed across v2.0.3–v2.0.8. Bugs hit and fixed, in o
    reach existing deployments. Expect recurrence on the free tier (OAuth traffic is sparse); both
    `oauth-redeem` routes now catch store errors and return
    `Token store unavailable: <cause>` at HTTP 200 instead of an opaque 500.
+   **Recurred 2026-11-13, worse:** both of this project's Upstash stores (`upstash-kv-cyan-window`,
+   `upstash-kv-apricot-ribbon`) showed as *uninstalled* in Vercel, so there was nothing to restore,
+   and the account's one free Upstash database is `sbpm-scheduler-redis`. By the user's choice that
+   store is now SHARED: connected to `your-call-ai` (Production + Preview) with prefix `SLACK` →
+   `SLACK_KV_REST_API_URL/TOKEN`, the first names `redisClient()` reads. Keys cannot clash
+   (`slack:otc:*`, `asana:otc:*`, `ai:job:*`), but the two apps share its free-tier limits, and if
+   that database goes both break. The dead stores were disconnected from the project.
+   Health check: `POST /api/slack/oauth-redeem {"code":"x"}` must answer "Code expired or
+   invalid", not "Token store unavailable".
 10. **`AI request failed (504): FUNCTION_INVOCATION_TIMEOUT`** — reported from the Asana task
     flow, but **not** integration code: every integration funnels through `/api/ai`. Two separate
     defects, both measured against prod:
