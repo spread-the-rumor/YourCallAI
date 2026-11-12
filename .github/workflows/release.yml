@@ -15,7 +15,7 @@ jobs:
       matrix:
         include:
           - os: windows-latest
-          - os: macos-14
+          - os: macos-15 # macos-14 was retired: jobs were cancelled with "configuration not supported"
     runs-on: ${{ matrix.os }}
     permissions:
       contents: write

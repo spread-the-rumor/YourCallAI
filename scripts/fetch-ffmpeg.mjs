@@ -118,13 +118,13 @@ const PINS = {
     // update the three values below. Do NOT switch to the `latest` tag's
     // `ffmpeg-master-latest-*` assets to dodge this: those are rolling, so the hash would change
     // under us and the pin would stop meaning anything.
-    url: 'https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-09-24-14-14/ffmpeg-n9.0.2-3-ga5923073bf-win64-lgpl-9.0.zip',
+    url: 'https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-11-11-12-39/ffmpeg-n9.0.2-49-gc179411bbb-win64-lgpl-9.0.zip',
     archive: 'zip',
     member: 'bin/ffmpeg.exe', // we extract ONLY this; ffprobe/ffplay would double the payload
     binary: 'ffmpeg.exe',
-    archiveSha256: 'ad4bddec89f4d5413f976ca4b4424c3aeec095afa029f739a2a03e9a360f06cd',
-    binarySha256: 'ca2b72f7607527869f8f132c504765cfbab21ab05971006c7f5dd45b72c0127f',
-    // Verified on this pin (2026-09-24, by reading FFMPEG_CONFIGURATION out of the binary, not a
+    archiveSha256: '9ccd65428fb0e60a0d574b76145df41f402b754edd2d06c2e24fa506fc1c2b02',
+    binarySha256: 'ea893b575982e11af6707fb00d2eb285a1183395ee48cdb065a6b8c91aeb1767',
+    // Verified on this pin (2026-11-12, by reading FFMPEG_CONFIGURATION out of the binary, not a
     // README): --disable-libx264 AND --disable-libx265, zero occurrences of --enable-gpl or
     // --enable-nonfree, --enable-libopenh264 (Cisco, BSD-2) for software H.264, and
     // libopenh264 / h264_qsv / h264_nvenc / h264_amf all present in -encoders.
