@@ -29,7 +29,6 @@ contextBridge.exposeInMainWorld('api', {
   startHuddle: invoke('start-huddle'),
   stopRecording: invoke('stop-recording'),
   startDetectedRecording: invoke('start-detected-recording'),
-  dismissDetectedMeeting: invoke('dismiss-detected-meeting'),
 
   sendToSlack: invoke('send-to-slack'),
   listSlackChannels: invoke('list-slack-channels'),
@@ -63,7 +62,6 @@ contextBridge.exposeInMainWorld('api', {
   getEffectiveConfig: invoke('get-effective-config'),
   onConfigChanged: on('config-changed'),
   getAppVersion: invoke('get-app-version'),
-  restartApp: invoke('restart-app'),
 
   signIn: invoke('auth-sign-in'),
   signOut: invoke('auth-sign-out'),

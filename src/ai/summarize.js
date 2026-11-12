@@ -1,7 +1,7 @@
 // Fixed-structure Markdown meeting summary. Never throws — failures return a
 // readable "Summary unavailable — <reason>" string the UI shows as-is.
 const { chatCompletion } = require('./requesty');
-const { transcriptToPrompt } = require('../transcriptUtils');
+const { transcriptToPrompt, segSpeaker } = require('../transcriptUtils');
 
 const SYSTEM = `You are an expert executive assistant and elite meeting synthesizer. Your task is to transform raw, messy meeting transcripts into hyper-dense, actionable, and scannable summaries.
 
@@ -41,7 +41,8 @@ Participants:
 * [High-level strategic milestone or follow-up meeting details]
 * [Future roadmap item]`;
 
-async function summarizeTranscript(transcript, onDelta) {
+// onDelta(chunk) streams the summary; onReset() is called before a retry re-streams it.
+async function summarizeTranscript(transcript, onDelta, onReset) {
   const text = transcriptToPrompt(transcript);
   if (!text.trim()) return 'Summary unavailable — the transcript is empty.';
   try {
@@ -50,7 +51,7 @@ async function summarizeTranscript(transcript, onDelta) {
         { role: 'system', content: SYSTEM },
         { role: 'user', content: `Summarize this meeting transcript:\n\n${text}` },
       ],
-      onDelta ? { onDelta } : {}
+      onDelta ? { onDelta, onReset } : {}
     );
     return out.trim() || 'Summary unavailable — the AI returned an empty response.';
   } catch (err) {
@@ -62,4 +63,24 @@ function summaryFailed(summary) {
   return !summary || !summary.trim() || summary.startsWith('Summary unavailable');
 }
 
-module.exports = { summarizeTranscript, summaryFailed };
+// The summary is generated in parallel with name resolution, on the provisional "Speaker N"
+// labels, and the resolved names are substituted in afterwards. `before` maps "<ch>:<dz>" to the
+// label the summarizer saw; `after` is the resolved transcript. Only generic labels are rewritten,
+// longest first and digit-bounded so "Speaker 1" can never eat the front of "Speaker 12".
+function relabelSummary(summary, before, after) {
+  if (!summary || summaryFailed(summary)) return summary;
+  const finalByKey = new Map();
+  for (const s of after || []) finalByKey.set(`${s.channel}:${s.diarizedSpeaker}`, segSpeaker(s));
+  const swaps = [];
+  for (const [key, oldLabel] of before) {
+    const next = finalByKey.get(key);
+    if (next && next !== oldLabel && /^Speaker \d+$/.test(oldLabel)) swaps.push([oldLabel, next]);
+  }
+  swaps.sort((a, b) => b[0].length - a[0].length);
+  let out = summary;
+  // Function replacer: a name containing `$&` or `$1` must be inserted literally.
+  for (const [from, to] of swaps) out = out.replace(new RegExp(`\\b${from}(?!\\d)`, 'g'), () => to);
+  return out;
+}
+
+module.exports = { summarizeTranscript, summaryFailed, relabelSummary };

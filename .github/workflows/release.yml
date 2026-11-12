@@ -25,9 +25,32 @@ jobs:
         with:
           node-version: 22
 
+      # Fail fast on a missing secret: an empty value is baked in as '' without any error, and an
+      # installer with no APP_PROXY_TOKEN gets 401 from every proxy route (AI, transcription, Slack).
+      - name: Check build secrets
+        shell: bash
+        run: |
+          missing=""
+          for v in APP_PROXY_TOKEN SUPABASE_URL SUPABASE_ANON_KEY SLACK_CLIENT_ID ASANA_CLIENT_ID; do
+            [ -n "${!v}" ] || missing="$missing $v"
+          done
+          if [ -n "$missing" ]; then echo "::error::Missing build secrets:$missing"; exit 1; fi
+        env:
+          APP_PROXY_TOKEN: ${{ secrets.APP_PROXY_TOKEN }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+          SLACK_CLIENT_ID: ${{ secrets.SLACK_CLIENT_ID }}
+          ASANA_CLIENT_ID: ${{ secrets.ASANA_CLIENT_ID }}
+
       - name: Build Windows name agent
         if: runner.os == 'Windows'
         run: pwsh agents/windows/build.ps1
+
+      # The installer must never ship without the agent (names, native audio capture, detection).
+      - name: Check Windows agent binary
+        if: runner.os == 'Windows'
+        shell: bash
+        run: test -s agents/dist/YourCallAgent.exe || { echo "::error::agents/dist/YourCallAgent.exe missing"; exit 1; }
 
       - name: Build macOS name agent
         if: runner.os == 'macOS'
@@ -54,6 +77,9 @@ jobs:
 
       - run: npm ci
 
+      - name: Self-check tests
+        run: npm test
+
       # Both jobs publish to the same draft GitHub Release; publish the draft to go live.
       - name: Publish
         run: npm run publish
@@ -67,7 +93,10 @@ jobs:
           ASANA_CLIENT_ID: ${{ secrets.ASANA_CLIENT_ID }}
           APP_PROXY_TOKEN: ${{ secrets.APP_PROXY_TOKEN }}
 
+  # After the installers: the API and the client it serves go live together, and a failed build
+  # no longer leaves a new backend in front of an old app (or the reverse).
   deploy-api:
+    needs: release
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

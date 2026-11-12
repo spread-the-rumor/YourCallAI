@@ -25,7 +25,19 @@ const KNOWN_START_MS = 4000;     // a known call app holding the mic this long �
 const UNKNOWN_START_MS = 30000;  // an unrecognised mic user must persist longer (dictation, voice notes)
 const END_GRACE_MS = 20000;      // every liveness signal absent this long → the meeting is over
 
-const BROWSER_RE = /^(chrome|msedge|edge|chromium|brave|opera|vivaldi|firefox|arc|comet|thebrowsercompany|librewolf|waterfox|zen)$/;
+const BROWSER_RE = /^(chrome|msedge|edge|chromium|brave|opera|vivaldi|firefox|arc|comet|thebrowsercompany|librewolf|waterfox|zen|safari)$/;
+
+// macOS reports display names ("zoom.us", "Microsoft Teams", "Google Chrome"); map them onto the
+// Windows process names the tables below use.
+function macProcName(name) {
+  const n = String(name || '').toLowerCase().trim();
+  const map = {
+    'zoom.us': 'zoom', 'microsoft teams': 'teams', 'microsoft teams (work or school)': 'teams',
+    'microsoft teams classic': 'teams', 'google chrome': 'chrome', 'microsoft edge': 'msedge',
+    'brave browser': 'brave', 'arc': 'arc', 'webex': 'webex', 'cisco webex meetings': 'webex',
+  };
+  return map[n] || n.replace(/.app$/, '');
+}
 
 // Processes that use the microphone for reasons other than a call. Our own app is here: the
 // recorder holds the mic for the whole recording.
@@ -90,7 +102,7 @@ function classifySnapshot(snapshot) {
   const windows = s.windows || [];
   const holders = [...new Set((s.mic || []).map((m) => (m.proc || '').toLowerCase()))]
     .filter((p) => p && !IGNORE_MIC.test(p));
-  if (!holders.length) return null;
+  if (!holders.length) return s.micUnknown ? classifyByTitle(windows) : null;
 
   // Prefer a recognised desktop app over everything else.
   for (const proc of holders) {
@@ -117,6 +129,23 @@ function classifySnapshot(snapshot) {
   return { platform: 'other', transport: 'app', app: proc, title: titleFor(null, windows, proc), known: false };
 }
 
+// Title-only classification, for when nobody can say who holds the mic (macOS has no
+// equivalent of the Windows mic-session data). Stricter than the mic path: only windows that
+// exist DURING a call count, so an open Teams or Zoom main window never starts anything.
+function classifyByTitle(windows) {
+  for (const w of windows || []) {
+    const platform = appPlatform(w.proc);
+    const cw = platform && CALL_WINDOW.find((c) => c.platform === platform);
+    if (cw && cw.re.test(w.title || '')) return { platform, transport: 'app', app: w.proc, title: w.title, known: true };
+  }
+  for (const w of windows || []) {
+    if (!BROWSER_RE.test(w.proc || '')) continue;
+    const platform = tabHint(w.title);
+    if (platform && platform !== 'browser') return { platform, transport: 'browser', app: w.proc, title: w.title, known: true };
+  }
+  return null;
+}
+
 // Is the announced call still live? Any one signal is enough.
 function stillLive(call, snapshot, { systemAudio = false } = {}) {
   if (!call) return false;
@@ -126,6 +155,9 @@ function stillLive(call, snapshot, { systemAudio = false } = {}) {
   if (call.platform === 'teams' && (s.mic || []).some((m) => m.proc === 'msedgewebview2')) return true;
   const cw = CALL_WINDOW.find((c) => c.platform === call.platform);
   if (cw && (s.windows || []).some((w) => w.proc === call.app && cw.re.test(w.title || ''))) return true;
+  // Without mic data (macOS) the meeting tab itself is the only evidence a browser call goes on.
+  if (s.micUnknown && call.transport === 'browser'
+    && (s.windows || []).some((w) => w.proc === call.app && tabHint(w.title) === call.platform)) return true;
   return false;
 }
 
@@ -189,7 +221,7 @@ function platformListWindows() {
         if (err) return resolve(null);
         resolve(stdout.split('\n').filter(Boolean).map((line) => {
           const i = line.indexOf('|');
-          return { proc: line.slice(0, i).toLowerCase(), title: line.slice(i + 1) };
+          return { proc: macProcName(line.slice(0, i)), title: line.slice(i + 1) };
         }));
       });
     } else resolve([]);
@@ -267,7 +299,9 @@ function start(opts) {
     if (!latestAt || Date.now() - latestAt > AGENT_POLL_MS * 3) {
       try {
         const [windows, mic] = await Promise.all([platformListWindows(), registryMic()]);
-        if (windows !== null || mic !== null) evaluate({ windows: windows || [], mic: mic || [], playing: [], source: 'fallback' });
+        // mic === null: no mic-in-use source on this platform (macOS) or it failed — classify by
+        // call-window titles instead of announcing nothing, which is what macOS used to get.
+        if (windows !== null || mic !== null) evaluate({ windows: windows || [], mic: mic || [], micUnknown: mic === null, playing: [], source: 'fallback' });
       } catch (err) { console.warn('[detector] fallback poll failed:', err.message); }
     }
     if (!stopped) fallbackTimer = setTimeout(fallback, FALLBACK_POLL_MS);

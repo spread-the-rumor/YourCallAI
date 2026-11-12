@@ -76,7 +76,7 @@ function parseEncoders(stdout) {
 function exec(bin, args, { timeout = 20000 } = {}) {
   return new Promise((resolve) => {
     let child;
-    try { child = spawn(bin, args, { stdio: ['ignore', 'pipe', 'pipe'], shell: false }); }
+    try { child = spawn(bin, args, { stdio: ['ignore', 'pipe', 'pipe'], shell: false, windowsHide: true }); }
     catch (err) { return resolve({ status: null, stdout: '', stderr: String(err.message) }); }
     let stdout = '';
     let stderr = '';
@@ -233,7 +233,7 @@ function run(bin, args, { wallMs, onProgress, onChild } = {}) {
   return new Promise((resolve) => {
     let child;
     try {
-      child = spawn(bin, args, { stdio: ['ignore', 'pipe', 'pipe'], shell: false });
+      child = spawn(bin, args, { stdio: ['ignore', 'pipe', 'pipe'], shell: false, windowsHide: true });
     } catch (err) {
       return resolve({ ok: false, code: null, killed: false, outMs: 0, stderr: err.message });
     }

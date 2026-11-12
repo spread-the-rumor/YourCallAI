@@ -969,4 +969,170 @@ assert.strictEqual(ffm.outTimeMs(seen[1]), null, 'N/A early in the run is not a 
 feed('out_time_ms=2000000\nprogress=end\n');
 assert.strictEqual(ffm.outTimeMs(seen[2]), 2000, 'out_time_ms fallback');
 
-console.log('selfcheck: all assertions passed');
+// ---------- store / sync data integrity (async) ----------
+(async () => {
+  const store = require('../src/store');
+  const sync = require('../src/sync');
+  const { JsonFile } = require('../src/jsonFile');
+  const tick = () => new Promise((r) => setImmediate(r));
+  const mkTmp = (p) => fs.mkdtempSync(path.join(os.tmpdir(), p));
+  const readFile = (dir) => JSON.parse(fs.readFileSync(path.join(dir, 'meetings.json'), 'utf8'));
+  // Signed out, with a throwaway queue file (the real one lives in Electron's userData).
+  sync._setTestDeps({ client: null, user: null, queueFile: new JsonFile(path.join(mkTmp('ycai-q-'), 'q.json'), { ids: [] }) });
+  const microUntil = async (cond) => { for (let i = 0; i < 1000 && !cond(); i++) await Promise.resolve(); assert.ok(cond(), 'condition reached'); };
+
+  // 1. flushSync (will-quit) while an async write is in flight. The old store cleared `dirty`
+  //    when the async write STARTED, so flushSync did nothing and the exit beat the rename.
+  {
+    const dir = mkTmp('ycai-store-');
+    store._reset(dir);
+    await store.upsertMeeting({ id: 'm1', recordingId: 'm1', title: 'v1', date: '2026-01-01T00:00:00Z' });
+    const p = store.flush();
+    await microUntil(() => store._writeState().inFlight > 0); // serialized, awaiting I/O
+    assert.ok(!fs.existsSync(path.join(dir, 'meetings.json')), 'async write not yet renamed');
+    store.flushSync();
+    assert.strictEqual(readFile(dir).meetings[0].title, 'v1', 'flushSync writes while an async write is in flight');
+    await p;
+    assert.strictEqual(readFile(dir).meetings[0].title, 'v1');
+
+    // A change made during the in-flight write must win over the older async body.
+    const p2 = (async () => { await store.updateMeeting('m1', { title: 'v2' }); return store.flush(); })();
+    await microUntil(() => store._writeState().inFlight > 0);
+    await store.updateMeeting('m1', { title: 'v3' });
+    store.flushSync();
+    assert.strictEqual(readFile(dir).meetings[0].title, 'v3', 'flushSync persists the latest data');
+    await p2; await store.flush();
+    assert.strictEqual(readFile(dir).meetings[0].title, 'v3', 'the older async body never lands after flushSync');
+    assert.deepStrictEqual(fs.readdirSync(dir).filter((f) => f.endsWith('.tmp')), [], 'no tmp files left behind');
+    const ws = store._writeState();
+    assert.strictEqual(ws.gen, ws.savedGen, 'clean after flush');
+    assert.strictEqual(ws.inFlight, 0);
+  }
+
+  // 2. restore sets deletedAt: null (a deleted key does not survive sync's shallow merge).
+  {
+    const dir = mkTmp('ycai-store-');
+    store._reset(dir);
+    await store.upsertMeeting({ id: 'r1', recordingId: 'r1', title: 'x', date: '2026-01-01T00:00:00Z' });
+    const del = await store.softDelete('r1');
+    assert.ok(del.deletedAt);
+    assert.strictEqual((await store.loadTrash()).length, 1);
+    await new Promise((r) => setTimeout(r, 2));
+    const back = await store.restore('r1');
+    assert.ok('deletedAt' in back && back.deletedAt === null, 'restore writes deletedAt: null, not an absent key');
+    assert.ok(new Date(back.updatedAt) > new Date(del.updatedAt), 'restore bumps updatedAt');
+    assert.strictEqual((await store.loadMeetings()).length, 1, 'null deletedAt = not deleted');
+    assert.strictEqual((await store.loadTrash()).length, 0);
+    // Through a shallow merge (what a pull does), null clears the other side's deletedAt.
+    const merged = { ...del, ...sync.stripLocal(back) };
+    assert.strictEqual(merged.deletedAt, null);
+    await store.flush();
+  }
+
+  // 3. Permanent delete leaves a hidden tombstone, removes the recording folder by recordingId,
+  //    and reconcile never brings the meeting back.
+  {
+    const dir = mkTmp('ycai-store-');
+    const recs = mkTmp('ycai-recs-');
+    fs.mkdirSync(path.join(recs, 'rec-7'));
+    fs.writeFileSync(path.join(recs, 'rec-7', 'audio.webm'), 'x');
+    store._reset(dir);
+    await store.upsertMeeting({ id: 'p1', recordingId: 'rec-7', title: 'secret', date: '2026-01-01T00:00:00Z' });
+    await store.upsertMeeting({ id: 'k1', recordingId: 'k1', title: 'keep', date: '2026-01-02T00:00:00Z' });
+    const before = (await store.loadAllRaw()).find((m) => m.id === 'p1').updatedAt;
+
+    assert.strictEqual(await store.recordingIdFor('p1'), 'rec-7');
+    const busy = await store.deletePermanent('p1', recs, { isBusy: (rid) => rid === 'rec-7' });
+    assert.strictEqual(busy.ok, false, 'isBusy refuses the delete');
+    assert.ok(await store.getMeeting('p1'), 'refused delete leaves the meeting');
+
+    await new Promise((r) => setTimeout(r, 2));
+    assert.deepStrictEqual(await store.deletePermanent('p1', recs), { ok: true });
+    assert.ok(!fs.existsSync(path.join(recs, 'rec-7')), 'recording folder named by recordingId removed');
+    assert.strictEqual(await store.getMeeting('p1'), null, 'getMeeting hides tombstones');
+    assert.strictEqual(await store.recordingIdFor('p1'), null);
+    assert.deepStrictEqual((await store.loadMeetings()).map((m) => m.id), ['k1']);
+    assert.deepStrictEqual(await store.loadTrash(), [], 'tombstone not in trash');
+    assert.deepStrictEqual(await store.searchMeetings(''), ['k1'], 'search (empty) hides tombstones');
+    assert.deepStrictEqual(await store.searchMeetings('secret'), [], 'search hides tombstones');
+    const tomb = (await store.loadAllRaw()).find((m) => m.id === 'p1');
+    assert.deepStrictEqual(Object.keys(tomb).sort(), ['deletedAt', 'id', 'purged', 'recordingId', 'updatedAt']);
+    assert.ok(new Date(tomb.updatedAt) > new Date(before), 'tombstone is newer than the live record');
+    assert.strictEqual(await store.upsertMeeting({ id: 'p1', recordingId: 'rec-7', title: 'again' }), null, 'upsert cannot resurrect');
+    assert.strictEqual(await store.updateMeeting('p1', { title: 'again' }), null);
+    assert.strictEqual((await store.deletePermanent('p1', recs)).ok, false, 'second purge is a no-op');
+    assert.deepStrictEqual(sync.stripLocal(tomb), { id: 'p1', purged: true, deletedAt: tomb.deletedAt, updatedAt: tomb.updatedAt },
+      'the pushed row data is the minimal tombstone');
+
+    // Server still holds the older live row: the tombstone goes UP, nothing comes down.
+    const plan = sync._reconcilePlan([{ id: 'p1', updatedAt: tomb.updatedAt }], [{ id: 'p1', updatedAt: before }]);
+    assert.deepStrictEqual(plan, { toLocal: [], toServer: ['p1'] }, 'tombstone pushed, meeting not pulled back');
+    // Even if a live row arrives (edited elsewhere), the local tombstone is sticky.
+    await store.putManyRaw([{ id: 'p1', recordingId: 'rec-7', title: 'zombie', updatedAt: '2099-01-01T00:00:00Z' }]);
+    assert.strictEqual(await store.getMeeting('p1'), null, 'a pulled live row never resurrects a tombstone');
+    // A purged row from the server turns a live local meeting into a tombstone.
+    await store.putManyRaw([{ id: 'k1', purged: true, deletedAt: '2099-01-01T00:00:00Z', updatedAt: '2099-01-01T00:00:00Z' }]);
+    assert.strictEqual(await store.getMeeting('k1'), null, 'pulled purge deletes the local record');
+    const kt = (await store.loadAllRaw()).find((m) => m.id === 'k1');
+    assert.ok(kt.purged && kt.recordingId === 'k1' && !kt.title, 'and leaves a local tombstone');
+
+    // Ownership: another account's meeting is never planned for upload.
+    const own = sync._reconcilePlan(
+      [{ id: 'a', updatedAt: '2026-01-02', ownerId: 'userA' }, { id: 'b', updatedAt: '2026-01-02' }, { id: 'c', updatedAt: '2026-01-02', ownerId: 'userB' }],
+      [], { userId: 'userB' });
+    assert.deepStrictEqual(own.toServer, ['b', 'c'], 'foreign-owned excluded, unowned adopted');
+    await store.flush();
+  }
+
+  // 4. Offline queue: rebuilt from real failures + ids enqueued during the flush.
+  {
+    assert.deepStrictEqual(sync._rebuildQueue({ snapshot: ['a', 'b', 'c'], failed: ['b'], current: ['a', 'b', 'c', 'd'], during: ['a'] }),
+      ['b', 'd', 'a'], 'failures kept, mid-flush enqueues kept, successes dropped');
+
+    const dir = mkTmp('ycai-store-');
+    store._reset(dir);
+    await store.upsertMeeting({ id: 'ok1', recordingId: 'ok1', title: 'ok', date: '2026-01-01T00:00:00Z' });
+    await store.upsertMeeting({ id: 'bad', recordingId: 'bad', title: 'bad', date: '2026-01-01T00:00:00Z' });
+    await store.upsertMeeting({ id: 'theirs', recordingId: 'theirs', title: 't', date: '2026-01-01T00:00:00Z' });
+    await store.putManyRaw([{ id: 'theirs', ownerId: 'someone-else' }]);
+    await tick(); await tick(); // let the signed-out push-on-write echoes settle
+
+    const qf = new JsonFile(path.join(dir, 'sync-queue.json'), { ids: [] });
+    await qf.update(() => ({ ids: ['ok1', 'bad', 'gone', 'theirs'] }));
+    const rows = [];
+    const client = { from: () => ({ upsert: async (row) => {
+      rows.push(row);
+      if (row.id === 'ok1' && !row.data.purged) await qf.update((d) => { d.ids.push('late'); }); // enqueued mid-flush
+      return { error: row.id === 'bad' ? { message: 'boom' } : null };
+    } }) };
+    sync._setTestDeps({ client, user: { id: 'me' }, queueFile: qf });
+    try {
+      const res = await sync.flushQueue();
+      assert.deepStrictEqual(res.failed, ['bad']);
+      const { ids } = await qf.read();
+      assert.deepStrictEqual(ids.sort(), ['bad', 'late'], 'queue keeps the failure and the mid-flush enqueue');
+      assert.ok(!rows.some((r) => r.id === 'theirs'), "another account's meeting is never pushed");
+      const gone = rows.find((r) => r.id === 'gone');
+      assert.ok(gone && gone.data.purged === true, 'a queued id with no local record pushes a tombstone');
+      assert.ok(rows.every((r) => r.user_id === 'me'));
+      assert.strictEqual((await store.loadAllRaw()).find((m) => m.id === 'ok1').ownerId, 'me', 'pushed meetings are stamped');
+
+      // Delete while signed out is queued, then flushed on sign-in.
+      await qf.update(() => ({ ids: [] }));
+      sync._setTestDeps({ client, user: null, queueFile: qf });
+      await store.deletePermanent('ok1', null);
+      for (let i = 0; i < 100 && !(await qf.read()).ids.length; i++) await new Promise((r) => setTimeout(r, 10));
+      assert.deepStrictEqual((await qf.read()).ids, ['ok1'], 'signed-out delete is queued');
+      sync._setTestDeps({ client, user: { id: 'me' }, queueFile: qf });
+      rows.length = 0;
+      await sync.flushQueue();
+      assert.ok(rows.find((r) => r.id === 'ok1').data.purged, 'queued delete pushed as a tombstone on sign-in');
+      assert.deepStrictEqual((await qf.read()).ids, []);
+    } finally {
+      sync._setTestDeps({ client: null, user: null, queueFile: new JsonFile(path.join(mkTmp('ycai-q-'), 'q.json'), { ids: [] }) });
+    }
+    await store.flush();
+  }
+
+  console.log('selfcheck: all assertions passed');
+})().catch((e) => { console.error(e); process.exit(1); });

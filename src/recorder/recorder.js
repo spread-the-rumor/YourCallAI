@@ -128,6 +128,9 @@ async function startCapture({ forceVideoMime = '', testHooks = false } = {}) {
     const ctx = new AudioContext();
     const micSrc = ctx.createMediaStreamSource(mic);
     const sysTracks = display.getAudioTracks();
+    // The loopback track in use NOW. Recovery replaces it; each replaced one is retired, or its
+    // onended fired later (when that device went away) and raised a false "not captured" alarm.
+    let curSysTrack = sysTracks[0] || null;
     // `let`: the system source is REPLACEABLE. When the default output device changes, WASAPI
     // keeps the old loopback bound to an endpoint nobody plays to, so we swap in a fresh one.
     let sysSrc = sysTracks.length ? ctx.createMediaStreamSource(new MediaStream(sysTracks)) : null;
@@ -547,8 +550,12 @@ async function startCapture({ forceVideoMime = '', testHooks = false } = {}) {
         watchTrack(newTrack, 'system');
         // Drop only the video track we just acquired; the ORIGINAL video track keeps recording.
         candidate.getVideoTracks().forEach((t) => { t.onended = null; t.stop(); });
-        // Retire the old loopback audio track so Windows releases the dead endpoint.
-        sysTracks.forEach((t) => { t.onended = null; t.onmute = null; t.onunmute = null; try { t.stop(); } catch {} });
+        // Retire the old loopback audio track(s) so Windows releases the dead endpoint — the
+        // originals and whichever recovered track was in use until now.
+        const retire = (t) => { if (!t || t === newTrack) return; t.onended = null; t.onmute = null; t.onunmute = null; try { t.stop(); } catch {} };
+        sysTracks.forEach(retire);
+        retire(curSysTrack);
+        curSysTrack = newTrack;
         state.streams.push(candidate);
         health.rearm(Date.now());
         // Recovered: forget the failure history so a LATER dead stretch gets its own full
@@ -569,7 +576,7 @@ async function startCapture({ forceVideoMime = '', testHooks = false } = {}) {
     const onDeviceChange = async () => {
       if (!state) return;
       try {
-        const snap = await snapshotDevices(micTrack, sysTracks[0]);
+        const snap = await snapshotDevices(micTrack, curSysTrack);
         const next = defaultOutputKey(snap);
         // devicechange fires repeatedly with the default unchanged (measured: 4 in a row on one
         // Bluetooth connect) — only a real endpoint change is worth acting on.
@@ -602,7 +609,7 @@ async function startCapture({ forceVideoMime = '', testHooks = false } = {}) {
     if (testHooks) {
       window.__ycaiTest = {
         endVideo: () => display.getVideoTracks()[0].dispatchEvent(new Event('ended')),
-        endSystem: () => { const t = sysTracks[0]; if (t && t.onended) t.onended(new Event('ended')); },
+        endSystem: () => { const t = curSysTrack; if (t && t.onended) t.onended(new Event('ended')); },
         deviceChange: () => navigator.mediaDevices.ondevicechange && navigator.mediaDevices.ondevicechange(),
       };
     }

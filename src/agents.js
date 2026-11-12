@@ -33,7 +33,7 @@ function startNameAgent(platform, onLine) {
 
   const launch = () => {
     if (stopped) return;
-    child = spawn(bin, [platform], { stdio: ['ignore', 'pipe', 'pipe'] });
+    child = spawn(bin, [platform], { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
     let buf = '';
     child.stdout.on('data', (d) => {
       buf += d.toString('utf8');

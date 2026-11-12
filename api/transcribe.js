@@ -10,7 +10,7 @@
 //
 // Requires a raised maxDuration (see vercel.json) since this blocks for the whole
 // transcription (~30x realtime on Deepgram nova-3; ~300s covers well over 2 hours of audio).
-const { json, readJson, env } = require('./_shared');
+const { json, readJson, env, requireAppToken } = require('./_shared');
 const { put, del } = require('@vercel/blob');
 
 const DG_QUERY = 'model=nova-3&multichannel=true&diarize=true&utterances=true&smart_format=true&punctuate=true';
@@ -33,8 +33,13 @@ function keytermQuery(list) {
   return out.join('');
 }
 
+const result = require('./_transcribe-result');
+
 module.exports = async (req, res) => {
+  // GET = the /api/transcribe/result lookup (rewritten here; see _transcribe-result.js).
+  if (req.method === 'GET') return result(req, res);
   if (req.method !== 'POST') return json(res, 405, { error: 'POST only' });
+  if (!requireAppToken(req, res)) return; // else an open Deepgram relay that also deletes blobs
   const key = env('DEEPGRAM_API_KEY');
   if (!key) return json(res, 200, { error: 'Deepgram not configured on server.' });
 

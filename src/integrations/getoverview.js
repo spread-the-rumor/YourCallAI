@@ -10,11 +10,12 @@ async function goFetch(pathname, options = {}) {
       pathname,
       method: options.method || 'GET',
       body: options.body,
-    });
+    }, { signal: AbortSignal.timeout(options.timeoutMs || 20000) });
     const out = await res.json().catch(() => ({ ok: false, error: `GetOverview ${res.status}` }));
     return out; // proxy already returns { ok, status, body } | { ok:false, error }
   } catch (err) {
-    return { ok: false, error: `GetOverview request failed: ${err.message}` };
+    const why = err.name === 'TimeoutError' ? 'timed out' : (err.cause?.code || err.message);
+    return { ok: false, error: `GetOverview request failed: ${why}` };
   }
 }
 

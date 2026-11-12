@@ -6,7 +6,12 @@ const fs = require('fs');
 const fsp = fs.promises;
 const path = require('path');
 const { upload } = require('@vercel/blob/client');
-const { PROXY_URL, proxyPost } = require('./proxy');
+const { PROXY_URL, proxyPost, appProxyToken } = require('./proxy');
+
+// The proxy routes require the app token (v2.5.1); these two are plain GETs, not proxyPost.
+const proxyGet = (pathname, ms = 20000) => fetch(`${PROXY_URL}${pathname}`, {
+  headers: { 'x-app-token': appProxyToken() }, signal: AbortSignal.timeout(ms),
+});
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -36,6 +41,7 @@ async function uploadAudio(audioBuf) {
     access: 'public',
     contentType: 'audio/webm',
     handleUploadUrl: `${PROXY_URL}/api/blob-upload`,
+    headers: { 'x-app-token': appProxyToken() },
   });
   return blob.url;
 }
@@ -55,7 +61,19 @@ async function transcribeViaProxy(audioBuf, { onStep, keyterms } = {}) {
   t0 = Date.now();
   const body = { url, id };
   if (Array.isArray(keyterms) && keyterms.length) body.keyterms = keyterms;
-  const submit = await (await proxyPost('/api/transcribe', body)).json();
+  // The submit call blocks while Deepgram runs (up to the function's 300 s). A gateway timeout,
+  // an HTML error page or a dropped connection used to throw "Unexpected token…" here and skip
+  // the /result recovery that exists for exactly that case; now any of them falls into polling.
+  let submit = {};
+  try {
+    const res = await proxyPost('/api/transcribe', body, { signal: AbortSignal.timeout(330000) });
+    const text = await res.text();
+    try { submit = JSON.parse(text); } catch { submit = { lost: `HTTP ${res.status}` }; }
+    if (res.status === 401) throw new Error('The app is not authorised to transcribe (update the app).');
+  } catch (err) {
+    if (/not authorised/.test(err.message)) throw err;
+    submit = { lost: err.cause?.code || err.message };
+  }
   if (submit.error) throw new Error(submit.error);
 
   // Prefer the URL from the submit response; fall back to polling /result if it was lost.
@@ -63,20 +81,22 @@ async function transcribeViaProxy(audioBuf, { onStep, keyterms } = {}) {
   if (!resultUrl) {
     for (let i = 0; i < 60 && !resultUrl; i++) {
       await sleep(3000);
-      const data = await fetch(`${PROXY_URL}/api/transcribe/result?id=${encodeURIComponent(id)}`)
+      const data = await proxyGet(`/api/transcribe/result?id=${encodeURIComponent(id)}`)
         .then((r) => r.json()).catch(() => ({}));
       if (data.status === 'done') resultUrl = data.resultUrl;
       else if (data.status === 'error') throw new Error(data.error || 'Transcription failed');
     }
-    if (!resultUrl) throw new Error('Transcription timed out');
+    if (!resultUrl) throw new Error(`Transcription timed out${submit.lost ? ` (${submit.lost})` : ''}`);
   }
   step('deepgram', t0);
 
   t0 = Date.now();
-  const result = await fetch(resultUrl).then((r) => r.json());
+  const res = await fetch(resultUrl, { signal: AbortSignal.timeout(120000) });
+  if (!res.ok) throw new Error(`Could not download the transcript (HTTP ${res.status})`);
+  const result = await res.json();
   step('fetch-result', t0);
   // Best-effort: drop the stored transcript now that we have it.
-  fetch(`${PROXY_URL}/api/transcribe/result?id=${encodeURIComponent(id)}&ack=1`).catch(() => {});
+  proxyGet(`/api/transcribe/result?id=${encodeURIComponent(id)}&ack=1`).catch(() => {});
   return result;
 }
 

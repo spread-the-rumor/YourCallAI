@@ -23,6 +23,69 @@ resolves speaker names, AI summaries (Requesty/LLM), and sends summaries to Slac
 - `src/names.js` + `src/people.js` + `src/ai/inferSpeakerNames.js` — speaker naming.
 - `src/detector.js` — meeting detection (mic-holder based). `src/systemAudio.js` — native capture.
 
+## v2.5.1 — AI transport, and the stakeholder-readiness audit (2026-11-12)
+
+**"Chat unavailable — terminated".** v2.5.0 moved chat (and summaries) onto `/api/ai`'s streaming
+pass-through. Measured: ~30% of AI responses died mid-flight — the client stopped receiving bytes
+(7–53 s in) and `fetch` reported `terminated` ~70 s later. Node `fetch` and Chromium `net.fetch`
+failed at the same rate. **Request tracing proved the function was fine**: Vercel's runtime log
+showed every such request running to `finish_reason: "stop"` (101 s, 120 s) with the client never
+seen leaving — the answer was complete on the server and lost on the long connection back to the
+app (Edge and Node alike; direct streams to Requesty from the same PC ran 365 s unbroken). So:
+- **AI jobs** (the real fix): each attempt sends a `jobId`; `api/ai.js` saves progress and the final
+  answer to Redis (`ai:job:<id>`, 15 min, re-saved every 15 s while running). When a stream dies the
+  client polls `GET /api/ai?job=<id>` (short requests) and gets the finished answer instead of
+  regenerating it; a running job's `ts` unchanged for 60 s = dead → retry. Without Redis (not
+  configured — creds exist for Production only) jobs are off and plain retries remain. Verified with
+  a relay that cuts every stream at 6 s: complete answers in ~40 s, one model run each.
+  `api/ai.js` `trace` lines (`{"ai":"alive"|"end"|"client-closed"}`) are what proved this — keep them.
+Fixes, both sides:
+- `api/ai.js` runs on the **Node runtime** (`maxDuration: 300` in vercel.json), sends a first byte
+  at once and a keep-alive every 5 s (`: ping` SSE comment / whitespace), aborts an upstream that is
+  silent for 90 s (reasoning models think silently: 20 s killed a correct 168 s answer) and retries
+  it once while no answer text has reached the client, and reports any later failure IN the body
+  (`data: {"error":{…}}` or `{error}`) instead of cutting the connection.
+- `src/ai/requesty.js` ALWAYS requests the stream format (the buffered format's 1-byte keep-alives
+  were held back up to 69 s by the network path, which looked like a dead connection), ends at
+  `[DONE]`/`finish_reason` (not socket close), aborts after 30 s without a byte, retries up to 3
+  attempts (onReset clears text already streamed; the UI gets
+  `chat-delta {reset:true}` / progress `summary-reset`), and throws real messages for `{error}`
+  bodies and in-stream error frames (both used to become "empty response").
+- `askMeeting` returns `{ok, answer|error}`; failures are never stored as chat turns (v2.5.0 saved
+  them and replayed them to the model). History sent is the last ≤12 turns / 8 KB. Stored failed
+  turns are removed at launch (`cleanFailedChatTurns`).
+- **Vercel Hobby allows 12 Node functions.** Moving `/api/ai` off Edge made 13, so
+  `/api/transcribe/result` is now `api/_transcribe-result.js`, reached via a vercel.json rewrite to
+  `/api/transcribe` (GET). Adding a route means merging another one the same way.
+- **Names were dead in v2.5.0:** Requesty answered 403 "model not approved" for the names model and
+  the fallback only covered 400/404/422. It now falls back on any 4xx except 401/429. Once the model
+  was approved it still failed: nemotron-3.5-lightning reasons for 186–365 s on a real names prompt
+  (no request option stops it) and answered mostly null. Names now use the default model (44 s,
+  correct); `NAMES_MODEL` on Vercel overrides.
+- **`/api/ai`, `/api/transcribe`, `/api/transcribe/result` and `/api/blob-upload` (token issuing)
+  accepted requests with no app token**; all check `x-app-token` now. `api/getoverview.js` has a
+  method+path allowlist. **Transition:** clients ≤ v2.5.0 send no token to `/api/blob-upload`, so a
+  MISSING token is still accepted there (a wrong one is not) — remove that in the next release.
+- CI: secrets check, `npm test`, agent-exe check; `deploy-api` `needs: release`; `build.ps1` exits
+  non-zero when `dotnet publish` fails.
+
+**Audit fixes** (each one reproduced from code before fixing): autosave wrote meeting B's notes into
+A on a fast switch; a title edit during summary streaming saved the half summary as the user's
+notes; double Start ran two recorders into one file (`starting` flag); double Stop finalized early
+and could finalize the NEXT recording (`rec.stopping` shared promise + finalize identity check);
+`flushSync` on quit skipped an in-flight write (gen counters); permanent delete came back via sync
+(tombstones: `purged:true`, hidden from every reader); restore never synced (`deletedAt: null`);
+another account's meetings were pushed on sign-in (`ownerId`); closing the main window left the app
+running invisibly (the hidden popup window means `window-all-closed` never fires — now quits on
+Windows); macOS never detected a meeting (title-only `classifyByTitle` when mic data is unknown);
+retention left `system.pcm` (~115 MB/h) behind (now deleted after transcription; a Retry reuses
+`audio.native.webm`); `status` carries `recording` so a processing meeting no longer hides Stop.
+Tests: `test/ai-client.js` (scripted fake backend: stall, cut-off, error frame, 429, reset),
+`test/detector-mac.js`, plus store/sync cases in `test/selfcheck.js` — all in `npm test`.
+
+**Not fixed:** the macOS build is unsigned (no auto-update on Mac without an Apple Developer
+certificate); a meeting deleted on another device leaves its local recording folder on disk.
+
 ## v2.5 overhaul — read this before the older sections below
 
 Four user-reported problems (2026-11-12): wrong names, audio lost on display/device change,
@@ -107,8 +170,9 @@ on a remote voice in 10 meetings, UI labels ("Huddles", "Code") as speakers. Roo
    then **mutated the transcript in place**, so the resolver rejecting it changed nothing. Now
    first sight is a baseline, `voteSpeakers` is pure and needs ≥3 events over ≥20 s covering ≥10%
    of that voice, and labels are applied only in `resolveSpeakers`.
-2. ONE AI call (`purpose: 'names'` → server picks `NAMES_MODEL`, default
-   `nvidia/nemotron-3.5-lightning-30b-a3b`, falls back to the default model on 400/404/422)
+2. ONE AI call (`purpose: 'names'` → server picks `NAMES_MODEL`, default = the default model since
+   v2.5.1 — nemotron-3.5-lightning reasoned 3–6 min per meeting, see `api/ai.js`; any 4xx except
+   401/429 falls back to the default model)
    replaces the four serial tiers. Candidates: participant list, **people who attend this
    meeting** (`people.js`: same typed title / ≥50% roster overlap / recurring time slot, learned
    from the user's renames), titles; explicit **host** reasoning (the 17 manual renames were all
@@ -787,7 +851,9 @@ agent exe.
 - **The Windows pin EXPIRES, and that is upstream behaviour, not a bug.** BtbN deletes dated
   `autobuild-*` releases after roughly two weeks, so a previously-good URL starts returning 404 and
   the Windows installer job fails at *Fetch ffmpeg* with `download failed (HTTP 404 Not Found)`.
-  This killed the v2.4.0 build (pin was n9.0.1 from `autobuild-2026-09-08-23-15`). The fix is
+  This killed the v2.4.0 build (pin was n9.0.1 from `autobuild-2026-09-08-23-15`) and again the
+  v2.5.0 build (re-pinned 2026-11-12 to n9.0.2-49 from `autobuild-2026-11-11-12-39`). The same
+  release also moved the macOS job to `macos-15` (GitHub retired `macos-14` runners). The fix is
   mechanical: take the newest `autobuild-*` tag's `ffmpeg-nX.Y.Z-...-win64-lgpl-*.zip`, recompute
   **both** hashes (`archiveSha256` of the zip, `binarySha256` of the extracted exe), and re-verify
   the licence by reading `configuration:` out of `ffmpeg -version` — not from a README. The

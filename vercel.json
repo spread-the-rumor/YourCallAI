@@ -4,6 +4,17 @@
   "buildCommand": null,
   "installCommand": "npm install",
   "functions": {
-    "api/transcribe.js": { "maxDuration": 300 }
-  }
+    "api/transcribe.js": {
+      "maxDuration": 300
+    },
+    "api/ai.js": {
+      "maxDuration": 300
+    }
+  },
+  "rewrites": [
+    {
+      "source": "/api/transcribe/result",
+      "destination": "/api/transcribe"
+    }
+  ]
 }

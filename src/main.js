@@ -22,8 +22,8 @@ const { startNameAgent } = require('./agents');
 const audioEndpoints = require('./audioEndpoints');
 const { transcribeRecording } = require('./transcribe');
 const { sampleFor } = require('./speakerResolve');
-const { summarizeTranscript, summaryFailed } = require('./ai/summarize');
-const { askMeeting } = require('./ai/chat');
+const { summarizeTranscript, summaryFailed, relabelSummary } = require('./ai/summarize');
+const { askMeeting, FAILED_RE: FAILED_CHAT_RE } = require('./ai/chat');
 const { extractActionItems } = require('./ai/extractActionItems');
 const slack = require('./integrations/slack');
 const getoverview = require('./integrations/getoverview');
@@ -51,7 +51,12 @@ let pendingMeeting = null;   // { platform, title } while a meeting is detected
 let quitting = false;
 
 // Active recording state
-let rec = null; // { id, dir, meta, videoStream, audioStream, speakersStream, agent, stopResolve }
+let rec = null; // { id, dir, meta, videoStream, audioStream, speakersStream, agent, stopResolve, stopping }
+// True from the first line of startRecording until `rec` is set. The function awaits (mac
+// permissions, mkdir, writeFile) before `rec` exists, so without this a double click — or popup
+// Start plus main Start — passed the "already recording" check twice and ran two recorders into
+// one audio.webm. Also keeps the video queue paused across those awaits.
+let starting = false;
 const pipelineRunning = new Set();
 
 // Composite liveness: last time the recorder reported meeting audio, and the cancelable
@@ -99,7 +104,9 @@ const rid = () => `rec_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
 
 function emitStatus(state, detail = '') {
   if (mainWindow && !mainWindow.isDestroyed()) {
-    mainWindow.webContents.send('status', { state, detail });
+    // `recording` is independent of `state`: a stopped meeting's pipeline emits 'transcribing'/
+    // 'processing' while a NEW recording runs, and the renderer used to hide Stop for it.
+    mainWindow.webContents.send('status', { state, detail, recording: !!rec || starting });
   }
 }
 function emitProgress(recordingId, stage, detail = '') {
@@ -150,7 +157,23 @@ function createMainWindow() {
     if (/^https?:/.test(url)) shell.openExternal(url);
     return { action: 'deny' };
   });
-  mainWindow.on('closed', () => { mainWindow = null; });
+  // The hidden popup window means 'window-all-closed' never fires, so closing the main window used
+  // to leave the app running invisibly (detector popups, even a recording) with no way back: a
+  // relaunch hit the single-instance lock and focused nothing. Closing the window quits on
+  // Windows/Linux (before-quit stops and saves a live recording); macOS keeps the app in the Dock
+  // and 'activate' reopens the window.
+  mainWindow.on('closed', () => {
+    mainWindow = null;
+    if (process.platform !== 'darwin' && !quitting) app.quit();
+  });
+}
+
+// Bring the main window back, creating it if it was closed (macOS keeps running without one).
+function showMainWindow() {
+  if (!mainWindow || mainWindow.isDestroyed()) { createMainWindow(); return; }
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  mainWindow.show();
+  mainWindow.focus();
 }
 
 function createPopupWindow() {
@@ -311,7 +334,19 @@ async function checkDiskSpace() {
 }
 
 async function startRecording(source, platform = '', title = '') {
-  if (rec) return { ok: false, error: 'Already recording.' };
+  if (rec || starting) return { ok: false, error: 'Already recording.' };
+  starting = true;
+  try {
+    return await startRecordingInner(source, platform, title);
+  } catch (err) {
+    normalize.resume();
+    emitStatus('error', `Could not start recording: ${err.message}`);
+    return { ok: false, error: err.message };
+  } finally {
+    starting = false;
+  }
+}
+async function startRecordingInner(source, platform, title) {
   const perms = await ensureMacPermissions();
   if (!perms.ok) { emitStatus('error', perms.error); return perms; }
   cancelPendingStop('new recording');
@@ -461,8 +496,11 @@ function stopMonitorWatchdog() {
   monitorWatchdog = null;
 }
 
-async function finalizeRecording(failedMessage = null) {
+// expectId: finalize only if that recording is still the current one. A stop that waited out its
+// timeout must never finalize a NEWER recording the user started in the meantime.
+async function finalizeRecording(failedMessage = null, expectId = null) {
   if (!rec) return null;
+  if (expectId && rec.id !== expectId) return null;
   stopMonitorWatchdog();
   const current = rec;
   rec = null;
@@ -488,7 +526,7 @@ async function finalizeRecording(failedMessage = null) {
   try {
     const placeholder = buildPlaceholderMeeting(current.id, current.meta, failedMessage);
     const saved = await store.upsertMeeting(placeholder);
-    if (mainWindow && !mainWindow.isDestroyed()) {
+    if (saved && mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send('recording-complete', saved);
     }
   } catch (err) {
@@ -498,16 +536,26 @@ async function finalizeRecording(failedMessage = null) {
   return current.id;
 }
 
-async function stopRecording(opts = {}) {
-  if (!rec) return { ok: false, error: 'Not recording.' };
+// One stop per recording. A second Stop (double click, popup + main window, detector + user)
+// used to replace stopResolve: the recorder answered the second stop-capture at once, main
+// finalized before the last chunks were written, and the FIRST call later finalized whatever
+// recording was current by then. Repeat callers now share the first call's promise.
+function stopRecording(opts = {}) {
+  if (!rec) return Promise.resolve({ ok: false, error: 'Not recording.' });
+  if (rec.stopping) return rec.stopping;
+  rec.stopping = stopRecordingInner(rec, opts);
+  return rec.stopping;
+}
+async function stopRecordingInner(current, opts) {
   cancelPendingStop('recording stopped'); // clear any in-flight ending countdown
-  patchMeta(rec.dir, { stopReason: opts.reason || 'user' }).catch(() => {});
-  const stopped = new Promise((resolve) => { rec.stopResolve = resolve; });
+  patchMeta(current.dir, { stopReason: opts.reason || 'user' }).catch(() => {});
+  const stopped = new Promise((resolve) => { current.stopResolve = resolve; });
   if (recorderWindow && !recorderWindow.isDestroyed()) {
     recorderWindow.webContents.send('stop-capture');
   }
   await Promise.race([stopped, new Promise((r) => setTimeout(r, 10000))]);
-  const id = await finalizeRecording();
+  const id = await finalizeRecording(null, current.id);
+  if (!id) return { ok: true, recordingId: current.id }; // finalized by another path meanwhile
   // AFTER finalizeRecording, which is what clears `rec`. This used to be a setTimeout(…, 0) at
   // the top of the function, which fired during the await above — while rec was still set — so
   // drain()'s `if (isRecording()) return` swallowed it every single time and the queue this
@@ -563,7 +611,8 @@ function nativeCovering() {
 // Used when capture ends without the user pressing Stop. Saves and transcribes what was captured,
 // and tells the user — a recording that quietly ended is the failure being fixed here.
 async function finalizeUnexpected(reason) {
-  if (!rec) return;
+  if (!rec || rec.stopping) return; // a user stop is already finalizing it
+  cancelPendingStop('recording ended unexpectedly'); // its countdown would hide the popup below
   const { platform, title } = rec.meta;
   await patchMeta(rec.dir, { stopReason: 'unexpected', stopDetail: reason }).catch(() => {});
   const id = await finalizeRecording();
@@ -572,10 +621,21 @@ async function finalizeUnexpected(reason) {
   showPopup({ kind: 'recording-ended', detail: reason, platform, title });
   if (id && !quitting) runPipeline(id);
 }
+// Capture failed to start or died. Same handling as an unexpected stop: keep what was captured,
+// resume the video queue, transcribe if there is audio. It used to do neither, so the card said
+// "Use Retry" over usable audio and video conversion stayed paused until the next recording.
 ipcMain.on('capture-error', async (e, message) => {
   console.error('[capture]', message);
-  await finalizeRecording(message);
-  emitStatus('error', message);
+  if (!rec || rec.stopping) return;
+  cancelPendingStop('capture error');
+  const dir = rec.dir;
+  let hasAudio = false;
+  try { hasAudio = (await fsp.stat(path.join(dir, media.AUDIO_NAME))).size > 0; } catch { /* none */ }
+  await patchMeta(dir, { stopReason: 'unexpected', stopDetail: message }).catch(() => {});
+  const id = await finalizeRecording(hasAudio ? null : message);
+  normalize.resume();
+  emitStatus('error', hasAudio ? `Recording ended early — ${message}. What was captured is being transcribed.` : message);
+  if (id && hasAudio && !quitting) runPipeline(id);
 });
 // Recorder liveness heartbeat. `sys` = MEETING audio (the system stream) is playing; only that may
 // keep the detector's meeting alive or cancel an ending countdown. Accepts the old boolean form.
@@ -740,24 +800,7 @@ function pipelineLogger(dir) {
   };
 }
 
-// The summary is generated in parallel with name resolution, on the provisional "Speaker N"
-// labels, and the resolved names are substituted in afterwards. `before` maps "<ch>:<dz>" to the
-// label the summarizer saw; `after` is the resolved transcript. Only generic labels are rewritten,
-// longest first and digit-bounded so "Speaker 1" can never eat the front of "Speaker 12".
-function relabelSummary(summary, before, after) {
-  if (!summary || summaryFailed(summary)) return summary;
-  const finalByKey = new Map();
-  for (const s of after || []) finalByKey.set(`${s.channel}:${s.diarizedSpeaker}`, segSpeaker(s));
-  const swaps = [];
-  for (const [key, oldLabel] of before) {
-    const next = finalByKey.get(key);
-    if (next && next !== oldLabel && /^Speaker \d+$/.test(oldLabel)) swaps.push([oldLabel, next]);
-  }
-  swaps.sort((a, b) => b[0].length - a[0].length);
-  let out = summary;
-  for (const [from, to] of swaps) out = out.replace(new RegExp(`\\b${from}(?!\\d)`, 'g'), to);
-  return out;
-}
+// relabelSummary (src/ai/summarize.js) substitutes resolved names into the summary afterwards.
 
 async function runPipeline(recordingId, opts = {}) {
   if (pipelineRunning.has(recordingId)) return;
@@ -769,6 +812,9 @@ async function runPipeline(recordingId, opts = {}) {
     const meta = await readMeta(dir);
     if (!meta) return;
     plog('start', { sinceEndMs: meta.endedAt ? tStart - Date.parse(meta.endedAt) : null, retry: !!opts.retry });
+    // Counts automatic attempts so a recording Deepgram keeps rejecting is not re-uploaded (and
+    // re-billed) on every launch forever. A Retry by the user starts the count again.
+    await patchMeta(dir, { attempts: opts.retry ? 1 : (meta.attempts || 0) + 1 });
 
     // Ensure a visible card exists before transcription — covers requeued/orphaned recordings
     // (folder on disk but no meetings.json entry) so they surface immediately, not only if the
@@ -776,6 +822,7 @@ async function runPipeline(recordingId, opts = {}) {
     if (!(await store.getMeeting(recordingId))) {
       const ph = buildPlaceholderMeeting(recordingId, meta, meta.status === 'failed' ? (meta.error || null) : null);
       const saved = await store.upsertMeeting(ph);
+      if (!saved) return; // permanently deleted: nothing to transcribe for
       if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('recording-complete', saved);
     }
 
@@ -809,6 +856,9 @@ async function runPipeline(recordingId, opts = {}) {
         onStep: (name, ms, extra) => plog(name, { ms, ...(extra || {}) }),
       });
       plog('transcribe', { ms: Date.now() - tStep, segments: transcript.length });
+      // Raw native capture (~115 MB/hour) is only an input to the upload. If it won, it is kept as
+      // audio.native.webm (which a Retry reuses), so the raw file is not needed any more.
+      await fsp.rm(path.join(dir, 'system.pcm'), { force: true }).catch(() => {});
     } catch (err) {
       transcribeError = err.message;
       plog('transcribe', { ms: Date.now() - tStep, error: err.message });
@@ -837,8 +887,9 @@ async function runPipeline(recordingId, opts = {}) {
       emitStatus('processing', 'Resolving names and generating summary…');
       emitProgress(recordingId, 'summarizing');
       const tSummary = Date.now();
-      const summaryP = summarizeTranscript(summaryInput, (delta) =>
-        emitProgress(recordingId, 'summary-delta', delta)).then((s) => {
+      const summaryP = summarizeTranscript(summaryInput,
+        (delta) => emitProgress(recordingId, 'summary-delta', delta),
+        () => emitProgress(recordingId, 'summary-reset')).then((s) => {
         plog('summary', { ms: Date.now() - tSummary, ok: !summaryFailed(s) });
         return s;
       });
@@ -884,7 +935,8 @@ async function runPipeline(recordingId, opts = {}) {
     let saved = meeting;
     try { saved = await store.upsertMeeting(meeting); }
     catch (err) { console.error('[pipeline] persist failed:', err.message); }
-    if (mainWindow && !mainWindow.isDestroyed()) {
+    // null = the meeting was permanently deleted while this ran; do not resurrect it in the UI.
+    if (saved && mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send('recording-complete', saved);
     }
     plog('done', { totalMs: Date.now() - tStart, sinceEndMs: meta.endedAt ? Date.now() - Date.parse(meta.endedAt) : null });
@@ -893,12 +945,20 @@ async function runPipeline(recordingId, opts = {}) {
     console.error('[pipeline] fatal:', err);
     await patchMeta(dir, { status: 'failed', error: err.message }).catch(() => {});
     // Never let an IO/store throw silently discard the recording: ensure a card still exists.
+    // The placeholder from finalize already exists, so "ensure a card" alone left it saying "being
+    // generated…" forever with no error. Write the failure onto it unless real content arrived.
     try {
-      if (!(await store.getMeeting(recordingId))) {
-        const meta = await readMeta(dir).catch(() => null);
-        const saved = await store.upsertMeeting(buildPlaceholderMeeting(recordingId, meta, err.message));
-        if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('recording-complete', saved);
+      const metaNow = await readMeta(dir).catch(() => null);
+      const failed = buildPlaceholderMeeting(recordingId, metaNow, err.message);
+      const existing = await store.getMeeting(recordingId);
+      let saved = null;
+      if (!existing) saved = await store.upsertMeeting(failed);
+      else if (!existing.transcript) {
+        const patch = { summary: failed.summary };
+        if (!existing.content || existing.content === existing.summary) patch.content = failed.summary;
+        saved = await store.updateMeeting(existing.id, patch);
       }
+      if (saved && mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('recording-complete', saved);
     } catch (e) { console.error('[pipeline] fallback persist failed:', e.message); }
   } finally {
     pipelineRunning.delete(recordingId);
@@ -908,6 +968,7 @@ async function runPipeline(recordingId, opts = {}) {
 
 // ---------- launch recovery, requeue, retention (§5, §11) ----------
 
+const MAX_AUTO_ATTEMPTS = 3;
 async function recoverAndRequeue() {
   let entries = [];
   try { entries = await fsp.readdir(recordingsDir); } catch { return; }
@@ -919,9 +980,16 @@ async function recoverAndRequeue() {
     if (meta.status === 'recording') {
       await patchMeta(path.join(recordingsDir, id), { status: 'interrupted', endedAt: meta.endedAt || nowIso() });
       interrupted.push(id);
-    } else if (['recorded', 'transcribing', 'failed'].includes(meta.status)) {
+    } else if (['recorded', 'transcribing', 'failed'].includes(meta.status) && (meta.attempts || 0) < MAX_AUTO_ATTEMPTS) {
       requeue.push(id);
     }
+  }
+  // A card for every interrupted recording now. "Later" used to leave them with status
+  // 'interrupted', which no later launch looks at, and with no card, so they vanished.
+  for (const id of interrupted) {
+    if (await store.getMeeting(id)) continue;
+    const meta = await readMeta(path.join(recordingsDir, id));
+    await store.upsertMeeting(buildPlaceholderMeeting(id, meta, 'the app closed while recording')).catch(() => {});
   }
   if (interrupted.length) {
     const { response } = await dialog.showMessageBox(mainWindow, {
@@ -940,7 +1008,12 @@ async function recoverAndRequeue() {
     // orphaned forever. Use the cached /api/config flag instead (default to attempting if unknown).
     let deepgramEnabled = true;
     try { deepgramEnabled = (await settingsStore.getConfiguredFlags()).deepgram !== false; } catch { /* assume on */ }
-    if (deepgramEnabled) for (const id of requeue) runPipeline(id);
+    // One at a time: concurrent uploads and Deepgram calls on launch competed with the user.
+    if (deepgramEnabled) {
+      (async () => {
+        for (const id of requeue) { if (quitting) break; await runPipeline(id).catch(() => {}); }
+      })();
+    }
   }
 }
 
@@ -950,7 +1023,10 @@ async function retentionSweep() {
   const cutoff = Date.now() - days * 86400_000;
   const meetings = await store.loadMeetings().catch(() => []);
   for (const m of meetings) {
-    if (m.videoUrl && new Date(m.date).getTime() < cutoff) {
+    if (!m.recordingId || pipelineRunning.has(m.recordingId)) continue;
+    // Gate on the folder, not the stored videoUrl (a derived cache, null for audio-only meetings).
+    if (!fs.existsSync(path.join(recordingsDir, m.recordingId))) continue;
+    if (new Date(m.date).getTime() < cutoff) {
       // An on-demand or legacy conversion targets exactly these old recordings. Deleting the
       // .part out from under a running ffmpeg fails with EBUSY on Windows and, worse, silently
       // succeeds on macOS/Linux — where ffmpeg keeps writing to the unlinked inode and the
@@ -962,8 +1038,11 @@ async function retentionSweep() {
       for (const name of media.allMediaNames()) {
         await fsp.rm(path.join(dir, name), { force: true }).catch(() => {});
       }
-      await fsp.rm(path.join(dir, media.AUDIO_NAME), { force: true }).catch(() => {});
-      await store.updateMeeting(m.id, { videoUrl: null });
+      // Raw meeting audio too: the native capture and its remix were never on this list.
+      for (const name of [media.AUDIO_NAME, 'system.pcm', 'system.json', 'audio.native.webm', 'audio.native.webm.part']) {
+        await fsp.rm(path.join(dir, name), { force: true }).catch(() => {});
+      }
+      if (m.videoUrl) await store.updateMeeting(m.id, { videoUrl: null });
     }
   }
 }
@@ -1005,20 +1084,57 @@ ipcMain.handle('delete-meeting', (e, id) => store.softDelete(id));
 ipcMain.handle('list-trash', async () => (await store.loadTrash()).map(listItem));
 ipcMain.handle('restore-meeting', (e, id) => store.restore(id));
 ipcMain.handle('delete-meeting-permanent', async (e, id) => {
-  await store.deletePermanent(id, recordingsDir);
-  return { ok: true };
+  // Deleting while the pipeline or a video conversion holds the recording brought it back: the
+  // pipeline's final upsert recreated the record, or ENOENT produced a fallback card.
+  const recId = (await store.recordingIdFor(id).catch(() => null)) || id;
+  if (pipelineRunning.has(recId)) return { ok: false, error: 'This meeting is still processing. Try again when it is done.' };
+  if (normalize.currentId() === recId) normalize.killCurrent('meeting deleted', { requeue: false });
+  const r = await store.deletePermanent(id, recordingsDir, { isBusy: (rid) => pipelineRunning.has(rid) });
+  return r && typeof r === 'object' ? r : { ok: true };
 });
 
+// v2.5.0 stored every failed answer ("Chat unavailable — terminated") as a chat turn. Remove
+// those and the question each one answered, once per launch (a no-op when there are none).
+async function cleanFailedChatTurns() {
+  const meetings = await store.loadMeetings();
+  for (const m of meetings) {
+    const chat = Array.isArray(m.chat) ? m.chat : [];
+    if (!chat.some((t) => t && t.role === 'assistant' && FAILED_CHAT_RE.test(t.content || ''))) continue;
+    const kept = [];
+    for (const t of chat) {
+      if (t && t.role === 'assistant' && FAILED_CHAT_RE.test(t.content || '')) {
+        if (kept.length && kept[kept.length - 1].role === 'user') kept.pop();
+        continue;
+      }
+      kept.push(t);
+    }
+    await store.updateMeeting(m.id, { chat: kept }).catch(() => {});
+  }
+}
+
+// Returns { ok, answer } or { ok: false, error }. A failure is NOT stored: in v2.5.0 every
+// "Chat unavailable — …" was saved as an assistant turn and replayed to the model afterwards.
 ipcMain.handle('ask-meeting', async (e, id, question) => {
-  const meeting = await store.getMeeting(id);
-  if (!meeting) return { answer: 'Meeting not found.' };
-  // Streamed: the reply appears as it is generated instead of after a silent "Thinking…".
-  const answer = await askMeeting(meeting.transcript, meeting.chat, question, (delta) => {
-    if (!e.sender.isDestroyed()) e.sender.send('chat-delta', { id, delta });
-  });
-  const chat = [...(meeting.chat || []), { role: 'user', content: question }, { role: 'assistant', content: answer }];
-  await store.updateMeeting(id, { chat });
-  return { answer };
+  try {
+    const q = String(question || '').trim();
+    if (!q) return { ok: false, error: 'Type a question first.' };
+    const meeting = await store.getMeeting(id);
+    if (!meeting) return { ok: false, error: 'Meeting not found.' };
+    const send = (payload) => { if (!e.sender.isDestroyed()) e.sender.send('chat-delta', { id, ...payload }); };
+    // Streamed: the reply appears as it is generated. reset = a retry is re-streaming it.
+    const r = await askMeeting(meeting.transcript, meeting.chat, q, {
+      onDelta: (delta) => send({ delta }),
+      onReset: () => send({ reset: true }),
+    });
+    if (!r.ok) return r;
+    // Re-read at write time: two questions in flight must not overwrite each other's turns.
+    const fresh = await store.getMeeting(id);
+    const chat = [...((fresh && fresh.chat) || []), { role: 'user', content: q }, { role: 'assistant', content: r.answer }];
+    await store.updateMeeting(id, { chat });
+    return { ok: true, answer: r.answer };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
 });
 
 ipcMain.handle('regenerate-summary', async (e, id) => {
@@ -1029,12 +1145,21 @@ ipcMain.handle('regenerate-summary', async (e, id) => {
   // summary hit the Edge function's time-to-first-byte limit and come back as a 504.
   const summary = await summarizeTranscript(meeting.transcript, () => {});
   if (summaryFailed(summary)) return { ok: false, error: summary };
-  const updated = await store.updateMeeting(id, { content: summary, summary });
-  return { ok: true, meeting: updated };
+  // Keep notes the user typed: only replace content that is still the (failed) summary.
+  const userEdited = meeting.content && meeting.content !== meeting.summary;
+  const updated = await store.updateMeeting(id, userEdited ? { summary } : { content: summary, summary });
+  return { ok: true, meeting: withVideoUrl(updated) };
 });
 
+// Answers whether the retry can run. It used to return ok unconditionally while runPipeline
+// returned silently (already running, no local recording), leaving the button on "Retrying…".
 ipcMain.handle('retry-transcription', async (e, id) => {
-  runPipeline(id, { retry: true });
+  const recId = (await store.recordingIdFor(id).catch(() => null)) || id;
+  if (pipelineRunning.has(recId)) return { ok: false, error: 'This meeting is already being processed.' };
+  if (!(await readMeta(path.join(recordingsDir, recId)))) {
+    return { ok: false, error: 'The recording is not on this computer, so it cannot be transcribed again here.' };
+  }
+  runPipeline(recId, { retry: true });
   return { ok: true };
 });
 
@@ -1087,7 +1212,11 @@ ipcMain.handle('reresolve-all-names', async () => {
       const r = await reresolveMeeting(m.id).catch((err) => ({ ok: false, error: err.message }));
       done++;
       if (!r.ok) failed++; else if (r.changed) changed++;
-      if (r.ok && mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('meeting-updated', r.meeting);
+      // Only when something changed, and as a light list item: sending every full transcript made
+      // the renderer rebuild the sidebar per meeting and undid the light list until a reload.
+      if (r.ok && r.changed && mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('meeting-updated', { ...listItem(r.meeting), _light: true });
+      }
     }
     emitStatus(rec ? 'recording' : 'idle');
     return { ok: true, total: meetings.length, changed, failed };
@@ -1099,6 +1228,10 @@ ipcMain.handle('rename-speaker', async (e, id, channel, diarizedSpeaker, newName
   if (!meeting?.transcript) return { ok: false, error: 'No transcript.' };
   const name = String(newName || '').trim();
   if (!name) return { ok: false, error: 'Name is empty.' };
+  // Old transcripts can lack channel/diarizedSpeaker; undefined === undefined renamed everyone.
+  if (!Number.isInteger(channel) || !Number.isInteger(diarizedSpeaker)) {
+    return { ok: false, error: 'This speaker cannot be renamed (older transcript format).' };
+  }
   const transcript = meeting.transcript.map((seg) =>
     seg.channel === channel && seg.diarizedSpeaker === diarizedSpeaker ? { ...seg, speaker: name } : seg);
   // Store a speech sample with the rename. Deepgram's diarized ids are not stable across runs, so
@@ -1116,7 +1249,7 @@ ipcMain.handle('rename-speaker', async (e, id, channel, diarizedSpeaker, newName
   };
   // Drop cached action items — speaker names feed the assignee field, so they're now stale.
   const updated = await store.updateMeeting(id, { transcript, speakerMap, actionItems: null });
-  return { ok: true, meeting: updated };
+  return { ok: true, meeting: withVideoUrl(updated) };
 });
 
 // ---------- IPC: recording controls ----------
@@ -1127,7 +1260,8 @@ ipcMain.handle('start-detected-recording', () =>
   startRecording('detected', pendingMeeting?.platform, pendingMeeting?.title));
 ipcMain.handle('dismiss-detected-meeting', () => { hidePopup(); return { ok: true }; });
 ipcMain.on('popup-start-recording', () => {
-  startRecording('detected', pendingMeeting?.platform, pendingMeeting?.title);
+  startRecording('detected', pendingMeeting?.platform, pendingMeeting?.title)
+    .catch((err) => console.error('[popup] start failed:', err.message));
 });
 ipcMain.on('popup-stop-recording', () => {
   cancelPendingStop('user stopped');
@@ -1195,7 +1329,8 @@ ipcMain.handle('save-transcript', async (e, meetingId, format) => {
   const body = ext === 'json'
     ? JSON.stringify(meeting.transcript, null, 2)
     : meeting.transcript.map((s) => `${segSpeaker(s)}: ${segText(s)}`).join('\n');
-  await fsp.writeFile(filePath, body, 'utf8');
+  try { await fsp.writeFile(filePath, body, 'utf8'); }
+  catch (err) { return { ok: false, error: `Could not save: ${err.message}` }; }
   return { ok: true, filePath };
 });
 
@@ -1277,7 +1412,7 @@ ipcMain.handle('save-recording', async (e, meetingId) => {
 ipcMain.handle('get-settings', () => settingsStore.getSettings());
 ipcMain.handle('save-settings', async (e, patch) => {
   const saved = await settingsStore.saveSettings(patch);
-  retentionSweep();
+  retentionSweep().catch((err) => console.error('[retention]', err.message));
   return saved;
 });
 ipcMain.handle('get-effective-config', () => settingsStore.getConfiguredFlags());
@@ -1308,7 +1443,7 @@ if (!gotLock) {
   };
 
   app.on('second-instance', (e, argv) => {
-    if (mainWindow) { if (mainWindow.isMinimized()) mainWindow.restore(); mainWindow.focus(); }
+    if (app.isReady()) showMainWindow();
     // Windows/Linux deliver the yourcallai:// deep link as an argv on the relaunch.
     const link = argv.find((a) => a.startsWith(`${auth.PROTOCOL}://`));
     if (link) routeDeepLink(link);
@@ -1321,7 +1456,9 @@ if (!gotLock) {
     // Start parsing meetings.json now, in parallel with the window being created, so the first
     // list request finds it loaded. A one-time compaction runs here on the first launch after
     // updating (see store.js); it backs the original up first.
-    store.load().catch((e) => console.error('[store] load failed:', e.message));
+    store.load()
+      .then(() => cleanFailedChatTurns())
+      .catch((e) => console.error('[store] load failed:', e.message));
     await settingsStore.applyToEnv().catch((e) => console.error('[settings]', e.message));
     // Fire-and-forget: an 8s network call must not gate window creation (offline start still
     // works off the disk cache). But the renderer reads its flags once at boot, so when the
@@ -1338,7 +1475,7 @@ if (!gotLock) {
     recordingsDir = path.join(app.getPath('userData'), 'recordings');
     normalize.configure({
       recordingsDir,
-      isRecording: () => !!rec,
+      isRecording: () => !!rec || starting,
       emitProgress: (id, pct) => emitProgress(id, 'normalizing', `${pct}%`),
       // The URL is derived at read time, so nothing needs repointing — but a meeting the user
       // has open right now will not re-render on its own.
@@ -1471,8 +1608,6 @@ if (!gotLock) {
     if (process.platform !== 'darwin') app.quit();
   });
 
-  app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) createMainWindow();
-    else mainWindow?.show();
-  });
+  // The hidden popup window always exists, so "no windows" is never the test.
+  app.on('activate', () => showMainWindow());
 }

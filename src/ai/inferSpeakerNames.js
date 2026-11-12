@@ -15,6 +15,10 @@
 // must quote its evidence. Code then decides how far to trust each answer.
 const { chatCompletion, parseLooseJson } = require('./requesty');
 const { transcriptToNamePrompt, segSpeaker, segText } = require('../transcriptUtils');
+
+// Start (seconds) of a segment in either shape: compact (start) or pipeline/raw (per-word times).
+const segStartSec = (s) => (s.start != null ? s.start
+  : (s.words && s.words[0] && s.words[0].start_timestamp ? s.words[0].start_timestamp.relative : null));
 const { matchToRoster, rosterNames, nameKey, isPersonName } = require('../roster');
 
 const GENERIC_RE = /^Speaker \d+$/;
@@ -47,7 +51,7 @@ function labelStats(transcript, labels) {
     total += words;
     const l = segSpeaker(s);
     if (!labels.includes(l)) continue;
-    const e = stats[l] || (stats[l] = { words: 0, turns: 0, firstAt: s.start != null ? s.start : null });
+    const e = stats[l] || (stats[l] = { words: 0, turns: 0, firstAt: segStartSec(s) });
     e.words += words;
     e.turns += 1;
   }

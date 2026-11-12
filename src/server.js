@@ -4,14 +4,12 @@ const express = require('express');
 
 const PORT = 3100; // webpack dev server owns 3000 — never use it
 
-// opts.routes(app): register extra routes before listening.
-function start(recordingsDir, opts = {}) {
+function start(recordingsDir) {
   return new Promise((resolve) => {
     try {
       const app = express();
       app.use('/recordings', express.static(recordingsDir));
       app.get('/health', (req, res) => res.json({ ok: true }));
-      if (typeof opts.routes === 'function') opts.routes(app);
       const srv = app.listen(PORT, '127.0.0.1', () => resolve(srv));
       srv.on('error', (err) => {
         console.error(`[server] failed to bind :${PORT} (${err.code}) — media serving disabled`);

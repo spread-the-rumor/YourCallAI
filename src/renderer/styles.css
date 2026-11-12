@@ -462,6 +462,10 @@ select:focus { border-color: var(--accent); }
 .bubble.user { align-self: flex-end; background: linear-gradient(135deg, var(--accent), var(--accent-2)); color: var(--accent-text); }
 .bubble.assistant { align-self: flex-start; background: var(--surface); border: 1px solid var(--border); }
 .bubble.thinking { color: var(--text-muted); font-style: italic; }
+/* A failed question: shown for this session only, never saved into the meeting's chat. */
+.bubble.assistant.error { color: var(--red); border-color: color-mix(in srgb, var(--red) 50%, var(--border)); }
+.bubble.user.unsent { opacity: 0.6; }
+#legacy-result:empty { display: none; }
 .chat-input-row { display: flex; gap: var(--s2); padding: var(--s3) var(--s4); border-top: 1px solid var(--border); }
 .chat-input-row input {
   flex: 1; background: var(--surface); border: 1px solid var(--border); border-radius: var(--pill);

@@ -124,9 +124,11 @@
           <p id="legacy-status" class="muted"></p>
           <div class="settings-actions">
             <button id="legacy-convert" class="btn pill">Convert to MP4</button>
-            <span id="legacy-result" class="muted"></span>
           </div>
         </div>
+        <!-- Outside #legacy-block: a successful conversion hides the block (nothing left to
+             convert), and the result has to stay readable after that. -->
+        <p id="legacy-result" class="muted"></p>
 
         <!-- Speaker names: re-run naming over saved transcripts (no re-transcription). -->
         <div id="names-block" class="account-block">

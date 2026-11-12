@@ -151,7 +151,10 @@ async function prepareUpload(dir, log = () => {}) {
   const metaPath = path.join(dir, 'system.json');
   const webm = path.join(dir, 'audio.webm');
   const out = path.join(dir, OUT_NAME);
-  if (!fs.existsSync(pcmPath) || !fs.existsSync(metaPath) || !fs.existsSync(webm)) return null;
+  // After a successful transcription the pipeline deletes system.pcm (~115 MB/hour). A Retry then
+  // reuses the remix built from it, if the native track was the one chosen.
+  if (!fs.existsSync(pcmPath)) return fs.existsSync(out) ? out : null;
+  if (!fs.existsSync(metaPath) || !fs.existsSync(webm)) return null;
 
   // Retry transcription: reuse a remix built from these exact inputs.
   try {

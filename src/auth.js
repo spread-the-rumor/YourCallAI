@@ -37,8 +37,12 @@ function getClient() {
       auth: { flowType: 'pkce', persistSession: false, autoRefreshToken: true, detectSessionInUrl: false },
     });
     client.auth.onAuthStateChange((_event, session) => {
+      const prevId = currentUser?.id || null;
       currentUser = session?.user || null;
       if (session) persistSession(session);
+      // A failed token refresh signs the user out here, not through signOut(); without this the
+      // UI kept showing "signed in" while every sync silently no-op'd.
+      if ((currentUser?.id || null) !== prevId) emitAuthChanged();
     });
   }
   return client;

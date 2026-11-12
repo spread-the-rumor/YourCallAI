@@ -14,7 +14,7 @@
     "make": "electron-forge make",
     "publish": "electron-forge publish",
     "ship": "node scripts/ship.mjs",
-    "test": "node test/selfcheck.js",
+    "test": "node test/selfcheck.js && node test/ai-client.js && node test/detector-mac.js",
     "build:agent": "node scripts/build-agent.mjs",
     "fetch:ffmpeg": "node scripts/fetch-ffmpeg.mjs"
   },

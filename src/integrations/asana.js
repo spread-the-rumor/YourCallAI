@@ -41,18 +41,27 @@ let pendingState = null; // in-memory CSRF state for the current connect() attem
 // ---- token lifecycle ----
 
 let refreshing = null; // in-flight refresh, shared so a burst of calls triggers one refresh
+// Why the last refresh failed when it was NOT an expired session (network, server, proxy). Every
+// failure used to read "session expired — reconnect", sending users to reconnect for an outage.
+let lastRefreshError = null;
 
 // Refresh the access token via the backend and persist it. Serialized: concurrent callers
 // await the same promise rather than each spending the refresh token.
 function refreshToken(rt) {
   refreshing ||= (async () => {
     try {
-      const res = await proxyPost('/api/asana/oauth-refresh', { refreshToken: rt });
-      const d = await res.json();
-      if (!d.ok || !d.token) return null;
+      const res = await proxyPost('/api/asana/oauth-refresh', { refreshToken: rt }, { signal: AbortSignal.timeout(15000) });
+      const d = await res.json().catch(() => ({}));
+      if (!d.ok || !d.token) {
+        const expired = /invalid_grant|invalid_request|expired|revoked|invalid/i.test(String(d.error || ''));
+        lastRefreshError = expired ? null : `Could not reach Asana (${d.error || `HTTP ${res.status}`}) — try again.`;
+        return null;
+      }
+      lastRefreshError = null;
       await session().update((cur) => { cur.token = d.token; cur.expiresAt = d.expiresAt || 0; });
       return d.token;
-    } catch {
+    } catch (err) {
+      lastRefreshError = `Could not reach Asana (${err.name === 'TimeoutError' ? 'timed out' : (err.cause?.code || err.message)}) — try again.`;
       return null;
     } finally {
       refreshing = null;
@@ -74,7 +83,7 @@ async function validToken() {
   if (s.expiresAt && s.expiresAt - Date.now() > 60_000) return { token: s.token };
   if (!s.refreshToken) return { token: s.token }; // nothing to refresh with; let the 401 path report it
   const fresh = await refreshToken(s.refreshToken);
-  return fresh ? { token: fresh } : { error: EXPIRED };
+  return fresh ? { token: fresh } : { error: lastRefreshError || EXPIRED };
 }
 
 // ---- REST plumbing ----
@@ -93,7 +102,7 @@ async function asanaApi(pathname, { method = 'GET', body } = {}, retried = false
       if (!retried && s.refreshToken && await refreshToken(s.refreshToken)) {
         return asanaApi(pathname, { method, body }, true);
       }
-      return { ok: false, error: EXPIRED };
+      return { ok: false, error: (retried ? null : lastRefreshError) || EXPIRED };
     }
     return out; // proxy already returns { ok, status, body } | { ok:false, error }
   } catch (err) {
